@@ -235,4 +235,86 @@ async function exportOrders(req, res) {
   res.send('﻿' + csv); // BOM para Excel reconhecer UTF-8
 }
 
-module.exports = { importOrders, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders };
+// GET /api/orders/sku-report — performance por produto no período
+async function skuReport(req, res) {
+  const { storeId, startDate, endDate } = req.query;
+
+  const where = { store: { userId: req.userId }, status: { not: 'cancelled' } };
+  if (storeId) where.storeId = storeId;
+  if (startDate || endDate) {
+    where.soldAt = {};
+    if (startDate) where.soldAt.gte = new Date(startDate);
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setUTCHours(23, 59, 59, 999);
+      where.soldAt.lte = end;
+    }
+  }
+
+  const orders = await prisma.order.findMany({
+    where,
+    include: {
+      items: { include: { product: { select: { id: true, name: true, sku: true } } } },
+    },
+  });
+
+  // Agrega por produto usando cálculo por item com snapshots
+  const map = new Map();
+
+  for (const order of orders) {
+    const isCurrentMonth = (() => {
+      const now = new Date();
+      const d   = new Date(order.soldAt);
+      return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+    })();
+
+    const storeConfig = isCurrentMonth
+      ? await prisma.store.findUnique({ where: { id: order.storeId } })
+      : { commission: order.snapshotCommission, serviceFee: order.snapshotServiceFee, taxRate: order.snapshotTaxRate, fixedFeePerItem: order.snapshotFixedFee };
+
+    for (const item of order.items) {
+      const productConfig = isCurrentMonth
+        ? item.product
+        : { costPrice: item.snapshotCostPrice, packaging: item.snapshotPackaging, supplies: item.snapshotSupplies };
+
+      const revenue = item.unitPrice * item.quantity;
+      const calc    = calcProfit(revenue, item.quantity, productConfig, storeConfig, 0, 0);
+
+      const pid = item.product.id;
+      if (!map.has(pid)) {
+        map.set(pid, {
+          productId:    pid,
+          name:         item.product.name,
+          sku:          item.product.sku ?? '',
+          totalQty:     0,
+          totalRevenue: 0,
+          totalProfit:  0,
+          orderCount:   0,
+        });
+      }
+
+      const row = map.get(pid);
+      row.totalQty     += item.quantity;
+      row.totalRevenue += revenue;
+      row.totalProfit  += calc.profit;
+      row.orderCount   += 1;
+    }
+  }
+
+  const products = Array.from(map.values()).map((r) => ({
+    ...r,
+    totalRevenue: parseFloat(r.totalRevenue.toFixed(2)),
+    totalProfit:  parseFloat(r.totalProfit.toFixed(2)),
+    avgMargin:    r.totalRevenue > 0 ? parseFloat(((r.totalProfit / r.totalRevenue) * 100).toFixed(1)) : 0,
+  })).sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+  const totals = products.reduce((s, p) => ({
+    qty:     s.qty     + p.totalQty,
+    revenue: s.revenue + p.totalRevenue,
+    profit:  s.profit  + p.totalProfit,
+  }), { qty: 0, revenue: 0, profit: 0 });
+
+  return res.json({ products, totals });
+}
+
+module.exports = { importOrders, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders, skuReport };
