@@ -47,12 +47,16 @@ model Product {
   externalId String?
   name       String
   sku        String?
+  barcode    String?
   costPrice  Float
   listPrice  Float       @default(0)
   packaging  Float       @default(0)
   supplies   Float       @default(0)
   stock      Int         @default(0)
   minStock   Int         @default(5)
+  parentId   String?
+  parent     Product?    @relation("Variants", fields: [parentId], references: [id], onDelete: SetNull)
+  variants   Product[]   @relation("Variants")
   createdAt  DateTime    @default(now())
   orderItems         OrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
