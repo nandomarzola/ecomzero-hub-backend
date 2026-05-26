@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String    @id @default(uuid())
+  name       String
+  email      String    @unique
+  password   String
+  plan       String    @default("free")
+  role       String    @default("seller")
+  lastSeenAt DateTime?
+  createdAt  DateTime  @default(now())
+  stores         Store[]
+  suppliers      Supplier[]
+  bills          Bill[]
+  purchaseOrders PurchaseOrder[]
+  newsReads      NewsRead[]
+}
+
+model Store {
+  id              String    @id @default(uuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  marketplace     String
+  commission      Float     @default(14.0)
+  serviceFee      Float     @default(2.0)
+  taxType         String    @default("mei")
+  taxRate         Float     @default(5.0)
+  fixedFeePerItem Float     @default(0)
+  createdAt       DateTime  @default(now())
+  products        Product[]
+  orders          Order[]
+  bills           Bill[]
+}
+
+model Product {
+  id         String      @id @default(uuid())
+  storeId    String
+  store      Store       @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  externalId String?
+  name       String
+  sku        String?
+  costPrice  Float
+  listPrice  Float       @default(0)
+  packaging  Float       @default(0)
+  supplies   Float       @default(0)
+  stock      Int         @default(0)
+  minStock   Int         @default(5)
+  createdAt  DateTime    @default(now())
+  orderItems         OrderItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+}
+
+model Order {
+  id         String      @id @default(uuid())
+  storeId    String
+  store      Store       @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  externalId String?
+  salePrice  Float
+  freight    Float       @default(0)
+  discount   Float       @default(0)
+  status     String
+  soldAt     DateTime
+  createdAt  DateTime    @default(now())
+  items      OrderItem[]
+  profit     Float?
+  margin     Float?
+  snapshotCommission  Float  @default(0)
+  snapshotServiceFee  Float  @default(0)
+  snapshotTaxRate     Float  @default(0)
+  snapshotFixedFee    Float  @default(0)
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Float
+  snapshotCostPrice Float @default(0)
+  snapshotPackaging Float @default(0)
+  snapshotSupplies  Float @default(0)
+}
+
+// ───────────────────────────────────────────
+// FORNECEDORES
+// ───────────────────────────────────────────
+model Supplier {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  contact   String?
+  phone     String?
+  email     String?
+  cnpj      String?
+  notes     String?
+  leadDays  Int      @default(7)
+  createdAt DateTime @default(now())
+  bills          Bill[]
+  purchaseOrders PurchaseOrder[]
+}
+
+// ───────────────────────────────────────────
+// CONTAS A PAGAR
+// ───────────────────────────────────────────
+model Bill {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  storeId     String?
+  store       Store?    @relation(fields: [storeId], references: [id])
+  supplierId  String?
+  supplier    Supplier? @relation(fields: [supplierId], references: [id])
+  description String
+  amount      Float
+  dueDate     DateTime
+  paidAt      DateTime?
+  status      String    @default("pending") // pending, paid
+  category    String    @default("outros")  // embalagem, marketing, logistica, taxa, outros, compra
+  recurring   Boolean   @default(false)
+  recurrence  String?   // monthly, weekly
+  notes       String?
+  createdAt   DateTime  @default(now())
+}
+
+// ───────────────────────────────────────────
+// PEDIDOS DE COMPRA (controle de reposição)
+// ───────────────────────────────────────────
+model PurchaseOrder {
+  id         String              @id @default(uuid())
+  userId     String
+  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  supplierId String?
+  supplier   Supplier?           @relation(fields: [supplierId], references: [id])
+  status     String              @default("draft") // draft, ordered, received, cancelled
+  orderedAt  DateTime?
+  expectedAt DateTime?
+  receivedAt DateTime?
+  notes      String?
+  total      Float               @default(0)
+  createdAt  DateTime            @default(now())
+  items      PurchaseOrderItem[]
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(uuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product       @relation(fields: [productId], references: [id])
+  quantity        Int
+  unitCost        Float
+}
+
+// ───────────────────────────────────────────
+// NOVIDADES DO SISTEMA (admin)
+// ───────────────────────────────────────────
+model SystemNews {
+  id          String     @id @default(uuid())
+  title       String
+  content     String     @db.Text
+  type        String     @default("feature") // feature, fix, announcement
+  createdBy   String
+  publishedAt DateTime   @default(now())
+  reads       NewsRead[]
+}
+
+model NewsRead {
+  id     String     @id @default(uuid())
+  userId String
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  newsId String
+  news   SystemNews @relation(fields: [newsId], references: [id], onDelete: Cascade)
+  readAt DateTime   @default(now())
+  @@unique([userId, newsId])
+}

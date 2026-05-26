@@ -1,0 +1,5 @@
+-- AlterTable
+ALTER TABLE `Product` ADD COLUMN `listPrice` DOUBLE NOT NULL DEFAULT 0;
+
+-- AlterTable
+ALTER TABLE `Store` ADD COLUMN `fixedFeePerItem` DOUBLE NOT NULL DEFAULT 0;
