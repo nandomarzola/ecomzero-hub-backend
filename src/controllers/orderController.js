@@ -188,4 +188,51 @@ async function recalculateOrders(req, res) {
   });
 }
 
-module.exports = { importOrders, listOrders, getOrder, deleteOrder, recalculateOrders };
+// GET /api/orders/export — retorna CSV com todos os pedidos do período (sem paginação)
+async function exportOrders(req, res) {
+  const { storeId, startDate, endDate, status } = req.query;
+
+  const where = { store: { userId: req.userId } };
+  if (storeId) where.storeId = storeId;
+  if (status)  where.status  = status;
+  if (startDate || endDate) {
+    where.soldAt = {};
+    if (startDate) where.soldAt.gte = new Date(startDate);
+    if (endDate) {
+      const end = new Date(endDate);
+      end.setUTCHours(23, 59, 59, 999);
+      where.soldAt.lte = end;
+    }
+  }
+
+  const orders = await prisma.order.findMany({
+    where,
+    include: { items: { include: { product: { select: { name: true, sku: true } } } } },
+    orderBy: { soldAt: 'desc' },
+  });
+
+  const header = ['Data', 'ID Externo', 'Produto', 'SKU', 'Qtd', 'Faturado', 'Lucro', 'Margem (%)', 'Status'];
+
+  const rows = orders.map((o) => {
+    const date    = new Date(o.soldAt).toLocaleDateString('pt-BR');
+    const extId   = o.externalId ?? '';
+    const name    = o.items?.[0]?.product?.name ?? '';
+    const sku     = o.items?.[0]?.product?.sku  ?? '';
+    const qty     = o.items?.reduce((s, it) => s + it.quantity, 0) ?? 0;
+    const revenue = Number(o.salePrice ?? 0).toFixed(2).replace('.', ',');
+    const profit  = Number(o.profit   ?? 0).toFixed(2).replace('.', ',');
+    const margin  = Number(o.margin   ?? 0).toFixed(1).replace('.', ',');
+    const statusLabel = { paid: 'Pago', cancelled: 'Cancelado', returned: 'Devolvido' }[o.status] ?? o.status;
+    return [date, extId, name, sku, qty, revenue, profit, margin, statusLabel]
+      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+      .join(';');
+  });
+
+  const csv = [header.join(';'), ...rows].join('\r\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="pedidos.csv"');
+  res.send('﻿' + csv); // BOM para Excel reconhecer UTF-8
+}
+
+module.exports = { importOrders, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders };
