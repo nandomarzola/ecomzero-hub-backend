@@ -65,7 +65,28 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
     const varsWithRevenue = group.variations.filter(v => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
 
     if (varsWithRevenue.length > 0) {
-      // Produto COM variações — importar cada variação separada
+      // Produto COM variações — garantir que o produto pai existe
+      const parentName = String(group.parent?.['Produto'] || varsWithRevenue[0]?.['Produto'] || '').trim();
+      let parentProduct = await prisma.product.findFirst({
+        where: { storeId, externalId: itemId, parentId: null },
+      });
+      if (!parentProduct) {
+        parentProduct = await prisma.product.create({
+          data: {
+            storeId,
+            externalId: itemId,
+            name:       parentName.substring(0, 255),
+            sku:        null,
+            costPrice:  0,
+            listPrice:  0,
+            packaging:  0,
+            supplies:   0,
+            stock:      0,
+          },
+        });
+      }
+
+      // Importar cada variação separada linkada ao pai
       for (const varRow of varsWithRevenue) {
         try {
           const varId       = String(varRow['ID da Variação'] || '').trim();
@@ -83,7 +104,7 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
           const exists = await prisma.order.findFirst({ where: { storeId, externalId } });
           if (exists) { skipped++; continue; }
 
-          // Buscar produto pela variação
+          // Buscar produto pela variação (pode já existir como produto standalone do import anterior)
           let product = null;
           if (sku && sku !== '-') {
             product = await prisma.product.findFirst({ where: { storeId, sku } });
@@ -100,6 +121,7 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
             product = await prisma.product.create({
               data: {
                 storeId,
+                parentId:   parentProduct.id,
                 externalId: `${itemId}_${varId}`,
                 name:       displayName.substring(0, 255),
                 sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}-${varId}`,
@@ -109,6 +131,12 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
                 supplies:   0,
                 stock:      0,
               },
+            });
+          } else if (!product.parentId) {
+            // Produto existia como standalone — vincular ao pai
+            await prisma.product.update({
+              where: { id: product.id },
+              data:  { parentId: parentProduct.id },
             });
           }
 
