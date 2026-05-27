@@ -1,9 +1,11 @@
 const fs     = require('fs');
 const prisma  = require('../lib/prisma');
 const { calcProfit } = require('../services/calculatorService');
-const { importShopeeParentSKU } = require('../services/importService');
+const { Job }        = require('bullmq');
+const { importQueue } = require('../services/importQueue');
+const connection = require('../lib/redisConnection');
 
-// POST /api/orders/import
+// POST /api/orders/import — enfileira job, responde 202 + jobId imediatamente
 async function importOrders(req, res) {
   if (!req.file) return res.status(400).json({ error: 'Arquivo .xlsx obrigatório' });
 
@@ -13,16 +15,33 @@ async function importOrders(req, res) {
     return res.status(400).json({ error: 'storeId obrigatório' });
   }
 
-  let result;
-  try {
-    result = await importShopeeParentSKU(req.file.path, storeId, req.userId, req.file.originalname);
-  } catch (err) {
-    return res.status(400).json({ error: err.message });
-  } finally {
-    try { fs.unlinkSync(req.file.path); } catch {}
-  }
+  const job = await importQueue.add('import', {
+    filePath: req.file.path,
+    filename: req.file.originalname,
+    storeId,
+    userId:   req.userId,
+  });
 
-  return res.status(201).json(result);
+  return res.status(202).json({ jobId: job.id });
+}
+
+// GET /api/orders/import/:jobId — retorna status do job via BullMQ/Redis
+async function importStatus(req, res) {
+  const job = await Job.fromId(importQueue, req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+  if (job.data.userId !== req.userId) return res.status(403).json({ error: 'Acesso negado' });
+
+  const state = await job.getState(); // waiting | active | completed | failed | delayed
+
+  const statusMap = { waiting: 'pending', active: 'processing', completed: 'done', failed: 'error', delayed: 'pending' };
+
+  return res.json({
+    jobId:    job.id,
+    status:   statusMap[state] ?? state,
+    progress: job.progress ?? { step: 'aguardando', current: 0, total: 0 },
+    result:   state === 'completed' ? job.returnvalue : null,
+    error:    state === 'failed'    ? job.failedReason : null,
+  });
 }
 
 // GET /api/orders
@@ -317,4 +336,4 @@ async function skuReport(req, res) {
   return res.json({ products, totals });
 }
 
-module.exports = { importOrders, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders, skuReport };
+module.exports = { importOrders, importStatus, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders, skuReport };

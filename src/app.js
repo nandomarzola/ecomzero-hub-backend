@@ -15,6 +15,7 @@ const purchaseOrderRoutes = require('./routes/purchaseOrders');
 const newsRoutes          = require('./routes/news');
 const cashflowRoutes      = require('./routes/cashflow');
 const adminPanelRoutes    = require('./routes/adminPanel');
+const { startWorker }     = require('./services/importQueue');
 
 const app = express();
 app.set('etag', false);
@@ -78,6 +79,8 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3333;
 app.listen(PORT, () => {
   console.log(`ProfitTrack API rodando na porta ${PORT}`);
+  startWorker();
+  console.log('[import-worker] Worker de importação iniciado');
 });
 
 module.exports = app;

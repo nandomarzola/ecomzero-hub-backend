@@ -1,4 +1,4 @@
-const XLSX = require('xlsx');
+const XLSX  = require('xlsx');
 const prisma = require('../lib/prisma');
 const { calcProfit } = require('./calculatorService');
 
@@ -7,20 +7,15 @@ function parseBRL(value) {
   if (typeof value === 'number') return value;
   const str = String(value).trim();
   if (!str || str === '-') return 0;
-  const cleaned = str.replace(/\./g, '').replace(',', '.');
-  const result = parseFloat(cleaned);
-  return isNaN(result) ? 0 : result;
+  return parseFloat(str.replace(/\./g, '').replace(',', '.')) || 0;
 }
 
 function parseINT(value) {
   if (value === null || value === undefined || value === '') return 0;
   if (typeof value === 'number') return Math.round(value);
-  const str = String(value).trim().replace(/\./g, '').replace(',', '.');
-  const result = parseInt(str);
-  return isNaN(result) ? 0 : result;
+  return parseInt(String(value).trim().replace(/\./g, '').replace(',', '.')) || 0;
 }
 
-// Extrai YYYY-MM do nome do arquivo (parentskudetail.20260501_20260524.xlsx → 2026-05)
 function extractMonthKey(filename) {
   if (filename) {
     const m = String(filename).match(/(\d{4})(\d{2})\d{2}_/);
@@ -30,130 +25,220 @@ function extractMonthKey(filename) {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
-async function importShopeeParentSKU(filePath, storeId, userId, originalFilename) {
-  const workbook = XLSX.readFile(filePath, { raw: false });
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+function chunks(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
+async function importShopeeParentSKU(filePath, storeId, userId, originalFilename, onProgress) {
+  // ── 1. Verificar loja ────────────────────────────────────────────────────
   const where = userId ? { id: storeId, userId } : { id: storeId };
   const store = await prisma.store.findFirst({ where });
   if (!store) throw new Error('Loja não encontrada');
 
   const monthKey = extractMonthKey(originalFilename);
+  const [year, mon] = monthKey.split('-').map(Number);
+  const soldAt = new Date(Date.UTC(year, mon - 1, 15)); // dia 15 do mês como referência
 
-  // Agrupar linhas por itemId para decidir pai vs variação
+  // ── 2. Ler XLSX e agrupar linhas ─────────────────────────────────────────
+  const workbook = XLSX.readFile(filePath, { raw: false });
+  const sheet    = workbook.Sheets[workbook.SheetNames[0]];
+  const rows     = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
   const groups = {};
   for (const row of rows) {
     const itemId = String(row['ID do Item'] || '').trim();
     if (!itemId || itemId === 'ID do Item') continue;
     if (!groups[itemId]) groups[itemId] = { parent: null, variations: [] };
-    const varId = String(row['ID da Variação'] || '').trim();
-    if (varId === '-') {
-      groups[itemId].parent = row;
-    } else {
-      groups[itemId].variations.push(row);
-    }
+    String(row['ID da Variação'] || '').trim() === '-'
+      ? (groups[itemId].parent = row)
+      : groups[itemId].variations.push(row);
   }
 
-  let imported = 0;
-  let skipped = 0;
-  let totalRevenue = 0;
-  let totalProfit = 0;
+  // ── 3. PRÉ-FETCH em batch: produtos existentes + orders do mês ───────────
+  // Uma query para todos os produtos da loja
+  const existingProducts = await prisma.product.findMany({
+    where:  { storeId },
+    select: { id: true, externalId: true, sku: true, costPrice: true, packaging: true, supplies: true, parentId: true },
+  });
+  const byExternalId = new Map(existingProducts.map((p) => [p.externalId, p]));
+  const bySku        = new Map(existingProducts.filter((p) => p.sku).map((p) => [p.sku, p]));
+
+  // Uma query para todos os externalIds de orders já importados (evita duplicata)
+  const existingOrders = await prisma.order.findMany({
+    where:  { storeId },
+    select: { externalId: true },
+  });
+  const existingExternalIds = new Set(existingOrders.map((o) => o.externalId));
+
+  // ── 4. Calcular o que precisa ser criado ─────────────────────────────────
+  const productsToCreate = []; // novos produtos a criar em batch
+  const ordersToCreate   = []; // { externalId, productRef, revenue, quantity, unitPrice }
   const errors = [];
 
+  let total = 0;
+  // contar total para progresso
+  for (const group of Object.values(groups)) {
+    const varsWithRevenue = group.variations.filter((v) => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
+    if (varsWithRevenue.length > 0) total += varsWithRevenue.length;
+    else if (group.parent && parseBRL(group.parent['Vendas (Pedido pago) (BRL)']) > 0) total++;
+  }
+
+  // Mapa de produtos que ainda vamos criar (key = externalId planejado)
+  const plannedProducts = new Map();
+
   for (const [itemId, group] of Object.entries(groups)) {
-    const varsWithRevenue = group.variations.filter(v => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
+    const varsWithRevenue = group.variations.filter((v) => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
 
     if (varsWithRevenue.length > 0) {
-      // Produto COM variações — garantir que o produto pai existe
+      // ── Produto com variações ──
       const parentName = String(group.parent?.['Produto'] || varsWithRevenue[0]?.['Produto'] || '').trim();
-      let parentProduct = await prisma.product.findFirst({
-        where: { storeId, externalId: itemId, parentId: null },
-      });
-      if (!parentProduct) {
-        parentProduct = await prisma.product.create({
-          data: {
-            storeId,
-            externalId: itemId,
-            name:       parentName.substring(0, 255),
-            sku:        null,
-            costPrice:  0,
-            listPrice:  0,
-            packaging:  0,
-            supplies:   0,
-            stock:      0,
-          },
-        });
+      const parentExtId = itemId;
+
+      // Garantir produto pai (pode já existir, estar em byExternalId ou ser novo)
+      let parentRef = byExternalId.get(parentExtId) ?? plannedProducts.get(parentExtId);
+      if (!parentRef) {
+        parentRef = { _planned: true, externalId: parentExtId, name: parentName.substring(0, 255), sku: null, costPrice: 0, listPrice: 0, packaging: 0, supplies: 0, stock: 0 };
+        productsToCreate.push({ storeId, externalId: parentExtId, name: parentRef.name, sku: null, costPrice: 0, listPrice: 0, packaging: 0, supplies: 0, stock: 0 });
+        plannedProducts.set(parentExtId, parentRef);
       }
 
-      // Importar cada variação separada linkada ao pai
       for (const varRow of varsWithRevenue) {
         try {
           const varId       = String(varRow['ID da Variação'] || '').trim();
           const varName     = String(varRow['Nome da Variação'] || '').trim();
           const productName = String(varRow['Produto'] || group.parent?.['Produto'] || '').trim();
           const sku         = String(varRow['SKU da Variação'] || varRow['SKU Principle'] || '').trim();
+          const revenue     = parseBRL(varRow['Vendas (Pedido pago) (BRL)']);
+          const quantity    = parseINT(varRow['Unidades (Pedido pago)']);
+          if (revenue <= 0 || quantity <= 0) continue;
 
-          const revenue  = parseBRL(varRow['Vendas (Pedido pago) (BRL)']);
-          const quantity = parseINT(varRow['Unidades (Pedido pago)']);
-          if (revenue <= 0 || quantity <= 0) { skipped++; continue; }
-
-          const unitPrice = parseFloat((revenue / quantity).toFixed(2));
+          const unitPrice  = parseFloat((revenue / quantity).toFixed(2));
           const externalId = `${itemId}_${varId}_${monthKey}`;
+          if (existingExternalIds.has(externalId)) continue;
 
-          const exists = await prisma.order.findFirst({ where: { storeId, externalId } });
-          if (exists) { skipped++; continue; }
+          const varExtId = `${itemId}_${varId}`;
+          let productRef = (sku && sku !== '-' ? bySku.get(sku) : null) ?? byExternalId.get(varExtId) ?? plannedProducts.get(varExtId);
 
-          // Buscar produto pela variação (pode já existir como produto standalone do import anterior)
-          let product = null;
-          if (sku && sku !== '-') {
-            product = await prisma.product.findFirst({ where: { storeId, sku } });
-          }
-          if (!product) {
-            product = await prisma.product.findFirst({
-              where: { storeId, externalId: `${itemId}_${varId}` },
+          if (!productRef) {
+            const displayName = varName && varName !== '-' ? `${productName} — ${varName}` : productName;
+            productRef = { _planned: true, externalId: varExtId, costPrice: 0, packaging: 0, supplies: 0 };
+            productsToCreate.push({
+              storeId,
+              externalId: varExtId,
+              name:       displayName.substring(0, 255),
+              sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}-${varId}`,
+              costPrice:  0, listPrice: unitPrice, packaging: 0, supplies: 0, stock: 0,
+              // parentId será resolvido após createMany
+              _parentExtId: parentExtId,
             });
-          }
-          if (!product) {
-            const displayName = varName && varName !== '-'
-              ? `${productName} — ${varName}`
-              : productName;
-            product = await prisma.product.create({
-              data: {
-                storeId,
-                parentId:   parentProduct.id,
-                externalId: `${itemId}_${varId}`,
-                name:       displayName.substring(0, 255),
-                sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}-${varId}`,
-                costPrice:  0,
-                listPrice:  unitPrice,
-                packaging:  0,
-                supplies:   0,
-                stock:      0,
-              },
-            });
-          } else if (!product.parentId) {
-            // Produto existia como standalone — vincular ao pai
-            await prisma.product.update({
-              where: { id: product.id },
-              data:  { parentId: parentProduct.id },
-            });
+            plannedProducts.set(varExtId, productRef);
           }
 
-          const calc = calcProfit(revenue, quantity, product, store, 0, 0);
+          ordersToCreate.push({ externalId, varExtId: productRef._planned ? varExtId : null, productId: productRef._planned ? null : productRef.id, revenue, quantity, unitPrice, storeConfig: store });
+        } catch (err) {
+          errors.push({ produto: String(varRow['Produto'] || '?').substring(0, 50), erro: err.message });
+        }
+      }
+
+    } else if (group.parent) {
+      // ── Produto sem variações ──
+      try {
+        const row         = group.parent;
+        const productName = String(row['Produto'] || '').trim();
+        const sku         = String(row['SKU Principle'] || row['SKU da Variação'] || '').trim();
+        const revenue     = parseBRL(row['Vendas (Pedido pago) (BRL)']);
+        const quantity    = parseINT(row['Unidades (Pedido pago)']);
+        if (revenue <= 0 || quantity <= 0) continue;
+
+        const unitPrice  = parseFloat((revenue / quantity).toFixed(2));
+        const externalId = `${itemId}_${monthKey}`;
+        if (existingExternalIds.has(externalId)) continue;
+
+        let productRef = (sku && sku !== '-' ? bySku.get(sku) : null) ?? byExternalId.get(itemId) ?? plannedProducts.get(itemId);
+
+        if (!productRef) {
+          productRef = { _planned: true, externalId: itemId, costPrice: 0, packaging: 0, supplies: 0 };
+          productsToCreate.push({
+            storeId,
+            externalId: itemId,
+            name:       productName.substring(0, 255),
+            sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}`,
+            costPrice:  0, listPrice: unitPrice, packaging: 0, supplies: 0, stock: 0,
+          });
+          plannedProducts.set(itemId, productRef);
+        }
+
+        ordersToCreate.push({ externalId, varExtId: productRef._planned ? itemId : null, productId: productRef._planned ? null : productRef.id, revenue, quantity, unitPrice, storeConfig: store });
+      } catch (err) {
+        errors.push({ produto: String(group.parent['Produto'] || '?').substring(0, 50), erro: err.message });
+      }
+    }
+  }
+
+  onProgress?.({ step: 'products', current: 0, total: productsToCreate.length });
+
+  // ── 5. Criar produtos em batch (uma query) ──────────────────────────────
+  if (productsToCreate.length > 0) {
+    // Remover o campo auxiliar antes de criar
+    const data = productsToCreate.map(({ _parentExtId, ...rest }) => rest);
+    await prisma.product.createMany({ data, skipDuplicates: true });
+
+    // Buscar os recém-criados para obter IDs
+    const created = await prisma.product.findMany({
+      where:  { storeId, externalId: { in: productsToCreate.map((p) => p.externalId) } },
+      select: { id: true, externalId: true },
+    });
+    for (const p of created) byExternalId.set(p.externalId, p);
+
+    // Vincular variações ao produto pai (batch update)
+    const variantsToLink = productsToCreate.filter((p) => p._parentExtId);
+    if (variantsToLink.length > 0) {
+      await Promise.all(
+        variantsToLink.map((v) => {
+          const parentProduct = byExternalId.get(v._parentExtId);
+          const varProduct    = byExternalId.get(v.externalId);
+          if (parentProduct && varProduct) {
+            return prisma.product.update({ where: { id: varProduct.id }, data: { parentId: parentProduct.id } });
+          }
+        }).filter(Boolean)
+      );
+    }
+  }
+
+  onProgress?.({ step: 'orders', current: 0, total: ordersToCreate.length });
+
+  // ── 6. Criar orders em paralelo (batches de 20) ──────────────────────────
+  let imported = 0;
+  let skipped  = 0;
+  let totalRevenue = 0;
+  let totalProfit  = 0;
+
+  const orderBatches = chunks(ordersToCreate, 20);
+  for (const batch of orderBatches) {
+    await Promise.all(
+      batch.map(async (item) => {
+        try {
+          const productId = item.productId ?? byExternalId.get(item.varExtId)?.id;
+          if (!productId) { skipped++; return; }
+
+          // Buscar produto para calcProfit (custo pode ser 0, OK)
+          const product = existingProducts.find((p) => p.id === productId) ?? { costPrice: 0, packaging: 0, supplies: 0 };
+          const calc    = calcProfit(item.revenue, item.quantity, product, item.storeConfig, 0, 0);
 
           await prisma.$transaction(async (tx) => {
             const order = await tx.order.create({
               data: {
                 storeId,
-                externalId,
-                salePrice: revenue,
-                freight:   0,
-                discount:  0,
-                status:    'paid',
-                soldAt:    new Date(),
-                profit:    calc.profit,
-                margin:    calc.margin,
+                externalId:         item.externalId,
+                salePrice:          item.revenue,
+                freight:            0,
+                discount:           0,
+                status:             'paid',
+                soldAt,
+                profit:             calc.profit,
+                margin:             calc.margin,
                 snapshotCommission: store.commission,
                 snapshotServiceFee: store.serviceFee,
                 snapshotTaxRate:    store.taxRate,
@@ -163,107 +248,26 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
             await tx.orderItem.create({
               data: {
                 orderId:           order.id,
-                productId:         product.id,
-                quantity,
-                unitPrice,
+                productId,
+                quantity:          item.quantity,
+                unitPrice:         item.unitPrice,
                 snapshotCostPrice: product.costPrice,
-                snapshotPackaging: product.packaging,
-                snapshotSupplies:  product.supplies,
+                snapshotPackaging: product.packaging ?? 0,
+                snapshotSupplies:  product.supplies  ?? 0,
               },
             });
           });
 
-          totalRevenue += revenue;
+          totalRevenue += item.revenue;
           totalProfit  += calc.profit;
           imported++;
         } catch (err) {
-          errors.push({ produto: String(varRow['Produto'] || '?').substring(0, 50), erro: err.message });
           skipped++;
+          errors.push({ produto: item.externalId, erro: err.message });
         }
-      }
-    } else if (group.parent) {
-      // Produto SEM variações — importar linha pai
-      try {
-        const row         = group.parent;
-        const productName = String(row['Produto'] || '').trim();
-        const sku         = String(row['SKU Principle'] || row['SKU da Variação'] || '').trim();
-
-        const revenue  = parseBRL(row['Vendas (Pedido pago) (BRL)']);
-        const quantity = parseINT(row['Unidades (Pedido pago)']);
-        if (revenue <= 0 || quantity <= 0) { skipped++; continue; }
-
-        const unitPrice  = parseFloat((revenue / quantity).toFixed(2));
-        const externalId = `${itemId}_${monthKey}`;
-
-        const exists = await prisma.order.findFirst({ where: { storeId, externalId } });
-        if (exists) { skipped++; continue; }
-
-        let product = null;
-        if (sku && sku !== '-') {
-          product = await prisma.product.findFirst({ where: { storeId, sku } });
-        }
-        if (!product) {
-          product = await prisma.product.findFirst({
-            where: { storeId, externalId: itemId },
-          });
-        }
-        if (!product) {
-          product = await prisma.product.create({
-            data: {
-              storeId,
-              externalId: itemId,
-              name:       productName.substring(0, 255),
-              sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}`,
-              costPrice:  0,
-              listPrice:  unitPrice,
-              packaging:  0,
-              supplies:   0,
-              stock:      0,
-            },
-          });
-        }
-
-        const calc = calcProfit(revenue, quantity, product, store, 0, 0);
-
-        await prisma.$transaction(async (tx) => {
-          const order = await tx.order.create({
-            data: {
-              storeId,
-              externalId,
-              salePrice: revenue,
-              freight:   0,
-              discount:  0,
-              status:    'paid',
-              soldAt:    new Date(),
-              profit:    calc.profit,
-              margin:    calc.margin,
-              snapshotCommission: store.commission,
-              snapshotServiceFee: store.serviceFee,
-              snapshotTaxRate:    store.taxRate,
-              snapshotFixedFee:   store.fixedFeePerItem || 0,
-            },
-          });
-          await tx.orderItem.create({
-            data: {
-              orderId:           order.id,
-              productId:         product.id,
-              quantity,
-              unitPrice,
-              snapshotCostPrice: product.costPrice,
-              snapshotPackaging: product.packaging,
-              snapshotSupplies:  product.supplies,
-            },
-          });
-        });
-
-        totalRevenue += revenue;
-        totalProfit  += calc.profit;
-        imported++;
-      } catch (err) {
-        errors.push({ produto: String(group.parent['Produto'] || '?').substring(0, 50), erro: err.message });
-        skipped++;
-      }
-    }
+      })
+    );
+    onProgress?.({ step: 'orders', current: imported + skipped, total: ordersToCreate.length });
   }
 
   return {
@@ -271,10 +275,8 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
     skipped,
     totalRevenue: parseFloat(totalRevenue.toFixed(2)),
     totalProfit:  parseFloat(totalProfit.toFixed(2)),
-    avgMargin: totalRevenue > 0
-      ? parseFloat(((totalProfit / totalRevenue) * 100).toFixed(2))
-      : 0,
-    errors: errors.slice(0, 20),
+    avgMargin:    totalRevenue > 0 ? parseFloat(((totalProfit / totalRevenue) * 100).toFixed(2)) : 0,
+    errors:       errors.slice(0, 20),
   };
 }
 
