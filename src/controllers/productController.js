@@ -39,24 +39,37 @@ function withAlerts(p) {
   };
 }
 
-// GET /api/products — retorna apenas produtos raiz (sem pai) com variações incluídas
+// GET /api/products — produtos raiz com paginação e busca
 async function list(req, res) {
-  const { storeId } = req.query;
+  const { storeId, search, page = 1, limit = 20 } = req.query;
+
   const where = {
     parentId: null,
     ...(storeId ? { storeId, store: { userId: req.userId } } : { store: { userId: req.userId } }),
+    ...(search ? { OR: [
+      { name: { contains: search } },
+      { sku:  { contains: search } },
+    ]} : {}),
   };
 
-  const products = await prisma.product.findMany({
-    where,
-    include: {
-      store: { select: { name: true, marketplace: true } },
-      variants: { orderBy: { name: 'asc' } },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const take = parseInt(limit);
 
-  return res.json({ products: products.map(withAlerts) });
+  const [products, total] = await Promise.all([
+    prisma.product.findMany({
+      where,
+      include: {
+        store:    { select: { name: true, marketplace: true } },
+        variants: { orderBy: { name: 'asc' } },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+    }),
+    prisma.product.count({ where }),
+  ]);
+
+  return res.json({ products: products.map(withAlerts), total, page: parseInt(page), limit: take });
 }
 
 // GET /api/products/:id

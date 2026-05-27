@@ -47,7 +47,7 @@ async function createBill(req, res) {
   if (!amount || isNaN(parseFloat(amount))) return res.status(400).json({ error: 'Valor inválido' });
   if (!dueDate) return res.status(400).json({ error: 'Data de vencimento obrigatória' });
 
-  const n = Math.max(1, Math.min(24, parseInt(installments) || 1));
+  const n = Math.max(1, Math.min(999, parseInt(installments) || 1));
 
   if (n === 1) {
     const bill = await prisma.bill.create({
