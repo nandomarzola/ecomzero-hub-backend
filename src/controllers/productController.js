@@ -2,23 +2,23 @@ const { z } = require('zod');
 const prisma = require('../lib/prisma');
 
 const productSchema = z.object({
-  storeId:   z.string().uuid('storeId inválido'),
-  name:      z.string().min(1, 'Nome obrigatório'),
-  externalId: z.string().optional(),
-  sku:       z.string().optional(),
-  barcode:   z.string().optional(),
-  costPrice: z.number().min(0, 'Custo deve ser positivo'),
-  listPrice: z.number().min(0).optional(),
-  packaging: z.number().min(0).optional(),
-  supplies:  z.number().min(0).optional(),
-  stock:     z.number().int().min(0).optional(),
-  minStock:  z.number().int().min(0).optional(),
+  storeId:    z.string().uuid('storeId inválido'),
+  name:       z.string().min(1, 'Nome obrigatório'),
+  externalId: z.string().nullish(),
+  sku:        z.string().nullish(),
+  barcode:    z.string().nullish(),
+  costPrice:  z.number().min(0, 'Custo deve ser positivo'),
+  listPrice:  z.number().min(0).optional(),
+  packaging:  z.number().min(0).optional(),
+  supplies:   z.number().min(0).optional(),
+  stock:      z.number().int().min(0).optional(),
+  minStock:   z.number().int().min(0).optional(),
 });
 
 const variantSchema = z.object({
   name:      z.string().min(1, 'Nome da variação obrigatório'),
-  sku:       z.string().optional(),
-  barcode:   z.string().optional(),
+  sku:       z.string().nullish(),
+  barcode:   z.string().nullish(),
   costPrice: z.number().min(0).optional(),
   listPrice: z.number().min(0).optional(),
   packaging: z.number().min(0).optional(),
