@@ -15,6 +15,11 @@ async function importOrders(req, res) {
     return res.status(400).json({ error: 'storeId obrigatório' });
   }
 
+  if (!importQueue) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(503).json({ error: 'Serviço de importação indisponível (Redis não configurado)' });
+  }
+
   const job = await importQueue.add('import', {
     filePath: req.file.path,
     filename: req.file.originalname,
@@ -27,11 +32,13 @@ async function importOrders(req, res) {
 
 // GET /api/orders/import/:jobId — retorna status do job via BullMQ/Redis
 async function importStatus(req, res) {
+  if (!importQueue) return res.status(503).json({ error: 'Serviço de importação indisponível' });
+
   const job = await Job.fromId(importQueue, req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job não encontrado' });
   if (job.data.userId !== req.userId) return res.status(403).json({ error: 'Acesso negado' });
 
-  const state = await job.getState(); // waiting | active | completed | failed | delayed
+  const state = await job.getState();
 
   const statusMap = { waiting: 'pending', active: 'processing', completed: 'done', failed: 'error', delayed: 'pending' };
 
