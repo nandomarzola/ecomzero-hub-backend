@@ -2,7 +2,8 @@ const fs     = require('fs');
 const prisma  = require('../lib/prisma');
 const { calcProfit } = require('../services/calculatorService');
 const { Job }        = require('bullmq');
-const { importQueue } = require('../services/importQueue');
+const { importQueue }       = require('../services/importQueue');
+const { recalculateQueue }  = require('../services/recalculateQueue');
 const connection = require('../lib/redisConnection');
 
 // POST /api/orders/import — enfileira job, responde 202 + jobId imediatamente
@@ -132,79 +133,36 @@ async function deleteOrder(req, res) {
   return res.json({ message: 'Pedido cancelado e estoque revertido' });
 }
 
-// POST /api/orders/recalculate
-// Recalcula profit/margin usando os custos atuais de produto e taxas da loja.
-// Por padrão opera apenas no mês corrente (soldAt no mesmo mês de hoje).
-// Passe { month: "2026-05" } no body para outro mês específico.
-// Meses passados são protegidos: recalcula usando os snapshots salvos na importação,
-// apenas atualizando o profit/margin caso os custos de produto tenham mudado.
+// POST /api/orders/recalculate — enfileira job de recálculo, retorna jobId imediatamente
 async function recalculateOrders(req, res) {
-  const { month } = req.body ?? {};
+  const body = req.body ?? {};
 
-  const now = new Date();
-  const targetMonth = month || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  const [year, mon] = targetMonth.split('-').map(Number);
-  const startOfMonth = new Date(Date.UTC(year, mon - 1, 1));
-  const endOfMonth   = new Date(Date.UTC(year, mon, 0, 23, 59, 59, 999));
-
-  const isCurrentMonth =
-    year === now.getFullYear() && mon === now.getMonth() + 1;
-
-  const orders = await prisma.order.findMany({
-    where: {
-      store:  { userId: req.userId },
-      soldAt: { gte: startOfMonth, lte: endOfMonth },
-    },
-    include: { store: true, items: { include: { product: true } } },
+  const job = await recalculateQueue.add('recalculate', {
+    userId: req.userId,
+    all:    body.all    ?? false,
+    months: body.months ?? null,
   });
 
-  let updated = 0;
-  for (const order of orders) {
-    let totalProfit    = 0;
-    let totalSalePrice = 0;
+  return res.status(202).json({ jobId: job.id });
+}
 
-    for (const item of order.items) {
-      // Para o mês atual: usa configurações atuais da loja + custo atual do produto
-      // Para meses passados: usa snapshots salvos na importação (taxas e custo do produto)
-      const storeConfig = isCurrentMonth
-        ? order.store
-        : {
-            marketplace:     order.store.marketplace,
-            commission:      order.snapshotCommission,
-            serviceFee:      order.snapshotServiceFee,
-            taxRate:         order.snapshotTaxRate,
-            fixedFeePerItem: order.snapshotFixedFee,
-          };
+// GET /api/orders/recalculate/:jobId — polling de progresso do job
+async function recalculateStatus(req, res) {
+  const job = await Job.fromId(recalculateQueue, req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
+  if (job.data.userId !== req.userId) return res.status(403).json({ error: 'Acesso negado' });
 
-      const productConfig = isCurrentMonth
-        ? item.product
-        : {
-            costPrice: item.snapshotCostPrice,
-            packaging: item.snapshotPackaging,
-            supplies:  item.snapshotSupplies,
-          };
-
-      const calc = calcProfit(item.unitPrice * item.quantity, item.quantity, productConfig, storeConfig, 0, 0);
-      totalProfit    += calc.profit;
-      totalSalePrice += calc.breakdown.salePrice;
-    }
-
-    const margin = totalSalePrice > 0 ? (totalProfit / totalSalePrice) * 100 : 0;
-    await prisma.order.update({
-      where: { id: order.id },
-      data:  {
-        profit: parseFloat(totalProfit.toFixed(2)),
-        margin: parseFloat(margin.toFixed(2)),
-      },
-    });
-    updated++;
-  }
+  const state     = await job.getState();
+  const statusMap = { waiting: 'pending', active: 'active', completed: 'completed', failed: 'failed', delayed: 'pending' };
+  const progress  = job.progress ?? { pct: 0, message: 'Aguardando...' };
 
   return res.json({
-    updated,
-    month: targetMonth,
-    isCurrentMonth,
-    message: `${updated} pedido(s) de ${targetMonth} recalculado(s)`,
+    jobId:   job.id,
+    status:  statusMap[state] ?? state,
+    pct:     typeof progress === 'object' ? (progress.pct ?? 0)      : progress,
+    message: typeof progress === 'object' ? (progress.message ?? '')  : '',
+    result:  state === 'completed' ? job.returnvalue : null,
+    error:   state === 'failed'    ? job.failedReason : null,
   });
 }
 
@@ -271,15 +229,26 @@ async function skuReport(req, res) {
     }
   }
 
+  // Pre-fetch all store configs needed (avoid N+1 on current-month orders)
+  const storeCache = new Map();
+  const getStore = async (storeId) => {
+    if (!storeCache.has(storeId)) {
+      storeCache.set(storeId, await prisma.store.findUnique({ where: { id: storeId } }));
+    }
+    return storeCache.get(storeId);
+  };
+
   const orders = await prisma.order.findMany({
     where,
     include: {
-      store: { select: { marketplace: true } },
-      items: { include: { product: { select: { id: true, name: true, sku: true } } } },
+      store: true,
+      items: { include: { product: { select: { id: true, name: true, sku: true, costPrice: true, packaging: true, supplies: true } } } },
     },
   });
 
-  // Agrega por produto usando cálculo por item com snapshots
+  // Agrega por produto usando cálculo por item.
+  // Regra de custo: snapshot se não-zero, senão custo atual do produto (fix para pedidos
+  // importados antes dos custos serem cadastrados).
   const map = new Map();
 
   for (const order of orders) {
@@ -290,13 +259,21 @@ async function skuReport(req, res) {
     })();
 
     const storeConfig = isCurrentMonth
-      ? await prisma.store.findUnique({ where: { id: order.storeId } })
-      : { marketplace: order.store.marketplace, commission: order.snapshotCommission, serviceFee: order.snapshotServiceFee, taxRate: order.snapshotTaxRate, fixedFeePerItem: order.snapshotFixedFee };
+      ? await getStore(order.storeId)
+      : {
+          marketplace:     order.store.marketplace,
+          commission:      order.snapshotCommission || order.store.commission,
+          serviceFee:      order.snapshotServiceFee || order.store.serviceFee,
+          taxRate:         order.snapshotTaxRate    || order.store.taxRate,
+          fixedFeePerItem: order.snapshotFixedFee   || order.store.fixedFeePerItem,
+        };
 
     for (const item of order.items) {
-      const productConfig = isCurrentMonth
-        ? item.product
-        : { costPrice: item.snapshotCostPrice, packaging: item.snapshotPackaging, supplies: item.snapshotSupplies };
+      // Fallback: se snapshot zerado (importado antes do custo ser cadastrado), usa custo atual
+      const costPrice = isCurrentMonth ? (item.product?.costPrice ?? 0) : (item.snapshotCostPrice || item.product?.costPrice || 0);
+      const packaging = isCurrentMonth ? (item.product?.packaging ?? 0) : (item.snapshotPackaging || item.product?.packaging || 0);
+      const supplies  = isCurrentMonth ? (item.product?.supplies  ?? 0) : (item.snapshotSupplies  || item.product?.supplies  || 0);
+      const productConfig = { costPrice, packaging, supplies };
 
       const revenue = item.unitPrice * item.quantity;
       const calc    = calcProfit(revenue, item.quantity, productConfig, storeConfig, 0, 0);
@@ -322,12 +299,50 @@ async function skuReport(req, res) {
     }
   }
 
-  const products = Array.from(map.values()).map((r) => ({
-    ...r,
-    totalRevenue: parseFloat(r.totalRevenue.toFixed(2)),
-    totalProfit:  parseFloat(r.totalProfit.toFixed(2)),
-    avgMargin:    r.totalRevenue > 0 ? parseFloat(((r.totalProfit / r.totalRevenue) * 100).toFixed(1)) : 0,
-  })).sort((a, b) => b.totalRevenue - a.totalRevenue);
+  // Enriquece com dados de estoque e vendas dos últimos 30 dias
+  const productIds = Array.from(map.keys()).filter(Boolean);
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const [productsStock, items30] = await Promise.all([
+    prisma.product.findMany({
+      where:  { id: { in: productIds } },
+      select: { id: true, stock: true, minStock: true },
+    }),
+    prisma.orderItem.findMany({
+      where: {
+        productId: { in: productIds },
+        order: { status: { not: 'cancelled' }, soldAt: { gte: thirtyDaysAgo } },
+      },
+      select: { productId: true, quantity: true },
+    }),
+  ]);
+
+  const stockByPid  = Object.fromEntries(productsStock.map((p) => [p.id, p]));
+  const sales30ByPid = {};
+  for (const it of items30) {
+    sales30ByPid[it.productId] = (sales30ByPid[it.productId] ?? 0) + it.quantity;
+  }
+
+  const products = Array.from(map.values()).map((r) => {
+    const st          = stockByPid[r.productId] ?? { stock: 0, minStock: 5 };
+    const sales30     = sales30ByPid[r.productId] ?? 0;
+    const salesPerDay = sales30 / 30;
+    const daysRem     = salesPerDay > 0 ? st.stock / salesPerDay : null;
+    const suggested   = salesPerDay > 0 ? Math.max(0, Math.round(salesPerDay * 60 - st.stock)) : 0;
+    return {
+      ...r,
+      totalRevenue:    parseFloat(r.totalRevenue.toFixed(2)),
+      totalProfit:     parseFloat(r.totalProfit.toFixed(2)),
+      avgMargin:       r.totalRevenue > 0 ? parseFloat(((r.totalProfit / r.totalRevenue) * 100).toFixed(1)) : 0,
+      stock:           st.stock,
+      minStock:        st.minStock,
+      salesLast30:     sales30,
+      salesPerDay:     parseFloat(salesPerDay.toFixed(2)),
+      daysRemaining:   daysRem !== null ? parseFloat(daysRem.toFixed(1)) : null,
+      suggestedReorder: suggested,
+    };
+  }).sort((a, b) => b.totalRevenue - a.totalRevenue);
 
   const totals = products.reduce((s, p) => ({
     qty:     s.qty     + p.totalQty,
@@ -338,4 +353,4 @@ async function skuReport(req, res) {
   return res.json({ products, totals });
 }
 
-module.exports = { importOrders, importStatus, listOrders, getOrder, deleteOrder, recalculateOrders, exportOrders, skuReport };
+module.exports = { importOrders, importStatus, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport };

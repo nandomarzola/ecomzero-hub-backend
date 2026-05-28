@@ -15,7 +15,10 @@ const purchaseOrderRoutes = require('./routes/purchaseOrders');
 const newsRoutes          = require('./routes/news');
 const cashflowRoutes      = require('./routes/cashflow');
 const adminPanelRoutes    = require('./routes/adminPanel');
-const { startWorker }     = require('./services/importQueue');
+const goalsRoutes         = require('./routes/goals');
+const insightsRoutes      = require('./routes/insights');
+const { startWorker }             = require('./services/importQueue');
+const { startRecalculateWorker }  = require('./services/recalculateQueue');
 
 const app = express();
 app.set('etag', false);
@@ -69,6 +72,8 @@ app.use('/api/purchase-orders', purchaseOrderRoutes);
 app.use('/api/news',           newsRoutes);
 app.use('/api/cashflow',       cashflowRoutes);
 app.use('/api/admin',          adminPanelRoutes);
+app.use('/api/goals',          goalsRoutes);
+app.use('/api/insights',       insightsRoutes);
 
 // Tratamento de erros global
 app.use((err, req, res, next) => {
@@ -81,6 +86,8 @@ app.listen(PORT, () => {
   console.log(`ProfitTrack API rodando na porta ${PORT}`);
   startWorker();
   console.log('[import-worker] Worker de importação iniciado');
+  startRecalculateWorker();
+  console.log('[recalculate-worker] Worker de recálculo iniciado');
 });
 
 module.exports = app;
