@@ -149,10 +149,10 @@ async function remove(req, res) {
   if (!existing) return res.status(404).json({ error: 'Produto não encontrado' });
 
   const ids = [existing.id, ...existing.variants.map((v) => v.id)];
-  const orderCount = await prisma.orderItem.count({ where: { productId: { in: ids } } });
+  const orderCount = await prisma.orderItem.count({ where: { productId: { in: ids }, order: { status: 'paid' } } });
   if (orderCount > 0) {
     return res.status(409).json({
-      error: `Este produto possui ${orderCount} item(ns) vinculado(s) a pedidos e não pode ser removido.`,
+      error: `Este produto possui ${orderCount} item(ns) vinculado(s) a pedidos pagos e não pode ser removido.`,
     });
   }
 
@@ -224,10 +224,10 @@ async function removeVariant(req, res) {
   });
   if (!variant) return res.status(404).json({ error: 'Variação não encontrada' });
 
-  const orderCount = await prisma.orderItem.count({ where: { productId: variant.id } });
+  const orderCount = await prisma.orderItem.count({ where: { productId: variant.id, order: { status: 'paid' } } });
   if (orderCount > 0) {
     return res.status(409).json({
-      error: `Esta variação possui ${orderCount} item(ns) vinculado(s) a pedidos e não pode ser removida.`,
+      error: `Esta variação possui ${orderCount} item(ns) vinculado(s) a pedidos pagos e não pode ser removida.`,
     });
   }
 
@@ -235,4 +235,93 @@ async function removeVariant(req, res) {
   return res.json({ message: 'Variação removida' });
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant };
+// GET /api/products/stock-report — inteligência de estoque por produto
+async function stockReport(req, res) {
+  const { storeId } = req.query;
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true, name: true, marketplace: true } });
+  const storeIds = stores.map((s) => s.id);
+  if (!storeIds.length) return res.json({ products: [] });
+
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const [allProducts, items30, lastPurchases] = await Promise.all([
+    prisma.product.findMany({
+      where:   { storeId: { in: storeIds } },
+      select:  { id: true, name: true, sku: true, stock: true, minStock: true, costPrice: true, storeId: true, parentId: true, createdAt: true },
+      orderBy: { name: 'asc' },
+    }),
+    prisma.orderItem.findMany({
+      where:  { order: { storeId: { in: storeIds }, status: { not: 'cancelled' }, soldAt: { gte: thirtyDaysAgo } } },
+      select: { productId: true, quantity: true },
+    }),
+    prisma.purchaseOrderItem.findMany({
+      where:   { purchaseOrder: { userId: req.userId, status: 'received' } },
+      select:  { productId: true, purchaseOrder: { select: { receivedAt: true } } },
+      orderBy: { purchaseOrder: { receivedAt: 'desc' } },
+    }),
+  ]);
+
+  const sales30ByPid   = {};
+  for (const it of items30) {
+    sales30ByPid[it.productId] = (sales30ByPid[it.productId] ?? 0) + it.quantity;
+  }
+
+  const lastReceiptByPid = {};
+  for (const it of lastPurchases) {
+    if (!lastReceiptByPid[it.productId]) {
+      lastReceiptByPid[it.productId] = it.purchaseOrder.receivedAt;
+    }
+  }
+
+  const storeById = Object.fromEntries(stores.map((s) => [s.id, s]));
+
+  const products = allProducts.map((p) => {
+    const sales30     = sales30ByPid[p.id] ?? 0;
+    const salesPerDay = sales30 / 30;
+    const daysRem     = salesPerDay > 0 ? p.stock / salesPerDay : null;
+    const suggested   = salesPerDay > 0 ? Math.max(0, Math.round(salesPerDay * 60 - p.stock)) : 0;
+    const store       = storeById[p.storeId];
+    return {
+      id:              p.id,
+      name:            p.name,
+      sku:             p.sku ?? '',
+      stock:           p.stock,
+      minStock:        p.minStock,
+      costPrice:       p.costPrice,
+      storeId:         p.storeId,
+      storeName:       store?.name ?? '',
+      marketplace:     store?.marketplace ?? '',
+      isVariant:       !!p.parentId,
+      salesLast30:     sales30,
+      salesPerDay:     parseFloat(salesPerDay.toFixed(3)),
+      daysRemaining:   daysRem !== null ? parseFloat(daysRem.toFixed(1)) : null,
+      suggestedReorder: suggested,
+      lastReceivedAt:  lastReceiptByPid[p.id] ?? null,
+      createdAt:       p.createdAt,
+    };
+  });
+
+  // Ordena: críticos (< 15 dias) → atenção (15-30) → ok → sem movimento → sem estoque/venda
+  products.sort((a, b) => {
+    const urgA = a.daysRemaining !== null ? a.daysRemaining : 9999;
+    const urgB = b.daysRemaining !== null ? b.daysRemaining : 9999;
+    return urgA - urgB;
+  });
+
+  const totals = {
+    total:      products.length,
+    critical:   products.filter((p) => p.daysRemaining !== null && p.daysRemaining < 15).length,
+    warning:    products.filter((p) => p.daysRemaining !== null && p.daysRemaining >= 15 && p.daysRemaining < 30).length,
+    ok:         products.filter((p) => p.daysRemaining !== null && p.daysRemaining >= 30).length,
+    noMovement: products.filter((p) => p.daysRemaining === null).length,
+  };
+
+  return res.json({ products, totals });
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport };

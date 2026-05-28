@@ -8,7 +8,6 @@ function computeBillStatus(bill) {
 async function getSummary(req, res) {
   const { storeId, startDate, endDate } = req.query;
 
-  // Lojas do usuário
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
   const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
@@ -22,95 +21,174 @@ async function getSummary(req, res) {
     dateFilter.lte = end;
   }
 
-  // Receitas (pedidos pagos)
   const orderWhere = {
     storeId: { in: storeIds },
     status:  'paid',
     ...(Object.keys(dateFilter).length ? { soldAt: dateFilter } : {}),
   };
 
-  const orders = await prisma.order.findMany({
-    where:  orderWhere,
-    select: { salePrice: true, profit: true, soldAt: true },
-  });
-
-  const totalRevenue = orders.reduce((s, o) => s + o.salePrice, 0);
-  const totalProfit  = orders.reduce((s, o) => s + (o.profit ?? 0), 0);
-
-  // Contas a pagar do usuário
   const billWhere = {
     userId: req.userId,
     ...(storeId ? { storeId } : {}),
     ...(Object.keys(dateFilter).length ? { dueDate: dateFilter } : {}),
   };
 
-  const bills = await prisma.bill.findMany({ where: billWhere });
+  const [orders, bills] = await Promise.all([
+    prisma.order.findMany({
+      where:  orderWhere,
+      select: {
+        salePrice:          true,
+        freight:            true,
+        discount:           true,
+        soldAt:             true,
+        snapshotCommission: true,
+        snapshotServiceFee: true,
+        snapshotTaxRate:    true,
+        snapshotFixedFee:   true,
+        items: {
+          select: {
+            quantity:         true,
+            snapshotCostPrice:true,
+            snapshotPackaging:true,
+            snapshotSupplies: true,
+          },
+        },
+      },
+    }),
+    prisma.bill.findMany({ where: billWhere }),
+  ]);
 
-  const enrichedBills = bills.map((b) => ({ ...b, computedStatus: computeBillStatus(b) }));
+  // Aggregate DRE from orders
+  let totalRevenue    = 0;
+  let totalCmv        = 0;
+  let totalPackaging  = 0;
+  let totalSupplies   = 0;
+  let totalFreight    = 0;
+  let totalCommission = 0;
+  let totalServiceFee = 0;
+  let totalFixedFee   = 0;
+  let totalTaxProv    = 0;
 
-  const totalPaid    = enrichedBills.filter((b) => b.computedStatus === 'paid').reduce((s, b) => s + b.amount, 0);
-  const totalPending = enrichedBills.filter((b) => b.computedStatus === 'pending').reduce((s, b) => s + b.amount, 0);
-  const totalOverdue = enrichedBills.filter((b) => b.computedStatus === 'overdue').reduce((s, b) => s + b.amount, 0);
+  const monthlyMap = {};
 
-  // Resultado: receita - despesas pagas
-  const netResult = totalRevenue - totalPaid;
+  for (const o of orders) {
+    const effective = (o.salePrice ?? 0) - (o.discount ?? 0);
+    totalRevenue    += effective;
+    totalCommission += effective * ((o.snapshotCommission ?? 0) / 100);
+    totalServiceFee += effective * ((o.snapshotServiceFee ?? 0) / 100);
+    totalTaxProv    += effective * ((o.snapshotTaxRate    ?? 0) / 100);
+    totalFreight    += o.freight ?? 0;
 
-  // Por categoria de despesa
+    const key = o.soldAt.toISOString().substring(0, 7);
+    if (!monthlyMap[key]) {
+      monthlyMap[key] = { month: key, revenue: 0, cmv: 0, fees: 0, operational: 0, bills: 0, taxProvision: 0 };
+    }
+    const m = monthlyMap[key];
+    m.revenue    += effective;
+    m.fees       += effective * (((o.snapshotCommission ?? 0) + (o.snapshotServiceFee ?? 0)) / 100);
+    m.taxProvision += effective * ((o.snapshotTaxRate ?? 0) / 100);
+    m.operational  += o.freight ?? 0;
+
+    for (const item of o.items) {
+      const qty  = item.quantity ?? 0;
+      const cost = (item.snapshotCostPrice ?? 0) * qty;
+      const pack = (item.snapshotPackaging  ?? 0) * qty;
+      const supp = (item.snapshotSupplies   ?? 0) * qty;
+      const fixd = (o.snapshotFixedFee      ?? 0) * qty;
+
+      totalCmv       += cost;
+      totalPackaging += pack;
+      totalSupplies  += supp;
+      totalFixedFee  += fixd;
+
+      m.cmv         += cost;
+      m.operational += pack + supp;
+      m.fees        += fixd;
+    }
+  }
+
+  const totalMarketplaceFees   = totalCommission + totalServiceFee + totalFixedFee;
+  const totalOperationalCosts  = totalPackaging  + totalSupplies   + totalFreight;
+
+  // Bills
+  const enrichedBills  = bills.map((b) => ({ ...b, computedStatus: computeBillStatus(b) }));
+  const totalPaid      = enrichedBills.filter((b) => b.computedStatus === 'paid').reduce((s, b) => s + b.amount, 0);
+  const totalPending   = enrichedBills.filter((b) => b.computedStatus === 'pending').reduce((s, b) => s + b.amount, 0);
+  const totalOverdue   = enrichedBills.filter((b) => b.computedStatus === 'overdue').reduce((s, b) => s + b.amount, 0);
+
   const byCategory = {};
   for (const b of enrichedBills) {
     if (!byCategory[b.category]) byCategory[b.category] = 0;
     byCategory[b.category] += b.amount;
   }
 
-  // Evolução mensal: receitas e despesas por mês
-  const monthlyMap = {};
+  // DRE
+  const grossProfit      = totalRevenue - totalCmv;
+  const operatingProfit  = grossProfit - totalMarketplaceFees - totalOperationalCosts - totalPaid;
+  const netProfit        = operatingProfit - totalTaxProv;
 
-  for (const o of orders) {
-    const key = o.soldAt.toISOString().substring(0, 7);
-    if (!monthlyMap[key]) monthlyMap[key] = { month: key, revenue: 0, profit: 0, expenses: 0 };
-    monthlyMap[key].revenue += o.salePrice;
-    monthlyMap[key].profit  += o.profit ?? 0;
-  }
-
+  // Bills into monthly map
   for (const b of enrichedBills) {
     const key = new Date(b.dueDate).toISOString().substring(0, 7);
-    if (!monthlyMap[key]) monthlyMap[key] = { month: key, revenue: 0, profit: 0, expenses: 0 };
-    monthlyMap[key].expenses += b.amount;
+    if (!monthlyMap[key]) monthlyMap[key] = { month: key, revenue: 0, cmv: 0, fees: 0, operational: 0, bills: 0, taxProvision: 0 };
+    monthlyMap[key].bills += b.amount;
   }
 
   const monthlyChart = Object.values(monthlyMap)
     .sort((a, b) => a.month.localeCompare(b.month))
-    .map((m) => ({
-      month:    m.month,
-      revenue:  parseFloat(m.revenue.toFixed(2)),
-      profit:   parseFloat(m.profit.toFixed(2)),
-      expenses: parseFloat(m.expenses.toFixed(2)),
-      net:      parseFloat((m.revenue - m.expenses).toFixed(2)),
-    }));
+    .map((m) => {
+      const np = m.revenue - m.cmv - m.fees - m.operational - m.bills - m.taxProvision;
+      return {
+        month:        m.month,
+        revenue:      parseFloat(m.revenue.toFixed(2)),
+        cmv:          parseFloat(m.cmv.toFixed(2)),
+        fees:         parseFloat(m.fees.toFixed(2)),
+        operational:  parseFloat(m.operational.toFixed(2)),
+        bills:        parseFloat(m.bills.toFixed(2)),
+        taxProvision: parseFloat(m.taxProvision.toFixed(2)),
+        netProfit:    parseFloat(np.toFixed(2)),
+      };
+    });
 
-  // Próximas contas a vencer (próximos 30 dias)
-  const soon = new Date();
+  // Upcoming bills (next 30 days)
   const soonLimit = new Date();
   soonLimit.setDate(soonLimit.getDate() + 30);
-
   const upcoming = enrichedBills
     .filter((b) => b.computedStatus === 'pending' && new Date(b.dueDate) <= soonLimit)
     .sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate))
     .slice(0, 10);
 
+  const r = (v) => parseFloat(v.toFixed(2));
+
   return res.json({
-    income: {
-      totalRevenue:  parseFloat(totalRevenue.toFixed(2)),
-      totalProfit:   parseFloat(totalProfit.toFixed(2)),
-      orderCount:    orders.length,
+    orderCount: orders.length,
+    dre: {
+      grossRevenue:   r(totalRevenue),
+      cmv:            r(totalCmv),
+      grossProfit:    r(grossProfit),
+      marketplaceFees: r(totalMarketplaceFees),
+      marketplaceFeesBreakdown: {
+        commission: r(totalCommission),
+        serviceFee: r(totalServiceFee),
+        fixedFee:   r(totalFixedFee),
+      },
+      operationalCosts: r(totalOperationalCosts),
+      operationalCostsBreakdown: {
+        packaging: r(totalPackaging),
+        supplies:  r(totalSupplies),
+        freight:   r(totalFreight),
+      },
+      billsPaid:       r(totalPaid),
+      operatingProfit: r(operatingProfit),
+      taxProvision:    r(totalTaxProv),
+      netProfit:       r(netProfit),
     },
-    expenses: {
-      totalPaid:    parseFloat(totalPaid.toFixed(2)),
-      totalPending: parseFloat(totalPending.toFixed(2)),
-      totalOverdue: parseFloat(totalOverdue.toFixed(2)),
-      byCategory:   Object.entries(byCategory).map(([cat, val]) => ({ category: cat, amount: parseFloat(val.toFixed(2)) })),
+    bills: {
+      totalPaid:    r(totalPaid),
+      totalPending: r(totalPending),
+      totalOverdue: r(totalOverdue),
+      byCategory:   Object.entries(byCategory).map(([cat, val]) => ({ category: cat, amount: r(val) })),
     },
-    netResult: parseFloat(netResult.toFixed(2)),
     monthlyChart,
     upcoming,
   });

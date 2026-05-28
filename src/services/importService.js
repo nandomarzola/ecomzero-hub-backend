@@ -77,11 +77,21 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
   const ordersToCreate   = []; // { externalId, productRef, revenue, quantity, unitPrice }
   const errors = [];
 
+  // Variação ativa = tem vendas pagas E não foi excluída no Shopee
+  const isActiveVar = (v) =>
+    parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0 &&
+    String(v['Status Atual da Variação'] || '').trim() !== 'Excluído';
+
+  // Variação excluída mas com vendas reais → pedido vai para o produto pai (preserva faturamento)
+  const isDeletedWithRevenue = (v) =>
+    parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0 &&
+    String(v['Status Atual da Variação'] || '').trim() === 'Excluído';
+
   let total = 0;
-  // contar total para progresso
   for (const group of Object.values(groups)) {
-    const varsWithRevenue = group.variations.filter((v) => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
-    if (varsWithRevenue.length > 0) total += varsWithRevenue.length;
+    const active  = group.variations.filter(isActiveVar);
+    const deleted = group.variations.filter(isDeletedWithRevenue);
+    if (active.length + deleted.length > 0) total += active.length + deleted.length;
     else if (group.parent && parseBRL(group.parent['Vendas (Pedido pago) (BRL)']) > 0) total++;
   }
 
@@ -89,11 +99,12 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
   const plannedProducts = new Map();
 
   for (const [itemId, group] of Object.entries(groups)) {
-    const varsWithRevenue = group.variations.filter((v) => parseBRL(v['Vendas (Pedido pago) (BRL)']) > 0);
+    const varsActive  = group.variations.filter(isActiveVar);
+    const varsDeleted = group.variations.filter(isDeletedWithRevenue);
 
-    if (varsWithRevenue.length > 0) {
-      // ── Produto com variações ──
-      const parentName = String(group.parent?.['Produto'] || varsWithRevenue[0]?.['Produto'] || '').trim();
+    if (varsActive.length > 0 || varsDeleted.length > 0) {
+      // ── Produto com variações (ativas e/ou excluídas com vendas) ──
+      const parentName  = String(group.parent?.['Produto'] || varsActive[0]?.['Produto'] || varsDeleted[0]?.['Produto'] || '').trim();
       const parentExtId = itemId;
 
       // Garantir produto pai (pode já existir, estar em byExternalId ou ser novo)
@@ -104,7 +115,8 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
         plannedProducts.set(parentExtId, parentRef);
       }
 
-      for (const varRow of varsWithRevenue) {
+      // ── Variações ativas: cria produto de variação e pedido normalmente ──
+      for (const varRow of varsActive) {
         try {
           const varId       = String(varRow['ID da Variação'] || '').trim();
           const varName     = String(varRow['Nome da Variação'] || '').trim();
@@ -122,7 +134,11 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
           let productRef = (sku && sku !== '-' ? bySku.get(sku) : null) ?? byExternalId.get(varExtId) ?? plannedProducts.get(varExtId);
 
           if (!productRef) {
-            const displayName = varName && varName !== '-' ? `${productName} — ${varName}` : productName;
+            // Não usar varName se for igual ao productName (evita "Produto — Produto")
+            const usefulVarName = varName && varName !== '-' && varName.trim().toLowerCase() !== productName.trim().toLowerCase()
+              ? varName.trim()
+              : null;
+            const displayName = usefulVarName ? `${productName} — ${usefulVarName}` : productName;
             productRef = { _planned: true, externalId: varExtId, costPrice: 0, packaging: 0, supplies: 0 };
             productsToCreate.push({
               storeId,
@@ -130,13 +146,37 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
               name:       displayName.substring(0, 255),
               sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}-${varId}`,
               costPrice:  0, listPrice: unitPrice, packaging: 0, supplies: 0, stock: 0,
-              // parentId será resolvido após createMany
               _parentExtId: parentExtId,
             });
             plannedProducts.set(varExtId, productRef);
           }
 
           ordersToCreate.push({ externalId, varExtId: productRef._planned ? varExtId : null, productId: productRef._planned ? null : productRef.id, revenue, quantity, unitPrice, storeConfig: store });
+        } catch (err) {
+          errors.push({ produto: String(varRow['Produto'] || '?').substring(0, 50), erro: err.message });
+        }
+      }
+
+      // ── Variações excluídas com vendas: preserva faturamento linkando ao produto pai ──
+      for (const varRow of varsDeleted) {
+        try {
+          const varId   = String(varRow['ID da Variação'] || '').trim();
+          const revenue = parseBRL(varRow['Vendas (Pedido pago) (BRL)']);
+          const quantity = parseINT(varRow['Unidades (Pedido pago)']);
+          if (revenue <= 0 || quantity <= 0) continue;
+
+          const externalId = `${itemId}_${varId}_${monthKey}`;
+          if (existingExternalIds.has(externalId)) continue;
+
+          const unitPrice = parseFloat((revenue / quantity).toFixed(2));
+
+          // Pedido vinculado ao pai — não cria produto de variação com nome errado
+          ordersToCreate.push({
+            externalId,
+            varExtId:  parentRef._planned ? parentExtId : null,
+            productId: parentRef._planned ? null : parentRef.id,
+            revenue, quantity, unitPrice, storeConfig: store,
+          });
         } catch (err) {
           errors.push({ produto: String(varRow['Produto'] || '?').substring(0, 50), erro: err.message });
         }

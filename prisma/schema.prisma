@@ -21,6 +21,7 @@ model User {
   bills          Bill[]
   purchaseOrders PurchaseOrder[]
   newsReads      NewsRead[]
+  goals          Goal[]
 }
 
 model Store {
@@ -83,11 +84,11 @@ model Order {
 }
 
 model OrderItem {
-  id        String  @id @default(uuid())
+  id        String   @id @default(uuid())
   orderId   String
-  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId String
-  product   Product @relation(fields: [productId], references: [id])
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String?
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
   quantity  Int
   unitPrice Float
   snapshotCostPrice Float @default(0)
@@ -160,8 +161,8 @@ model PurchaseOrderItem {
   id              String        @id @default(uuid())
   purchaseOrderId String
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  productId       String
-  product         Product       @relation(fields: [productId], references: [id])
+  productId       String?
+  product         Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
   quantity        Int
   unitCost        Float
 }
@@ -187,4 +188,20 @@ model NewsRead {
   news   SystemNews @relation(fields: [newsId], references: [id], onDelete: Cascade)
   readAt DateTime   @default(now())
   @@unique([userId, newsId])
+}
+
+// ───────────────────────────────────────────
+// METAS MENSAIS
+// ───────────────────────────────────────────
+model Goal {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  month     String   // "2026-04"
+  revenue   Float    @default(0)
+  profit    Float    @default(0)
+  orders    Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([userId, month])
 }
