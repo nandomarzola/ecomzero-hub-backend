@@ -143,9 +143,19 @@ async function update(req, res) {
 // DELETE /api/products/:id
 async function remove(req, res) {
   const existing = await prisma.product.findFirst({
-    where: { id: req.params.id, store: { userId: req.userId } },
+    where:   { id: req.params.id, store: { userId: req.userId } },
+    include: { variants: { select: { id: true } } },
   });
   if (!existing) return res.status(404).json({ error: 'Produto não encontrado' });
+
+  const ids = [existing.id, ...existing.variants.map((v) => v.id)];
+  const orderCount = await prisma.orderItem.count({ where: { productId: { in: ids } } });
+  if (orderCount > 0) {
+    return res.status(409).json({
+      error: `Este produto possui ${orderCount} item(ns) vinculado(s) a pedidos e não pode ser removido.`,
+    });
+  }
+
   await prisma.product.delete({ where: { id: req.params.id } });
   return res.json({ message: 'Produto removido' });
 }
@@ -213,6 +223,14 @@ async function removeVariant(req, res) {
     },
   });
   if (!variant) return res.status(404).json({ error: 'Variação não encontrada' });
+
+  const orderCount = await prisma.orderItem.count({ where: { productId: variant.id } });
+  if (orderCount > 0) {
+    return res.status(409).json({
+      error: `Esta variação possui ${orderCount} item(ns) vinculado(s) a pedidos e não pode ser removida.`,
+    });
+  }
+
   await prisma.product.delete({ where: { id: variant.id } });
   return res.json({ message: 'Variação removida' });
 }

@@ -169,6 +169,7 @@ async function recalculateOrders(req, res) {
       const storeConfig = isCurrentMonth
         ? order.store
         : {
+            marketplace:     order.store.marketplace,
             commission:      order.snapshotCommission,
             serviceFee:      order.snapshotServiceFee,
             taxRate:         order.snapshotTaxRate,
@@ -273,6 +274,7 @@ async function skuReport(req, res) {
   const orders = await prisma.order.findMany({
     where,
     include: {
+      store: { select: { marketplace: true } },
       items: { include: { product: { select: { id: true, name: true, sku: true } } } },
     },
   });
@@ -289,7 +291,7 @@ async function skuReport(req, res) {
 
     const storeConfig = isCurrentMonth
       ? await prisma.store.findUnique({ where: { id: order.storeId } })
-      : { commission: order.snapshotCommission, serviceFee: order.snapshotServiceFee, taxRate: order.snapshotTaxRate, fixedFeePerItem: order.snapshotFixedFee };
+      : { marketplace: order.store.marketplace, commission: order.snapshotCommission, serviceFee: order.snapshotServiceFee, taxRate: order.snapshotTaxRate, fixedFeePerItem: order.snapshotFixedFee };
 
     for (const item of order.items) {
       const productConfig = isCurrentMonth
