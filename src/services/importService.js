@@ -157,26 +157,41 @@ async function importShopeeParentSKU(filePath, storeId, userId, originalFilename
         }
       }
 
-      // ── Variações excluídas com vendas: preserva faturamento linkando ao produto pai ──
+      // ── Variações excluídas com vendas reais ──
+      // Era um produto único antes de virar variação. Cria como produto próprio
+      // com prefixo "(Produto Inexistente)" para identificar que não existe mais.
       for (const varRow of varsDeleted) {
         try {
-          const varId   = String(varRow['ID da Variação'] || '').trim();
-          const revenue = parseBRL(varRow['Vendas (Pedido pago) (BRL)']);
-          const quantity = parseINT(varRow['Unidades (Pedido pago)']);
+          const varId       = String(varRow['ID da Variação'] || '').trim();
+          const productName = String(varRow['Produto'] || group.parent?.['Produto'] || '').trim();
+          const sku         = String(varRow['SKU da Variação'] || varRow['SKU Principle'] || '').trim();
+          const revenue     = parseBRL(varRow['Vendas (Pedido pago) (BRL)']);
+          const quantity    = parseINT(varRow['Unidades (Pedido pago)']);
           if (revenue <= 0 || quantity <= 0) continue;
 
           const externalId = `${itemId}_${varId}_${monthKey}`;
           if (existingExternalIds.has(externalId)) continue;
 
           const unitPrice = parseFloat((revenue / quantity).toFixed(2));
+          const varExtId  = `${itemId}_${varId}`;
 
-          // Pedido vinculado ao pai — não cria produto de variação com nome errado
-          ordersToCreate.push({
-            externalId,
-            varExtId:  parentRef._planned ? parentExtId : null,
-            productId: parentRef._planned ? null : parentRef.id,
-            revenue, quantity, unitPrice, storeConfig: store,
-          });
+          let productRef = (sku && sku !== '-' ? bySku.get(sku) : null) ?? byExternalId.get(varExtId) ?? plannedProducts.get(varExtId);
+
+          if (!productRef) {
+            const displayName = `(Produto Inexistente) ${productName}`.substring(0, 255);
+            productRef = { _planned: true, externalId: varExtId, costPrice: 0, packaging: 0, supplies: 0 };
+            productsToCreate.push({
+              storeId,
+              externalId: varExtId,
+              name:       displayName,
+              sku:        sku && sku !== '-' ? sku : `SHOPEE-${itemId}-${varId}`,
+              costPrice:  0, listPrice: unitPrice, packaging: 0, supplies: 0, stock: 0,
+              _parentExtId: parentExtId,
+            });
+            plannedProducts.set(varExtId, productRef);
+          }
+
+          ordersToCreate.push({ externalId, varExtId: productRef._planned ? varExtId : null, productId: productRef._planned ? null : productRef.id, revenue, quantity, unitPrice, storeConfig: store });
         } catch (err) {
           errors.push({ produto: String(varRow['Produto'] || '?').substring(0, 50), erro: err.message });
         }
