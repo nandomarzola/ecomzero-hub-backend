@@ -76,16 +76,18 @@ function startRecalculateWorker() {
         };
 
         for (const item of order.items) {
-          const costPrice = item.snapshotCostPrice || item.product?.costPrice || 0;
-          const packaging = item.snapshotPackaging || item.product?.packaging || 0;
-          const supplies  = item.snapshotSupplies  || item.product?.supplies  || 0;
+          // Always use current product cost — recalculate reflects the cost the user set now
+          const costPrice = item.product?.costPrice ?? item.snapshotCostPrice ?? 0;
+          const packaging = item.product?.packaging ?? item.snapshotPackaging ?? 0;
+          const supplies  = item.product?.supplies  ?? item.snapshotSupplies  ?? 0;
 
           const productConfig = { costPrice, packaging, supplies };
           const calc = calcProfit(item.unitPrice * item.quantity, item.quantity, productConfig, storeConfig, 0, 0);
           totalProfit    += calc.profit;
           totalSalePrice += calc.breakdown.salePrice;
 
-          if (item.snapshotCostPrice === 0 && costPrice > 0) {
+          // Always sync snapshot to current product cost so future reads are consistent
+          if (item.product) {
             itemUpdates.push(prisma.orderItem.update({
               where: { id: item.id },
               data:  { snapshotCostPrice: costPrice, snapshotPackaging: packaging, snapshotSupplies: supplies },
