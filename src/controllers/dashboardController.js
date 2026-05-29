@@ -464,4 +464,80 @@ async function getMonthlyComparison(req, res) {
   return res.json({ months: result });
 }
 
-module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison };
+// GET /api/dashboard/shopee-summary?storeId=&month=2026-04
+async function getShopeeSummary(req, res) {
+  const { storeId, month } = req.query;
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+  if (!storeIds.length) return res.json({ summaries: [], totals: null });
+
+  const where = { storeId: { in: storeIds } };
+  if (month) where.month = month;
+
+  const summaries = await prisma.shopeePeriodSummary.findMany({
+    where,
+    orderBy: { month: 'desc' },
+  });
+
+  // Aggregate across stores/months if no filter
+  const totals = summaries.reduce(
+    (acc, s) => ({
+      gmv:                  acc.gmv              + s.gmv,
+      shopeeDeductions:     acc.shopeeDeductions + s.shopeeDeductions,
+      netRevenue:           acc.netRevenue        + s.netRevenue,
+      grossProfit:          acc.grossProfit       + s.grossProfit,
+      validCount:           acc.validCount        + s.validCount,
+      unitCount:            acc.unitCount         + s.unitCount,
+      cancelledCount:       acc.cancelledCount    + s.cancelledCount,
+      cancelledGmv:         acc.cancelledGmv      + s.cancelledGmv,
+      unpaidCount:          acc.unpaidCount       + s.unpaidCount,
+      unpaidGmv:            acc.unpaidGmv         + s.unpaidGmv,
+      returnedFullCount:    acc.returnedFullCount + s.returnedFullCount,
+      returnedFullValue:    acc.returnedFullValue + s.returnedFullValue,
+      returnedPartialCount: acc.returnedPartialCount + s.returnedPartialCount,
+      returnedPartialValue: acc.returnedPartialValue + s.returnedPartialValue,
+    }),
+    {
+      gmv: 0, shopeeDeductions: 0, netRevenue: 0, grossProfit: 0,
+      validCount: 0, unitCount: 0,
+      cancelledCount: 0, cancelledGmv: 0,
+      unpaidCount: 0, unpaidGmv: 0,
+      returnedFullCount: 0, returnedFullValue: 0,
+      returnedPartialCount: 0, returnedPartialValue: 0,
+    }
+  );
+
+  totals.margin = totals.gmv > 0 ? parseFloat(((totals.grossProfit / totals.gmv) * 100).toFixed(2)) : 0;
+  totals.returnedCount = totals.returnedFullCount + totals.returnedPartialCount;
+  totals.returnedValue = parseFloat((totals.returnedFullValue + totals.returnedPartialValue).toFixed(2));
+  totals.cancellationRate = totals.validCount + totals.cancelledCount + totals.unpaidCount > 0
+    ? parseFloat(((totals.cancelledCount + totals.unpaidCount) / (totals.validCount + totals.cancelledCount + totals.unpaidCount + totals.returnedFullCount + totals.returnedPartialCount) * 100).toFixed(1))
+    : 0;
+
+  // Parse cancel reason breakdowns
+  const cancelReasonMap = {};
+  for (const s of summaries) {
+    try {
+      const reasons = JSON.parse(s.cancelReasonBreakdown || '{}');
+      for (const [reason, count] of Object.entries(reasons)) {
+        cancelReasonMap[reason] = (cancelReasonMap[reason] || 0) + count;
+      }
+    } catch {}
+  }
+
+  return res.json({
+    summaries: summaries.map((s) => ({
+      ...s,
+      cancelReasonBreakdown: undefined,
+      cancelReasons: (() => { try { return JSON.parse(s.cancelReasonBreakdown || '{}'); } catch { return {}; } })(),
+    })),
+    totals,
+    cancelReasons: cancelReasonMap,
+  });
+}
+
+module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison, getShopeeSummary };

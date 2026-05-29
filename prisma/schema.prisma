@@ -36,9 +36,10 @@ model Store {
   taxRate         Float     @default(5.0)
   fixedFeePerItem Float     @default(0)
   createdAt       DateTime  @default(now())
-  products        Product[]
-  orders          Order[]
-  bills           Bill[]
+  products             Product[]
+  orders               Order[]
+  bills                Bill[]
+  shopeeSummaries      ShopeePeriodSummary[]
 }
 
 model Product {
@@ -81,6 +82,20 @@ model Order {
   snapshotServiceFee  Float  @default(0)
   snapshotTaxRate     Float  @default(0)
   snapshotFixedFee    Float  @default(0)
+  // Order_all import fields
+  importSource     String?
+  orderCategory    String?
+  agreedPrice      Float    @default(0)
+  originalPrice    Float    @default(0)
+  sellerDiscount   Float    @default(0)
+  sellerCoupon     Float    @default(0)
+  shopeeCommission Float    @default(0)
+  shopeeServiceFee Float    @default(0)
+  globalTotal      Float    @default(0)
+  cancelReason     String?  @db.Text
+  returnStatus     String?
+  variationName    String?
+  productNameRaw   String?  @db.Text
 }
 
 model OrderItem {
@@ -204,4 +219,32 @@ model Goal {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@unique([userId, month])
+}
+
+// ───────────────────────────────────────────
+// RESUMO FINANCEIRO SHOPEE POR PERÍODO
+// ───────────────────────────────────────────
+model ShopeePeriodSummary {
+  id                   String   @id @default(uuid())
+  storeId              String
+  store                Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  month                String   // "2026-04"
+  gmv                  Float    @default(0)
+  shopeeDeductions     Float    @default(0)
+  netRevenue           Float    @default(0)
+  grossProfit          Float    @default(0)
+  margin               Float    @default(0)
+  validCount           Int      @default(0)
+  unitCount            Int      @default(0)
+  cancelledCount       Int      @default(0)
+  cancelledGmv         Float    @default(0)
+  unpaidCount          Int      @default(0)
+  unpaidGmv            Float    @default(0)
+  returnedFullCount    Int      @default(0)
+  returnedFullValue    Float    @default(0)
+  returnedPartialCount Int      @default(0)
+  returnedPartialValue Float    @default(0)
+  cancelReasonBreakdown String? @db.Text
+  updatedAt            DateTime @updatedAt
+  @@unique([storeId, month])
 }
