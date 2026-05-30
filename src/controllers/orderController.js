@@ -47,46 +47,168 @@ async function importStatus(req, res) {
 
 // GET /api/orders
 async function listOrders(req, res) {
-  const { storeId, startDate, endDate, status, page = 1, limit = 20 } = req.query;
+  const { storeId, startDate, endDate, status, orderCategory, page = 1, limit = 20, grouped } = req.query;
 
-  const where = { store: { userId: req.userId } };
-  if (storeId) where.storeId = storeId;
-  if (status)  where.status  = status;
+  // baseWhere — sem filtro de status/categoria (usado para contagem das abas)
+  const baseWhere = { store: { userId: req.userId } };
+  if (storeId) baseWhere.storeId = storeId;
   if (startDate || endDate) {
-    where.soldAt = {};
-    if (startDate) where.soldAt.gte = new Date(startDate);
+    baseWhere.soldAt = {};
+    if (startDate) baseWhere.soldAt.gte = new Date(startDate);
     if (endDate) {
       const end = new Date(endDate);
       end.setUTCHours(23, 59, 59, 999);
-      where.soldAt.lte = end;
+      baseWhere.soldAt.lte = end;
     }
+  }
+
+  // where — inclui filtros de status/categoria para a listagem paginada
+  const where = { ...baseWhere };
+  if (status)        where.status        = status;
+  if (orderCategory) where.orderCategory = orderCategory;
+
+  // ── Modo agrupado: agrega por item (correto para pedidos multi-produto) ────
+  if (grouped === 'true') {
+    const groupWhere = { ...where, importSource: 'orderall' };
+
+    const orders = await prisma.order.findMany({
+      where: groupWhere,
+      select: {
+        id:             true,
+        productNameRaw: true,
+        variationName:  true,
+        productSku:     true,
+        items: {
+          select: {
+            productId:        true,
+            unitPrice:        true,
+            quantity:         true,
+            profit:           true,
+            shopeeCommission: true,
+            snapshotCostPrice: true,
+            product: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+
+    // Agrega por produto × preço unitário (cada item vai para o grupo do seu produto)
+    const groupMap = new Map();
+    for (const order of orders) {
+      for (const item of order.items) {
+        const groupKey = item.productId
+          ? `${item.productId}::${item.unitPrice}`
+          : `${order.productNameRaw ?? ''}::${order.variationName ?? ''}::${item.unitPrice}`;
+
+        if (!groupMap.has(groupKey)) {
+          groupMap.set(groupKey, {
+            productName:   item.product?.name ?? order.productNameRaw ?? '(sem nome)',
+            variationName: order.variationName ?? null,
+            agreedPrice:   item.unitPrice,
+            productId:     item.productId ?? null,
+            productSku:    order.productSku ?? null,
+            rawName:       order.productNameRaw ?? null,
+            orderIds:      new Set(),
+            totalQty:      0,
+            totalGMV:      0,
+            totalShopee:   0,
+            totalProfit:   0,
+            allHaveCost:   true,
+          });
+        }
+        const g = groupMap.get(groupKey);
+        g.orderIds.add(order.id);
+        g.totalQty    += item.quantity;
+        g.totalGMV    += item.quantity * item.unitPrice;
+        g.totalShopee += item.shopeeCommission;
+        g.totalProfit += item.profit;
+        if (item.snapshotCostPrice === 0) g.allHaveCost = false;
+      }
+    }
+
+    const items = [...groupMap.values()]
+      .map((g) => {
+        const totalGMV    = parseFloat(g.totalGMV.toFixed(2));
+        const totalShopee = parseFloat(g.totalShopee.toFixed(2));
+        const totalProfit = parseFloat(g.totalProfit.toFixed(2));
+        const avgMargin   = totalGMV > 0 ? parseFloat((totalProfit / totalGMV * 100).toFixed(1)) : 0;
+        return {
+          productName:   g.productName,
+          variationName: g.variationName,
+          agreedPrice:   g.agreedPrice,
+          productId:     g.productId,
+          productSku:    g.productSku,
+          rawName:       g.rawName,
+          orderIds:      [...g.orderIds],
+          orderCount:    g.orderIds.size,
+          totalQty:      g.totalQty,
+          totalGMV,
+          totalShopee,
+          totalNetRev:   parseFloat((totalGMV - totalShopee).toFixed(2)),
+          totalProfit,
+          avgMargin,
+          hasCost:       g.allHaveCost,
+        };
+      })
+      .sort((a, b) => b.totalGMV - a.totalGMV);
+
+    return res.json({ grouped: true, total: items.length, items });
   }
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const take = parseInt(limit);
 
-  const [orders, total, agg] = await Promise.all([
+  const [orders, total, agg, tabGroups] = await Promise.all([
     prisma.order.findMany({
       where,
       include: { items: { orderBy: { quantity: 'desc' }, include: { product: { select: { name: true, sku: true } } } } },
-      orderBy: { salePrice: 'desc' },
+      orderBy: { soldAt: 'desc' },
       skip,
       take,
     }),
     prisma.order.count({ where }),
     prisma.order.aggregate({
       where,
-      _sum: { salePrice: true, profit: true },
+      _sum: {
+        salePrice: true, profit: true,
+        shopeeCommission: true, shopeeServiceFee: true, sellerCoupon: true,
+        globalTotal: true,
+      },
+    }),
+    prisma.order.groupBy({
+      by: ['status', 'orderCategory'],
+      where: baseWhere,
+      _count: { _all: true },
     }),
   ]);
+
+  const tabCounts = { all: 0, paid: 0, cancelled: 0, returned: 0, unpaid: 0, returnedFull: 0, returnedPartial: 0 };
+  for (const g of tabGroups) {
+    tabCounts.all += g._count._all;
+    if (g.status === 'paid')      tabCounts.paid      += g._count._all;
+    if (g.status === 'cancelled') tabCounts.cancelled += g._count._all;
+    if (g.status === 'returned')  tabCounts.returned  += g._count._all;
+    if (g.orderCategory === 'cancelled_unpaid') tabCounts.unpaid         += g._count._all;
+    if (g.orderCategory === 'returned_full')    tabCounts.returnedFull   += g._count._all;
+    if (g.orderCategory === 'returned_partial') tabCounts.returnedPartial += g._count._all;
+  }
+
+  const s = agg._sum;
+  const totalRevenue          = parseFloat((s.salePrice ?? 0).toFixed(2));
+  const totalShopeeDeductions = parseFloat(((s.shopeeCommission ?? 0) + (s.shopeeServiceFee ?? 0)).toFixed(2));
+  // Receita líquida = GMV - taxas Shopee (nunca usa globalTotal do Excel que inclui subsídios Shopee)
+  const totalNetRevenue       = parseFloat((totalRevenue - totalShopeeDeductions).toFixed(2));
 
   return res.json({
     orders,
     total,
-    page:         parseInt(page),
-    limit:        take,
-    totalRevenue: parseFloat((agg._sum.salePrice ?? 0).toFixed(2)),
-    totalProfit:  parseFloat((agg._sum.profit   ?? 0).toFixed(2)),
+    page:                parseInt(page),
+    limit:               take,
+    totalRevenue,
+    totalProfit:         parseFloat((s.profit ?? 0).toFixed(2)),
+    totalShopeeDeductions,
+    totalNetRevenue,
+    tabCounts,
   });
 }
 
@@ -168,11 +290,12 @@ async function recalculateStatus(req, res) {
 
 // GET /api/orders/export — retorna CSV com todos os pedidos do período (sem paginação)
 async function exportOrders(req, res) {
-  const { storeId, startDate, endDate, status } = req.query;
+  const { storeId, startDate, endDate, status, orderCategory } = req.query;
 
   const where = { store: { userId: req.userId } };
-  if (storeId) where.storeId = storeId;
-  if (status)  where.status  = status;
+  if (storeId)       where.storeId       = storeId;
+  if (status)        where.status        = status;
+  if (orderCategory) where.orderCategory = orderCategory;
   if (startDate || endDate) {
     where.soldAt = {};
     if (startDate) where.soldAt.gte = new Date(startDate);
@@ -278,6 +401,7 @@ async function skuReport(req, res) {
       const revenue = item.unitPrice * item.quantity;
       const calc    = calcProfit(revenue, item.quantity, productConfig, storeConfig, 0, 0);
 
+      if (!item.product) continue;
       const pid = item.product.id;
       if (!map.has(pid)) {
         map.set(pid, {

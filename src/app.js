@@ -17,6 +17,7 @@ const cashflowRoutes      = require('./routes/cashflow');
 const adminPanelRoutes    = require('./routes/adminPanel');
 const goalsRoutes         = require('./routes/goals');
 const insightsRoutes      = require('./routes/insights');
+const productAliasRoutes  = require('./routes/productAliases');
 const { startWorker }             = require('./services/importQueue');
 const { startRecalculateWorker }  = require('./services/recalculateQueue');
 
@@ -72,8 +73,9 @@ app.use('/api/purchase-orders', purchaseOrderRoutes);
 app.use('/api/news',           newsRoutes);
 app.use('/api/cashflow',       cashflowRoutes);
 app.use('/api/admin',          adminPanelRoutes);
-app.use('/api/goals',          goalsRoutes);
-app.use('/api/insights',       insightsRoutes);
+app.use('/api/goals',           goalsRoutes);
+app.use('/api/insights',        insightsRoutes);
+app.use('/api/product-aliases', productAliasRoutes);
 
 // Tratamento de erros global
 app.use((err, req, res, next) => {
@@ -84,10 +86,15 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3333;
 app.listen(PORT, () => {
   console.log(`ProfitTrack API rodando na porta ${PORT}`);
-  startWorker();
-  console.log('[import-worker] Worker de importação iniciado');
-  startRecalculateWorker();
-  console.log('[recalculate-worker] Worker de recálculo iniciado');
+
+  if (process.env.ENABLE_WORKER === 'true') {
+    startWorker();
+    console.log('[import-worker] Worker de importação iniciado');
+    startRecalculateWorker();
+    console.log('[recalculate-worker] Worker de recálculo iniciado');
+  } else {
+    console.log('[workers] DESABILITADOS — defina ENABLE_WORKER=true para ativar');
+  }
 });
 
 module.exports = app;
