@@ -1,4 +1,4 @@
-const { Queue, Worker, QueueEvents } = require('bullmq');
+const { Queue, Worker } = require('bullmq');
 const { importShopeeParentSKU } = require('./importService');
 const { importShopeeOrderAll }  = require('./importOrderAll');
 const fs = require('fs');
@@ -12,21 +12,16 @@ function detectImportType(filename) {
 
 const QUEUE_NAME = 'import-orders';
 
-// ── Fila ────────────────────────────────────────────────────────────────────
 const importQueue = new Queue(QUEUE_NAME, {
   connection,
   defaultJobOptions: {
     attempts: 2,
     backoff: { type: 'exponential', delay: 5000 },
-    removeOnComplete: { age: 2 * 60 * 60 },  // mantém 2h após conclusão
-    removeOnFail:     { age: 6 * 60 * 60 },  // mantém 6h após falha
+    removeOnComplete: { count: 50 },
+    removeOnFail:     { count: 20 },
   },
 });
 
-// ── Eventos (para polling) ───────────────────────────────────────────────────
-const queueEvents = new QueueEvents(QUEUE_NAME, { connection });
-
-// ── Worker ───────────────────────────────────────────────────────────────────
 let worker = null;
 
 function startWorker() {
@@ -52,7 +47,10 @@ function startWorker() {
     },
     {
       connection,
-      concurrency: 3,
+      concurrency:     3,
+      drainDelay:      30,      // s — espera 30s antes de novo poll quando fila vazia
+      stalledInterval: 300000,  // 5min — check de jobs travados
+      lockDuration:    60000,   // 60s — evita lock renewal excessivo
     },
   );
 
@@ -62,10 +60,13 @@ function startWorker() {
 
   worker.on('failed', (job, err) => {
     console.error(`[import-worker] job ${job?.id} falhou:`, err.message);
-    try { if (job?.data?.filePath) fs.unlinkSync(job.data.filePath); } catch {}
+    const maxAttempts = job?.opts?.attempts ?? 1;
+    if (job && job.attemptsMade >= maxAttempts) {
+      try { if (job.data?.filePath) fs.unlinkSync(job.data.filePath); } catch {}
+    }
   });
 
   return worker;
 }
 
-module.exports = { importQueue, queueEvents, startWorker };
+module.exports = { importQueue, startWorker };

@@ -1,6 +1,8 @@
 const XLSX  = require('xlsx');
 const prisma = require('../lib/prisma');
 
+// ── Parsers ───────────────────────────────────────────────────────────────────
+
 function parseNum(value) {
   if (value === null || value === undefined || value === '') return 0;
   if (typeof value === 'number') return value;
@@ -8,15 +10,13 @@ function parseNum(value) {
 }
 
 function parseInt2(value) {
-  const n = parseNum(value);
-  return Math.round(n) || 1;
+  return Math.round(parseNum(value)) || 1;
 }
 
 function parseOrderDate(value) {
   if (!value) return null;
   const str = String(value).trim();
   if (!str) return null;
-  // "2026-04-01 01:27" → treat as UTC (close enough for monthly reporting)
   const d = new Date(str.replace(' ', 'T') + ':00.000Z');
   return isNaN(d) ? null : d;
 }
@@ -40,56 +40,64 @@ function classifyOrder(row) {
 }
 
 function extractMonth(filename) {
-  if (filename) {
-    const m = String(filename).match(/(\d{4})(\d{2})\d{2}/);
-    if (m) return `${m[1]}-${m[2]}`;
-  }
+  const m = String(filename || '').match(/(\d{4})(\d{2})\d{2}/);
+  if (m) return `${m[1]}-${m[2]}`;
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
-function chunks(arr, size) {
+function chunkArr(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
 
+// ── Import principal ──────────────────────────────────────────────────────────
+
 async function importShopeeOrderAll(filePath, storeId, userId, originalFilename, onProgress) {
-  // ── 1. Verificar loja ─────────────────────────────────────────────────────
-  const where = userId ? { id: storeId, userId } : { id: storeId };
-  const store = await prisma.store.findFirst({ where });
+  // ── 1. Loja ───────────────────────────────────────────────────────────────
+  const store = await prisma.store.findFirst({
+    where: userId ? { id: storeId, userId } : { id: storeId },
+  });
   if (!store) throw new Error('Loja não encontrada');
 
   const monthKey = extractMonth(originalFilename);
   const [year, mon] = monthKey.split('-').map(Number);
   const fallbackDate = new Date(Date.UTC(year, mon - 1, 15));
 
-  // ── 2. Ler XLSX ──────────────────────────────────────────────────────────
+  // ── 2. Ler XLSX completo de uma vez ───────────────────────────────────────
+  await onProgress?.({ step: 'Lendo arquivo...', current: 0, total: 0 });
+
   const workbook = XLSX.readFile(filePath, { raw: false });
   const sheet    = workbook.Sheets[workbook.SheetNames[0]];
   const rows     = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-  onProgress?.({ step: 'parsing', current: 0, total: rows.length });
+  // ── 3. Pre-fetch produtos ─────────────────────────────────────────────────
+  await onProgress?.({ step: 'Carregando produtos...', current: 0, total: rows.length });
 
-  // ── 3. Verificar duplicatas (pelos orderId do período já importados) ──────
-  const existingOrders = await prisma.order.findMany({
-    where: { storeId, importSource: 'orderall' },
-    select: { externalId: true },
-  });
-  const existingIds = new Set(existingOrders.map((o) => o.externalId));
+  const [products, aliases] = await Promise.all([
+    prisma.product.findMany({
+      where:  { storeId },
+      select: { id: true, sku: true, name: true, costPrice: true, packaging: true, supplies: true },
+    }),
+    prisma.productAlias.findMany({
+      where:  { storeId },
+      select: { rawSku: true, product: { select: { id: true, sku: true, name: true, costPrice: true, packaging: true, supplies: true } } },
+    }),
+  ]);
 
-  // ── 4. Pre-fetch produtos para linking ───────────────────────────────────
-  const products = await prisma.product.findMany({
-    where:  { storeId },
-    select: { id: true, sku: true, name: true, costPrice: true, packaging: true, supplies: true },
-  });
-  const bySkuMap  = new Map(products.filter((p) => p.sku).map((p) => [p.sku.toLowerCase(), p]));
-  const byNameMap = new Map(products.map((p) => [p.name.toLowerCase(), p]));
+  const bySkuMap   = new Map(products.filter((p) => p.sku).map((p) => [p.sku.toLowerCase(), p]));
+  const byNameMap  = new Map(products.map((p) => [p.name.toLowerCase(), p]));
+  const byAliasMap = new Map(aliases.map((a) => [a.rawSku.toLowerCase(), a.product]));
 
   function findProduct(skuRef, productName, variationName) {
     if (skuRef) {
+      // 1. Match direto por SKU no catálogo
       const p = bySkuMap.get(skuRef.toLowerCase());
       if (p) return p;
+      // 2. Match por alias (SKU renomeado mapeado pelo usuário)
+      const aliased = byAliasMap.get(skuRef.toLowerCase());
+      if (aliased) return aliased;
     }
     const withVar = variationName && variationName !== '-'
       ? `${productName} — ${variationName}`.toLowerCase()
@@ -101,16 +109,17 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
     return byNameMap.get(productName.toLowerCase()) ?? null;
   }
 
-  // ── 5. Processar linhas ──────────────────────────────────────────────────
-  const toCreate = [];
-  let skipped = 0;
-  const errors = [];
+  // ── 4. Parsear todas as linhas em memória ─────────────────────────────────
+  await onProgress?.({ step: 'Classificando pedidos...', current: 0, total: rows.length });
+
+  const ordersData = [];  // dados completos para criar/atualizar
+  const itemsIndex = [];  // { externalId, product, quantity, unitPrice }
+  const errors     = [];
 
   for (const row of rows) {
     try {
       const orderId = String(row['ID do pedido'] || '').trim();
-      if (!orderId) { skipped++; continue; }
-      if (existingIds.has(orderId)) { skipped++; continue; }
+      if (!orderId) continue;
 
       const orderCategory  = classifyOrder(row);
       const agreedPrice    = parseNum(row['Preço acordado']);
@@ -131,15 +140,14 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
                   ?? parseOrderDate(row['Data de criação do pedido'])
                   ?? fallbackDate;
 
-      const product    = findProduct(skuRef, productName, variationName);
-      const salePrice  = parseFloat((agreedPrice * quantity).toFixed(2));
+      const product   = findProduct(skuRef, productName, variationName);
+      const salePrice = parseFloat((agreedPrice * quantity).toFixed(2));
 
-      // status: para compatibilidade com queries existentes
       const status = orderCategory === 'cancelled_unpaid' || orderCategory === 'cancelled_other'
         ? 'cancelled'
         : orderCategory === 'returned_full' ? 'returned' : 'paid';
 
-      toCreate.push({
+      ordersData.push({
         storeId,
         externalId:       orderId,
         salePrice,
@@ -158,61 +166,118 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
         shopeeCommission: shopeeComm,
         shopeeServiceFee: shopeeService,
         globalTotal,
-        cancelReason:     cancelReason || null,
-        returnStatus:     returnStatus || null,
+        cancelReason:     cancelReason  || null,
+        returnStatus:     returnStatus  || null,
         variationName:    variationName || null,
-        productNameRaw:   productName || null,
+        productNameRaw:   productName   || null,
+        productSku:       skuRef        || null,
         snapshotCommission: store.commission,
         snapshotServiceFee: store.serviceFee,
         snapshotTaxRate:    store.taxRate,
         snapshotFixedFee:   store.fixedFeePerItem || 0,
-        _productId: product?.id ?? null,
-        _product:   product,
-        _quantity:  quantity,
-        _unitPrice: agreedPrice,
       });
+
+      itemsIndex.push({ externalId: orderId, product: product || null, quantity, unitPrice: agreedPrice, skuRef: skuRef || null, productName, variationName });
     } catch (err) {
       errors.push({ row: String(row['ID do pedido'] || '?'), erro: err.message });
     }
   }
 
-  onProgress?.({ step: 'orders', current: 0, total: toCreate.length });
+  // ── 5. BULK INSERT: createMany + skipDuplicates (1 roundtrip para novos) ──
+  // A constraint @@unique([storeId, externalId]) garante idempotência.
+  await onProgress?.({ step: 'Salvando no banco...', current: 0, total: ordersData.length });
 
-  // ── 6. Criar pedidos em batches ──────────────────────────────────────────
-  let imported = 0;
-
-  for (const batch of chunks(toCreate, 50)) {
-    await prisma.$transaction(async (tx) => {
-      for (const item of batch) {
-        const { _productId, _product, _quantity, _unitPrice, ...orderData } = item;
-
-        const order = await tx.order.create({ data: orderData });
-
-        if (_productId) {
-          await tx.orderItem.create({
-            data: {
-              orderId:           order.id,
-              productId:         _productId,
-              quantity:          _quantity,
-              unitPrice:         _unitPrice,
-              snapshotCostPrice: _product?.costPrice  ?? 0,
-              snapshotPackaging: _product?.packaging  ?? 0,
-              snapshotSupplies:  _product?.supplies   ?? 0,
-            },
-          });
-        }
-        imported++;
-      }
-    });
-    onProgress?.({ step: 'orders', current: imported + skipped, total: rows.length });
+  // Inserir em batches de 1000 para não estourar o max_allowed_packet
+  for (const batch of chunkArr(ordersData, 1000)) {
+    await prisma.order.createMany({ data: batch, skipDuplicates: true });
   }
+
+  // ── 6. Atualizar registros com status/categoria que pode ter mudado ────────
+  // Busca apenas os externalIds que já existiam antes do createMany acima
+  const allExternalIds = ordersData.map((o) => o.externalId);
+
+  // Para arquivos grandes (30k+), busca em batches de 1000 IDs
+  const existingOrders = [];
+  for (const batch of chunkArr(allExternalIds, 1000)) {
+    const chunk = await prisma.order.findMany({
+      where:  { storeId, externalId: { in: batch } },
+      select: { id: true, externalId: true, status: true, orderCategory: true, returnStatus: true },
+    });
+    existingOrders.push(...chunk);
+  }
+
+  const existingMap = new Map(existingOrders.map((o) => [o.externalId, o]));
+
+  // Identificar apenas os que tiveram mudança de status/categoria (normalmente 0)
+  const toUpdate = ordersData.filter((d) => {
+    const ex = existingMap.get(d.externalId);
+    if (!ex) return false;
+    return ex.status !== d.status
+        || ex.orderCategory !== d.orderCategory
+        || ex.returnStatus  !== (d.returnStatus ?? null);
+  });
+
+  // Atualizar em paralelo com concorrência limitada (respeita pool de 13 conexões)
+  for (const batch of chunkArr(toUpdate, 8)) {
+    await Promise.all(
+      batch.map((d) => {
+        const ex = existingMap.get(d.externalId);
+        return prisma.order.update({
+          where: { id: ex.id },
+          data: {
+            status:          d.status,
+            orderCategory:   d.orderCategory,
+            returnStatus:    d.returnStatus,
+            cancelReason:    d.cancelReason,
+            globalTotal:     d.globalTotal,
+            shopeeCommission: d.shopeeCommission,
+            shopeeServiceFee: d.shopeeServiceFee,
+            sellerCoupon:    d.sellerCoupon,
+          },
+        });
+      })
+    );
+  }
+
+  await onProgress?.({ step: 'Criando itens...', current: ordersData.length, total: ordersData.length });
+
+  // ── 7. Bulk insert de OrderItems ──────────────────────────────────────────
+  const itemsData = itemsIndex
+    .filter((x) => existingMap.has(x.externalId))
+    .map((x) => ({
+      orderId:           existingMap.get(x.externalId).id,
+      productId:         x.product?.id         ?? null,
+      quantity:          x.quantity,
+      unitPrice:         x.unitPrice,
+      snapshotCostPrice: x.product?.costPrice  ?? 0,
+      snapshotPackaging: x.product?.packaging  ?? 0,
+      snapshotSupplies:  x.product?.supplies   ?? 0,
+    }));
+
+  if (itemsData.length > 0) {
+    for (const batch of chunkArr(itemsData, 1000)) {
+      await prisma.orderItem.createMany({ data: batch, skipDuplicates: true });
+    }
+  }
+
+  const imported = existingOrders.length;
+  const skipped  = rows.length - ordersData.length;
+
+  // Órfãos: itens de pedidos pagos/válidos sem produto vinculado
+  const orphanSkus = new Set(
+    itemsIndex
+      .filter((x) => !x.product && x.skuRef && existingMap.has(x.externalId))
+      .map((x) => x.skuRef)
+  );
 
   return {
     imported,
     skipped,
+    updated:      toUpdate.length,
     totalRevenue: 0,
     totalProfit:  0,
     avgMargin:    0,
+    orphanCount:  orphanSkus.size,
     errors:       errors.slice(0, 20),
     source:       'orderall',
     month:        monthKey,

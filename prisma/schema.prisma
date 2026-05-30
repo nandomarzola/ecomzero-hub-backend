@@ -40,6 +40,7 @@ model Store {
   orders               Order[]
   bills                Bill[]
   shopeeSummaries      ShopeePeriodSummary[]
+  productAliases       ProductAlias[]
 }
 
 model Product {
@@ -62,6 +63,7 @@ model Product {
   createdAt  DateTime    @default(now())
   orderItems         OrderItem[]
   purchaseOrderItems PurchaseOrderItem[]
+  aliases            ProductAlias[]
 }
 
 model Order {
@@ -96,6 +98,9 @@ model Order {
   returnStatus     String?
   variationName    String?
   productNameRaw   String?  @db.Text
+  productSku       String?
+
+  @@unique([storeId, externalId])
 }
 
 model OrderItem {
@@ -109,6 +114,22 @@ model OrderItem {
   snapshotCostPrice Float @default(0)
   snapshotPackaging Float @default(0)
   snapshotSupplies  Float @default(0)
+  profit            Float @default(0)
+  shopeeCommission  Float @default(0)
+}
+
+model ProductAlias {
+  id         String   @id @default(uuid())
+  storeId    String
+  store      Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  rawSku     String
+  rawName    String?
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  source     String   @default("manual")
+  createdAt  DateTime @default(now())
+
+  @@unique([storeId, rawSku])
 }
 
 // ───────────────────────────────────────────
@@ -232,6 +253,7 @@ model ShopeePeriodSummary {
   gmv                  Float    @default(0)
   shopeeDeductions     Float    @default(0)
   netRevenue           Float    @default(0)
+  tax                  Float    @default(0)
   grossProfit          Float    @default(0)
   margin               Float    @default(0)
   validCount           Int      @default(0)

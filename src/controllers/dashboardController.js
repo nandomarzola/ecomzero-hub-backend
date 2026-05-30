@@ -489,6 +489,7 @@ async function getShopeeSummary(req, res) {
       gmv:                  acc.gmv              + s.gmv,
       shopeeDeductions:     acc.shopeeDeductions + s.shopeeDeductions,
       netRevenue:           acc.netRevenue        + s.netRevenue,
+      tax:                  acc.tax              + (s.tax ?? 0),
       grossProfit:          acc.grossProfit       + s.grossProfit,
       validCount:           acc.validCount        + s.validCount,
       unitCount:            acc.unitCount         + s.unitCount,
@@ -502,7 +503,7 @@ async function getShopeeSummary(req, res) {
       returnedPartialValue: acc.returnedPartialValue + s.returnedPartialValue,
     }),
     {
-      gmv: 0, shopeeDeductions: 0, netRevenue: 0, grossProfit: 0,
+      gmv: 0, shopeeDeductions: 0, netRevenue: 0, tax: 0, grossProfit: 0,
       validCount: 0, unitCount: 0,
       cancelledCount: 0, cancelledGmv: 0,
       unpaidCount: 0, unpaidGmv: 0,
@@ -540,4 +541,119 @@ async function getShopeeSummary(req, res) {
   });
 }
 
-module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison, getShopeeSummary };
+// GET /api/dashboard/shopee-losses?storeId=&startDate=&endDate=
+// Lê diretamente da tabela Order — disponível logo após o import, sem precisar de recalculate
+async function getShopeeLosses(req, res) {
+  const { storeId, startDate, endDate } = req.query;
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+  if (!storeIds.length) return res.json({ losses: null });
+
+  const dateFilter = buildDateFilter(startDate, endDate);
+  const where = {
+    storeId:      { in: storeIds },
+    importSource: 'orderall',
+    ...(dateFilter ? { soldAt: dateFilter } : {}),
+  };
+
+  // Todos os pedidos do período (todos os status)
+  const orders = await prisma.order.findMany({
+    where,
+    select: {
+      id:            true,
+      orderCategory: true,
+      cancelReason:  true,
+      salePrice:     true,
+      agreedPrice:   true,
+      returnStatus:  true,
+      globalTotal:   true,
+      productNameRaw: true,
+      variationName:  true,
+    },
+  });
+
+  if (!orders.length) return res.json({ losses: null });
+
+  // ── Categorias ────────────────────────────────────────────────────────────
+  const byCategory = { valid: [], returned_full: [], returned_partial: [], cancelled_unpaid: [], cancelled_other: [] };
+  for (const o of orders) {
+    const cat = o.orderCategory || 'valid';
+    if (byCategory[cat]) byCategory[cat].push(o);
+    else byCategory.valid.push(o);
+  }
+
+  const totalGenerated = orders.length;
+  const validCount     = byCategory.valid.length + byCategory.returned_partial.length;
+
+  // ── Cancelamentos ─────────────────────────────────────────────────────────
+  const allCancelled   = [...byCategory.cancelled_unpaid, ...byCategory.cancelled_other];
+  const cancelledCount = allCancelled.length;
+  const cancelledGmv   = allCancelled.reduce((s, o) => s + (o.salePrice || 0), 0);
+  const cancelledRate  = totalGenerated > 0 ? parseFloat(((cancelledCount / totalGenerated) * 100).toFixed(1)) : 0;
+
+  // Não pagos
+  const unpaidCount = byCategory.cancelled_unpaid.length;
+  const unpaidGmv   = byCategory.cancelled_unpaid.reduce((s, o) => s + (o.salePrice || 0), 0);
+
+  // Fora de estoque (em cancelled_other)
+  const outOfStock = byCategory.cancelled_other.filter(
+    (o) => String(o.cancelReason || '').toLowerCase().includes('fora de estoque')
+  );
+  const outOfStockCount   = outOfStock.length;
+  const outOfStockRate    = cancelledCount > 0 ? parseFloat(((outOfStockCount / cancelledCount) * 100).toFixed(1)) : 0;
+  const outOfStockProducts = [...new Set(outOfStock.map((o) => o.productNameRaw).filter(Boolean))].slice(0, 10);
+
+  // ── Devoluções ─────────────────────────────────────────────────────────────
+  const returnedFull    = byCategory.returned_full;
+  const returnedPartial = byCategory.returned_partial;
+  const returnedCount   = returnedFull.length + returnedPartial.length;
+  const returnedFullGmv = returnedFull.reduce((s, o) => s + (o.salePrice || 0), 0);
+  const returnedLost    = returnedFullGmv + returnedPartial.reduce((s, o) => s + Math.max(0, (o.salePrice || 0) - (o.globalTotal || 0)), 0);
+  const returnedRate    = validCount > 0 ? parseFloat(((returnedCount / (validCount + returnedCount)) * 100).toFixed(1)) : 0;
+
+  // ── Breakdown de motivos ───────────────────────────────────────────────────
+  const reasonMap = {};
+  for (const o of allCancelled) {
+    const reason = o.cancelReason || 'Motivo não informado';
+    reasonMap[reason] = (reasonMap[reason] || 0) + 1;
+  }
+  const cancelReasons = Object.entries(reasonMap)
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => ({
+      reason,
+      count,
+      pct: cancelledCount > 0 ? parseFloat(((count / cancelledCount) * 100).toFixed(1)) : 0,
+    }));
+
+  return res.json({
+    losses: {
+      totalGenerated,
+      validCount,
+      // Cancelamentos
+      cancelledCount,
+      cancelledGmv:  parseFloat(cancelledGmv.toFixed(2)),
+      cancelledRate,
+      unpaidCount,
+      unpaidGmv:     parseFloat(unpaidGmv.toFixed(2)),
+      unpaidPct:     cancelledCount > 0 ? parseFloat(((unpaidCount / cancelledCount) * 100).toFixed(1)) : 0,
+      // Fora de estoque
+      outOfStockCount,
+      outOfStockRate,
+      outOfStockProducts,
+      // Devoluções
+      returnedCount,
+      returnedFullCount:    returnedFull.length,
+      returnedPartialCount: returnedPartial.length,
+      returnedLost:         parseFloat(returnedLost.toFixed(2)),
+      returnedRate,
+      // Breakdown
+      cancelReasons,
+    },
+  });
+}
+
+module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison, getShopeeSummary, getShopeeLosses };
