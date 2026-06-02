@@ -1,7 +1,7 @@
 const { z } = require('zod');
 const prisma = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
-const { getShopeeRates } = require('../services/calculatorService');
+const { getShopeeRates, calcOrderProfit } = require('../services/calculatorService');
 
 const productSchema = z.object({
   storeId:    z.string().uuid('storeId inválido'),
@@ -720,4 +720,80 @@ async function searchWithCost(req, res) {
   });
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost };
+// PATCH /api/products/:id/save-and-recalc — salva custo E recalcula pedidos do produto imediatamente
+// Usado no Fechamento Mensal — sem job queue, resultado síncrono
+async function saveAndRecalc(req, res) {
+  try {
+    const { costPrice, packaging } = req.body;
+    const productId = req.params.id;
+
+    const product = await prisma.product.findFirst({
+      where: { id: productId, store: { userId: req.userId } },
+      include: { store: { select: { taxRate: true, marketplace: true } } },
+    });
+    if (!product) return res.status(404).json({ error: 'Produto não encontrado' });
+
+    // 1. Atualizar custo
+    await prisma.product.update({
+      where: { id: productId },
+      data: { costPrice: parseFloat(costPrice || 0), packaging: parseFloat(packaging || 0) },
+    });
+
+    const cost = parseFloat(costPrice || 0);
+    const pkg  = parseFloat(packaging  || 0);
+    // calcOrderProfit importado no topo do arquivo
+
+    // 2. Buscar todos os pedidos vinculados a este produto
+    const orders = await prisma.order.findMany({
+      where: { productId },
+      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, shopeeCommission: true, listingType: true },
+    });
+
+    // 3. Recalcular cada pedido
+    const marketplace  = product.store?.marketplace ?? 'shopee';
+    const taxRate      = product.store?.taxRate ?? 0;
+    const updates = orders.map(o => {
+      const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+      const precomputedFee = marketplace === 'mercadolivre' ? (o.shopeeCommission ?? null) : null;
+      const calc = calcOrderProfit({
+        agreedPrice:   o.agreedPrice,
+        quantity:      o.quantity,
+        sellerCoupon:  o.sellerCoupon,
+        lmmDiscount:   o.lmmDiscount,
+        costPrice:     cost,
+        packagingCost: pkg,
+        taxRate,
+        marketplace,
+        precomputedFee,
+        listingType:   o.listingType,
+      });
+      const finalProfit = isRevenue ? calc.grossProfit : 0;
+      const finalMargin = isRevenue ? calc.margin      : 0;
+      return prisma.order.update({
+        where: { id: o.id },
+        data: {
+          calcGmv:         calc.gmv,
+          calcShopeeFee:   calc.marketplaceFee,
+          calcNetRevenue:  calc.netRevenue,
+          calcTax:         calc.taxAmount,
+          calcProductCost: calc.productCost,
+          calcPackaging:   calc.packaging,
+          calcGrossProfit: finalProfit,
+          calcMargin:      finalMargin,
+          hasCost:         calc.hasCost,
+          profit:          finalProfit,
+          margin:          finalMargin,
+        },
+      });
+    });
+
+    await Promise.all(updates);
+
+    return res.json({ success: true, updated: updates.length, costPrice: cost, packaging: pkg });
+  } catch (err) {
+    console.error('saveAndRecalc error:', err);
+    return res.status(500).json({ error: 'Erro ao salvar custo: ' + err.message });
+  }
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc };
