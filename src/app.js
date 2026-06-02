@@ -18,6 +18,7 @@ const adminPanelRoutes    = require('./routes/adminPanel');
 const goalsRoutes         = require('./routes/goals');
 const insightsRoutes      = require('./routes/insights');
 const closingRoutes       = require('./routes/closing');
+const mlRoutes            = require('./routes/ml');
 
 const { startRecalculateWorker }  = require('./services/recalculateQueue');
 
@@ -76,6 +77,7 @@ app.use('/api/admin',          adminPanelRoutes);
 app.use('/api/goals',           goalsRoutes);
 app.use('/api/insights',        insightsRoutes);
 app.use('/api/closing',         closingRoutes);
+app.use('/api/ml',              mlRoutes);
 
 // Tratamento de erros global
 app.use((err, req, res, next) => {

@@ -36,6 +36,11 @@ model Store {
   taxRate         Float     @default(5.0)
   fixedFeePerItem Float     @default(0)
   createdAt       DateTime  @default(now())
+  mlAccessToken    String?
+  mlRefreshToken   String?
+  mlSellerId       String?
+  mlTokenExpiresAt DateTime?
+
   products         Product[]
   orders           Order[]
   imports          Import[]
