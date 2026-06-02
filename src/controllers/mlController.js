@@ -212,7 +212,7 @@ async function syncItems(req, res) {
       const fees        = feesMap[item.id] ?? {};
       const listingType = item.listing_type_id ?? null;
       const feeRate     = fees.saleFeeRate ?? null;
-      // SKU pode estar em seller_sku, seller_custom_field ou nos atributos
+      const mlStatus    = item.status ?? null;
       const skuFromAttr = item.attributes?.find(a => a.id === 'SELLER_SKU')?.value_name ?? null;
       const sku = item.seller_sku ?? item.seller_custom_field ?? skuFromAttr ?? null;
 
@@ -221,19 +221,19 @@ async function syncItems(req, res) {
         externalId:    item.id,
         mlListingType: listingType,
         mlFeeRate:     feeRate,
+        mlStatus,
         name:          item.title ?? 'Sem título',
         sku:           sku,
         listPrice:     item.price ?? 0,
         stock:         item.available_quantity ?? 0,
       };
 
-      // Upsert por externalId (ML item_id)
       const existing = await prisma.product.findFirst({ where: { storeId, externalId: item.id } });
 
       if (existing) {
         await prisma.product.update({
           where: { id: existing.id },
-          data: { mlListingType: data.mlListingType, mlFeeRate: data.mlFeeRate, listPrice: data.listPrice, stock: data.stock, name: data.name, sku: data.sku ?? existing.sku },
+          data: { mlListingType: data.mlListingType, mlFeeRate: data.mlFeeRate, mlStatus, listPrice: data.listPrice, stock: data.stock, name: data.name, sku: data.sku ?? existing.sku },
         });
         updated++;
       } else {
@@ -243,7 +243,14 @@ async function syncItems(req, res) {
       synced++;
     }
 
-    return res.json({ synced, created, updated, total: itemIds.length });
+    // Contagem por status
+    const statusCount = {};
+    for (const item of items) {
+      const s = item?.status ?? 'unknown';
+      statusCount[s] = (statusCount[s] || 0) + 1;
+    }
+
+    return res.json({ synced, created, updated, total: itemIds.length, byStatus: statusCount });
   } catch (err) {
     console.error('[ML] sync-items erro:', err.message);
     return res.status(500).json({ error: 'Erro ao sincronizar anúncios: ' + err.message });

@@ -42,8 +42,10 @@ function withAlerts(p) {
 }
 
 // GET /api/products — produtos raiz com paginação e busca
+// source=ml  → só anúncios ML (externalId não nulo)
+// source=catalog → só produtos do catálogo (externalId nulo)
 async function list(req, res) {
-  const { storeId, search, page = 1, limit = 20 } = req.query;
+  const { storeId, search, page = 1, limit = 20, source, mlStatus } = req.query;
 
   const where = {
     parentId: null,
@@ -52,6 +54,9 @@ async function list(req, res) {
       { name: { contains: search } },
       { sku:  { contains: search } },
     ]} : {}),
+    ...(source === 'ml'      ? { externalId: { not: null } } : {}),
+    ...(source === 'catalog' ? { externalId: null } : {}),
+    ...(mlStatus ? { mlStatus } : {}),
   };
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
