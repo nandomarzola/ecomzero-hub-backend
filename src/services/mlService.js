@@ -236,13 +236,14 @@ function convertMlOrder(mlOrder, storeId, importId, store) {
 }
 
 // ── Buscar IDs de todos os anúncios ativos do seller ──────────────────────────
-async function fetchItemIds(accessToken, sellerId, status = 'active') {
+async function fetchItemIds(accessToken, sellerId) {
   const ids = [];
   let offset = 0;
   const limit = 50;
 
   while (true) {
-    const params = new URLSearchParams({ seller_id: sellerId, status, offset: String(offset), limit: String(limit) });
+    // Sem filtro de status — busca todos os anúncios (ativos, pausados, etc.)
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
     const res = await mlGet(`/users/${sellerId}/items/search?${params}`, accessToken);
     if (res.status !== 200) break;
 
@@ -258,7 +259,7 @@ async function fetchItemIds(accessToken, sellerId, status = 'active') {
 
 // ── Buscar detalhes de itens em lotes de 20 ────────────────────────────────────
 async function fetchItemDetails(accessToken, itemIds) {
-  const attrs = 'id,title,price,listing_type_id,seller_sku,available_quantity,thumbnail,permalink,variations,category_id,status';
+  const attrs = 'id,title,price,listing_type_id,seller_sku,seller_custom_field,available_quantity,thumbnail,permalink,variations,category_id,status,attributes';
   const items = [];
 
   for (let i = 0; i < itemIds.length; i += 20) {

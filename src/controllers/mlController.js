@@ -193,7 +193,7 @@ async function syncItems(req, res) {
 
   try {
     // 1. Buscar todos os IDs de anúncios ativos
-    const itemIds = await fetchItemIds(accessToken, store.mlSellerId, 'active');
+    const itemIds = await fetchItemIds(accessToken, store.mlSellerId);
     if (!itemIds.length) return res.json({ synced: 0, message: 'Nenhum anúncio ativo encontrado' });
 
     // 2. Detalhes em lotes de 20
@@ -212,7 +212,9 @@ async function syncItems(req, res) {
       const fees        = feesMap[item.id] ?? {};
       const listingType = item.listing_type_id ?? null;
       const feeRate     = fees.saleFeeRate ?? null;
-      const sku         = item.seller_sku ?? null;
+      // SKU pode estar em seller_sku, seller_custom_field ou nos atributos
+      const skuFromAttr = item.attributes?.find(a => a.id === 'SELLER_SKU')?.value_name ?? null;
+      const sku = item.seller_sku ?? item.seller_custom_field ?? skuFromAttr ?? null;
 
       const data = {
         storeId,
