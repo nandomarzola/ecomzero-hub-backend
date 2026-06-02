@@ -1,5 +1,5 @@
 const prisma = require('../lib/prisma');
-const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchItemFees } = require('../services/mlService');
+const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchItemFees, fetchShippingCosts } = require('../services/mlService');
 
 const FRONTEND_URL = process.env.ML_FRONTEND_URL || 'http://localhost:5173';
 
@@ -169,12 +169,23 @@ async function syncOrders(req, res) {
     }
     console.log(`[ML] ${Object.keys(itemMap).length} produtos criados/atualizados`);
 
-    // 5. Converter pedidos — agora com productId já resolvido via itemMap
+    // 5. Buscar custos de frete do vendedor para todos os pedidos com envio
+    const shippingIds = [...new Set(mlOrders.map(o => o.shipping?.id).filter(Boolean))];
+    console.log(`[ML] Buscando frete de ${shippingIds.length} envios...`);
+    const shippingCosts = shippingIds.length > 0
+      ? await fetchShippingCosts(accessToken, shippingIds)
+      : {};
+
+    // 6. Converter pedidos com productId e sellerShippingCost calculados
     const ordersData = mlOrders.map(o => {
-      const item     = o.order_items?.[0];
-      const mlItemId = item?.item?.id ?? null;
-      const productId = mlItemId ? (itemMap[mlItemId] ?? null) : null;
-      return convertMlOrder(o, storeId, imp.id, store, productId);
+      const item          = o.order_items?.[0];
+      const mlItemId      = item?.item?.id ?? null;
+      const productId     = mlItemId ? (itemMap[mlItemId] ?? null) : null;
+      const shippingId    = o.shipping?.id;
+      const buyerShipping = o.payments?.[0]?.shipping_cost ?? 0;
+      const { ratio = 0, gapDiscount = 0 } = shippingId ? (shippingCosts[shippingId] ?? {}) : {};
+      const sellerShipping = Math.max(0, ratio - gapDiscount - buyerShipping);
+      return convertMlOrder(o, storeId, imp.id, store, productId, sellerShipping);
     });
 
     // 6. Salvar pedidos

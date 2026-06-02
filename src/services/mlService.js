@@ -159,7 +159,8 @@ function categoryToStatus(cat) {
 
 // ── Converter pedido ML para nosso formato ─────────────────────────────────────
 // productId: já resolvido pelo controller via itemMap (externalId → product.id)
-function convertMlOrder(mlOrder, storeId, importId, store, productId = null) {
+// sellerShippingCost: frete que o VENDEDOR paga = ratio - gap_discount - buyer_shipping
+function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sellerShippingCost = 0) {
   const item       = mlOrder.order_items?.[0];
   const payment    = mlOrder.payments?.[0];
   const shipping   = mlOrder.shipping;
@@ -170,10 +171,11 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null) {
 
   // ML fornece o valor real da taxa no campo sale_fee
   const saleFee      = r2(item?.sale_fee ?? 0);
-  const netRevenue   = r2(gmv - saleFee);
+  const freight      = r2(sellerShippingCost ?? 0); // frete que o VENDEDOR paga
+  const netRevenue   = r2(gmv - saleFee - freight);
   const taxRate      = store.taxRate ?? 0;
   const taxAmount    = r2(gmv * (taxRate / 100));
-  const grossProfit  = r2(netRevenue - taxAmount); // sem custo ainda (orphan)
+  const grossProfit  = r2(netRevenue - taxAmount); // sem custo de produto ainda
   const margin       = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
 
   const orderCategory = classifyMlOrder(mlOrder.status);
@@ -218,8 +220,9 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null) {
     orderCreatedAt:   createdAt,
     orderPaidAt:      paidAt,
     orderDeliveredAt: deliveredAt,
+    mlShippingCost:   freight,
     calcGmv:          isRevenue ? gmv : 0,
-    calcShopeeFee:    isRevenue ? saleFee : 0,
+    calcShopeeFee:    isRevenue ? r2(saleFee + freight) : 0, // taxa total = comissão + frete vendedor
     calcNetRevenue:   isRevenue ? netRevenue : 0,
     calcTax:          isRevenue ? taxAmount : 0,
     calcProductCost:  0,
@@ -234,6 +237,30 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null) {
     margin:           isRevenue ? margin : 0,
     snapshotTaxRate:  taxRate,
   };
+}
+
+// ── Buscar custo de frete do vendedor para múltiplos envios (em paralelo) ────────
+// Fórmula: sellerShipping = max(0, ratio - gap_discount - buyerShipping)
+async function fetchShippingCosts(accessToken, shipmentIds) {
+  const costsMap = {}; // shippingId → sellerShippingCost
+
+  // Buscar em paralelo (limitado a 10 por vez para não sobrecarregar)
+  const chunks = [];
+  for (let i = 0; i < shipmentIds.length; i += 10) chunks.push(shipmentIds.slice(i, i + 10));
+
+  for (const chunk of chunks) {
+    await Promise.all(chunk.map(async (id) => {
+      try {
+        const ship = await mlGet('/shipments/' + id, accessToken);
+        const ratio       = ship?.cost_components?.ratio       ?? 0;
+        const gapDiscount = ship?.cost_components?.gap_discount ?? 0;
+        costsMap[id] = { ratio, gapDiscount };
+      } catch {
+        costsMap[id] = { ratio: 0, gapDiscount: 0 };
+      }
+    }));
+  }
+  return costsMap;
 }
 
 // ── Buscar IDs de todos os anúncios ativos do seller ──────────────────────────
@@ -332,5 +359,6 @@ module.exports = {
   fetchItemIds,
   fetchItemDetails,
   fetchItemFees,
+  fetchShippingCosts,
   listingTypeLabel,
 };

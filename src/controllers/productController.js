@@ -746,7 +746,7 @@ async function saveAndRecalc(req, res) {
     // 2. Buscar todos os pedidos vinculados a este produto
     const orders = await prisma.order.findMany({
       where: { productId },
-      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, shopeeCommission: true, listingType: true },
+      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, shopeeCommission: true, listingType: true, mlShippingCost: true },
     });
 
     // 3. Recalcular cada pedido
@@ -754,7 +754,11 @@ async function saveAndRecalc(req, res) {
     const taxRate      = product.store?.taxRate ?? 0;
     const updates = orders.map(o => {
       const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
-      const precomputedFee = marketplace === 'mercadolivre' ? (o.shopeeCommission ?? null) : null;
+      // Para ML: precomputedFee = comissão + frete vendedor (total deduções)
+      const mlFrete = o.mlShippingCost ?? 0;
+      const precomputedFee = marketplace === 'mercadolivre'
+        ? Math.round(((o.shopeeCommission ?? 0) + mlFrete) * 100) / 100
+        : null;
       const calc = calcOrderProfit({
         agreedPrice:   o.agreedPrice,
         quantity:      o.quantity,

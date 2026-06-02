@@ -140,6 +140,7 @@ model Order {
 
   // ── Logística ─────────────────────────────────────────────────────────────
   listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
+  mlShippingCost   Float    @default(0)  // Frete pago pelo VENDEDOR (Mercado Envios)
   trackingNumber   String?
   shippingOption   String?
   orderCreatedAt   DateTime?
