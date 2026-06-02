@@ -1,7 +1,7 @@
 const https = require('https');
 
 const ML_API    = 'https://api.mercadolibre.com';
-const ML_AUTH   = 'https://auth.mercadolibre.com.br';
+const ML_AUTH   = 'https://auth.mercadolivre.com.br';
 const CLIENT_ID     = process.env.ML_CLIENT_ID;
 const CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const REDIRECT_URI  = process.env.ML_REDIRECT_URI;
