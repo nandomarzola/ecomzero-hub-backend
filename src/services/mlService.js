@@ -252,8 +252,9 @@ async function fetchShippingCosts(accessToken, shipmentIds) {
     await Promise.all(chunk.map(async (id) => {
       try {
         const ship = await mlGet('/shipments/' + id, accessToken);
-        const ratio       = ship?.cost_components?.ratio       ?? 0;
-        const gapDiscount = ship?.cost_components?.gap_discount ?? 0;
+        const shipBody    = ship?.body ?? ship; // mlGet retorna { status, body }
+        const ratio       = shipBody?.cost_components?.ratio       ?? 0;
+        const gapDiscount = shipBody?.cost_components?.gap_discount ?? 0;
         costsMap[id] = { ratio, gapDiscount };
       } catch {
         costsMap[id] = { ratio: 0, gapDiscount: 0 };
