@@ -239,25 +239,24 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
   };
 }
 
-// ── Buscar custo de frete do vendedor para múltiplos envios (em paralelo) ────────
-// Fórmula: sellerShipping = max(0, ratio - gap_discount - buyerShipping)
+// ── Buscar custo de frete do VENDEDOR via /shipments/:id/costs ───────────────────
+// senders[0].cost = valor exato que o vendedor paga (mesmo mostrado no painel ML)
+// Ex: canivete R$22,99 → senders[0].cost = R$12,35 ✓
 async function fetchShippingCosts(accessToken, shipmentIds) {
-  const costsMap = {}; // shippingId → sellerShippingCost
+  const costsMap = {};
 
-  // Buscar em paralelo (limitado a 10 por vez para não sobrecarregar)
   const chunks = [];
   for (let i = 0; i < shipmentIds.length; i += 10) chunks.push(shipmentIds.slice(i, i + 10));
 
   for (const chunk of chunks) {
     await Promise.all(chunk.map(async (id) => {
       try {
-        const ship = await mlGet('/shipments/' + id, accessToken);
-        const shipBody    = ship?.body ?? ship; // mlGet retorna { status, body }
-        const ratio       = shipBody?.cost_components?.ratio       ?? 0;
-        const gapDiscount = shipBody?.cost_components?.gap_discount ?? 0;
-        costsMap[id] = { ratio, gapDiscount };
+        const res  = await mlGet('/shipments/' + id + '/costs', accessToken);
+        const data = res?.body ?? res;
+        const sellerCost = data?.senders?.[0]?.cost ?? 0;
+        costsMap[id] = { sellerCost };
       } catch {
-        costsMap[id] = { ratio: 0, gapDiscount: 0 };
+        costsMap[id] = { sellerCost: 0 };
       }
     }));
   }

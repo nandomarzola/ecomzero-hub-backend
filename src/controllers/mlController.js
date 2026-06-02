@@ -181,10 +181,9 @@ async function syncOrders(req, res) {
       const item          = o.order_items?.[0];
       const mlItemId      = item?.item?.id ?? null;
       const productId     = mlItemId ? (itemMap[mlItemId] ?? null) : null;
-      const shippingId    = o.shipping?.id;
-      const buyerShipping = o.payments?.[0]?.shipping_cost ?? 0;
-      const { ratio = 0, gapDiscount = 0 } = shippingId ? (shippingCosts[shippingId] ?? {}) : {};
-      const sellerShipping = Math.max(0, ratio - gapDiscount - buyerShipping);
+      const shippingId     = o.shipping?.id;
+      const { sellerCost = 0 } = shippingId ? (shippingCosts[shippingId] ?? {}) : {};
+      const sellerShipping = sellerCost; // valor exato do painel ML
       return convertMlOrder(o, storeId, imp.id, store, productId, sellerShipping);
     });
 
