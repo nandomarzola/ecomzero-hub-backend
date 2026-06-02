@@ -158,7 +158,8 @@ function categoryToStatus(cat) {
 }
 
 // ── Converter pedido ML para nosso formato ─────────────────────────────────────
-function convertMlOrder(mlOrder, storeId, importId, store) {
+// productId: já resolvido pelo controller via itemMap (externalId → product.id)
+function convertMlOrder(mlOrder, storeId, importId, store, productId = null) {
   const item       = mlOrder.order_items?.[0];
   const payment    = mlOrder.payments?.[0];
   const shipping   = mlOrder.shipping;
@@ -200,7 +201,7 @@ function convertMlOrder(mlOrder, storeId, importId, store) {
     skuVariacao:   sku,
     productName:   title,
     variationName: item?.item?.variation_attributes?.map(a => a.value_name).join(' ') || null,
-    productId:     null,
+    productId,
     originalPrice: agreedPrice,
     agreedPrice,
     quantity,

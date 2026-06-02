@@ -111,13 +111,12 @@ async function syncOrders(req, res) {
   }
 
   try {
-    // Criar registro de import
     const periodMonth = dateFrom.substring(0, 7);
     const imp = await prisma.import.create({
       data: { storeId, filename: `ml-sync-${periodMonth}`, periodMonth, totalRows: 0, status: 'processing' },
     });
 
-    // Buscar pedidos na API ML
+    // 1. Buscar pedidos na API ML
     const mlOrders = await fetchOrders(accessToken, store.mlSellerId, dateFrom, dateTo);
     console.log(`[ML] ${mlOrders.length} pedidos encontrados para ${periodMonth}`);
 
@@ -126,45 +125,79 @@ async function syncOrders(req, res) {
       return res.json({ imported: 0, message: 'Nenhum pedido encontrado no período' });
     }
 
-    // Converter e salvar
-    const ordersData = mlOrders.map(o => convertMlOrder(o, storeId, imp.id, store));
+    // 2. Extrair IDs únicos dos itens nos pedidos
+    const itemIdsInOrders = [...new Set(
+      mlOrders.flatMap(o => (o.order_items ?? []).map(i => i?.item?.id).filter(Boolean))
+    )];
+    console.log(`[ML] ${itemIdsInOrders.length} itens únicos nos pedidos`);
 
+    // 3. Buscar detalhes dos itens dos pedidos (não todos os anúncios — só os que têm pedido)
+    const itemDetails = itemIdsInOrders.length > 0
+      ? await fetchItemDetails(accessToken, itemIdsInOrders)
+      : [];
+
+    // 4. Upsert de produtos SOMENTE dos itens que têm pedidos
+    const itemMap = {}; // itemId → productId
+    for (const item of itemDetails) {
+      if (!item?.id) continue;
+      const skuFromAttr = item.attributes?.find(a => a.id === 'SELLER_SKU')?.value_name ?? null;
+      const sku         = item.seller_sku ?? item.seller_custom_field ?? skuFromAttr ?? null;
+      const productData = {
+        storeId,
+        externalId:    item.id,
+        mlListingType: item.listing_type_id ?? null,
+        mlStatus:      item.status ?? null,
+        name:          item.title ?? 'Sem título',
+        sku,
+        listPrice:     item.price ?? 0,
+        stock:         item.available_quantity ?? 0,
+      };
+
+      const existing = await prisma.product.findFirst({ where: { storeId, externalId: item.id } });
+      let product;
+      if (existing) {
+        product = await prisma.product.update({
+          where: { id: existing.id },
+          data: { mlListingType: productData.mlListingType, mlStatus: productData.mlStatus, listPrice: productData.listPrice, name: productData.name, sku: productData.sku ?? existing.sku },
+        });
+      } else {
+        product = await prisma.product.create({
+          data: { ...productData, costPrice: 0, packaging: 0, supplies: 0, minStock: 5 },
+        });
+      }
+      itemMap[item.id] = product.id;
+    }
+    console.log(`[ML] ${Object.keys(itemMap).length} produtos criados/atualizados`);
+
+    // 5. Converter pedidos — agora com productId já resolvido via itemMap
+    const ordersData = mlOrders.map(o => {
+      const item     = o.order_items?.[0];
+      const mlItemId = item?.item?.id ?? null;
+      const productId = mlItemId ? (itemMap[mlItemId] ?? null) : null;
+      return convertMlOrder(o, storeId, imp.id, store, productId);
+    });
+
+    // 6. Salvar pedidos
     let saved = 0;
     for (const batch of chunkArr(ordersData, 200)) {
       const result = await prisma.order.createMany({ data: batch, skipDuplicates: true });
       saved += result.count;
     }
 
-    // Vincular pedidos a produtos por SKU
-    await prisma.$executeRaw`
-      UPDATE \`Order\` o
-      INNER JOIN Product p
-        ON p.storeId = o.storeId
-        AND p.sku IS NOT NULL
-        AND p.sku = o.skuVariacao
-      SET o.productId = p.id
-      WHERE o.importId = ${imp.id} AND o.productId IS NULL
-    `;
-
-    // Totais para o Import record
+    // 7. Totais
     const valid     = ordersData.filter(o => o.orderCategory === 'valid').length;
     const pending   = ordersData.filter(o => o.orderCategory === 'pending').length;
     const cancelled = ordersData.filter(o => o.orderCategory.startsWith('cancelled')).length;
+    const linked    = ordersData.filter(o => o.productId !== null).length;
     const gmv       = ordersData.filter(o => ['valid','pending'].includes(o.orderCategory)).reduce((s, o) => s + o.calcGmv, 0);
 
     await prisma.import.update({
       where: { id: imp.id },
-      data: {
-        status: 'done',
-        totalRows: mlOrders.length,
-        validCount: valid,
-        pendingCount: pending,
-        cancelledCount: cancelled,
-        gmv: Math.round(gmv * 100) / 100,
-      },
+      data: { status: 'done', totalRows: mlOrders.length, validCount: valid, pendingCount: pending, cancelledCount: cancelled, gmv: Math.round(gmv * 100) / 100 },
     });
 
-    return res.json({ imported: saved, total: mlOrders.length, valid, pending, cancelled, periodMonth });
+    console.log(`[ML] ${saved} pedidos salvos, ${linked} vinculados a produtos`);
+    return res.json({ imported: saved, total: mlOrders.length, valid, pending, cancelled, linked, products: Object.keys(itemMap).length, periodMonth });
   } catch (err) {
     console.error('[ML] sync erro:', err.message);
     return res.status(500).json({ error: 'Erro ao sincronizar pedidos: ' + err.message });
