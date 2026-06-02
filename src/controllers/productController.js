@@ -683,4 +683,36 @@ async function setCostBySku(req, res) {
   }
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku };
+// GET /api/products/search-cost?q=nome — busca produtos COM custo em todas as lojas do usuário
+// Usado para copiar custo de produto de outra loja (ex: ML → Shopee)
+async function searchWithCost(req, res) {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) return res.json({ products: [] });
+
+  const words = q.trim().split(/\s+/).filter(w => w.length >= 3).slice(0, 4);
+
+  const products = await prisma.product.findMany({
+    where: {
+      store:     { userId: req.userId },
+      costPrice: { gt: 0 },
+      OR: words.map(w => ({ name: { contains: w } })),
+    },
+    include: { store: { select: { name: true, marketplace: true } } },
+    orderBy: { costPrice: 'desc' },
+    take: 8,
+  });
+
+  return res.json({
+    products: products.map(p => ({
+      id:          p.id,
+      name:        p.name,
+      sku:         p.sku,
+      costPrice:   p.costPrice,
+      packaging:   p.packaging,
+      storeName:   p.store?.name,
+      marketplace: p.store?.marketplace,
+    })),
+  });
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost };
