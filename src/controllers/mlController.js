@@ -176,14 +176,41 @@ async function syncOrders(req, res) {
       ? await fetchShippingCosts(accessToken, shippingIds)
       : {};
 
-    // 6. Converter pedidos com productId e sellerShippingCost calculados
+    // 6. Agrupar pedidos por pack_id para dividir frete proporcionalmente
+    // Pack = múltiplos pedidos do mesmo comprador com 1 envio compartilhado
+    const packGroups = {}; // packId → [{ orderId, totalAmount }]
+    mlOrders.forEach(o => {
+      const packId     = o.pack_id ?? o.id; // sem pack_id = pedido individual
+      const shipId     = o.shipping?.id;
+      const totalAmt   = parseFloat(o.total_amount ?? 0);
+      if (!packGroups[packId]) packGroups[packId] = [];
+      packGroups[packId].push({ orderId: String(o.id), totalAmount: totalAmt, shippingId: shipId });
+    });
+
+    // Calcular frete proporcional por pedido dentro do pack
+    const shippingPerOrder = {}; // orderId → sellerShippingCost proporcional
+    for (const [, group] of Object.entries(packGroups)) {
+      const shipId      = group[0]?.shippingId;
+      const { sellerCost = 0 } = shipId ? (shippingCosts[shipId] ?? {}) : {};
+      if (group.length === 1) {
+        // Pedido individual — frete total
+        shippingPerOrder[group[0].orderId] = sellerCost;
+      } else {
+        // Pack — dividir frete proporcional ao valor de cada pedido
+        const totalPackValue = group.reduce((s, g) => s + g.totalAmount, 0);
+        group.forEach(g => {
+          const proportion = totalPackValue > 0 ? g.totalAmount / totalPackValue : 1 / group.length;
+          shippingPerOrder[g.orderId] = Math.round(sellerCost * proportion * 100) / 100;
+        });
+      }
+    }
+
+    // 7. Converter pedidos com productId e frete proporcional
     const ordersData = mlOrders.map(o => {
       const item          = o.order_items?.[0];
       const mlItemId      = item?.item?.id ?? null;
       const productId     = mlItemId ? (itemMap[mlItemId] ?? null) : null;
-      const shippingId     = o.shipping?.id;
-      const { sellerCost = 0 } = shippingId ? (shippingCosts[shippingId] ?? {}) : {};
-      const sellerShipping = sellerCost; // valor exato do painel ML
+      const sellerShipping = shippingPerOrder[String(o.id)] ?? 0;
       return convertMlOrder(o, storeId, imp.id, store, productId, sellerShipping);
     });
 
