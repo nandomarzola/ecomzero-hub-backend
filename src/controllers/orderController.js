@@ -339,15 +339,92 @@ async function deleteOrder(req, res) {
   return res.json({ message: 'Pedido cancelado' });
 }
 
-// POST /api/orders/recalculate — enfileira job de recálculo
+// POST /api/orders/recalculate — recalcula diretamente (síncrono, sem job queue)
 async function recalculateOrders(req, res) {
-  const body = req.body ?? {};
-  const job  = await recalculateQueue.add('recalculate', {
-    userId: req.userId,
-    all:    body.all    ?? false,
-    months: body.months ?? null,
+  const body    = req.body ?? {};
+  const months  = body.months ?? null;
+  const all     = body.all ?? false;
+  const { calcOrderProfit } = require('../services/calculatorService');
+
+  const storeWhere = { userId: req.userId };
+  const whereOrder = { store: storeWhere };
+
+  if (!all && Array.isArray(months) && months.length) {
+    const [y, mo] = months[0].split('-').map(Number);
+    whereOrder.soldAt = {
+      gte: new Date(Date.UTC(y, mo - 1, 1)),
+      lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+    };
+  } else if (!all) {
+    const now = new Date();
+    whereOrder.soldAt = {
+      gte: new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1)),
+      lte: new Date(Date.UTC(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)),
+    };
+  }
+
+  const orders = await prisma.order.findMany({
+    where: whereOrder,
+    include: {
+      store:   { select: { taxRate: true, marketplace: true } },
+      product: { select: { costPrice: true, packaging: true } },
+    },
   });
-  return res.status(202).json({ jobId: job.id });
+
+  const r2 = (n) => Math.round((n ?? 0) * 100) / 100;
+  const BATCH = 200;
+  const updates = [];
+
+  for (const order of orders) {
+    const marketplace    = order.store?.marketplace ?? 'shopee';
+    const taxRate        = order.store?.taxRate ?? 0;
+    const mlFrete        = order.mlShippingCost ?? 0;
+    const precomputedFee = marketplace === 'mercadolivre'
+      ? r2((order.shopeeCommission ?? 0) + mlFrete)
+      : null;
+
+    const calc = calcOrderProfit({
+      agreedPrice:   order.agreedPrice,
+      quantity:      order.quantity,
+      sellerCoupon:  order.sellerCoupon,
+      lmmDiscount:   order.lmmDiscount,
+      costPrice:     order.product?.costPrice ?? 0,
+      packagingCost: order.product?.packaging ?? 0,
+      taxRate,
+      marketplace,
+      precomputedFee,
+      listingType:   order.listingType,
+    });
+
+    const isRevenue   = ['valid', 'pending', 'returned_partial'].includes(order.orderCategory);
+    const finalProfit = isRevenue ? calc.grossProfit : 0;
+    const finalMargin = isRevenue ? calc.margin      : 0;
+
+    updates.push(prisma.order.update({
+      where: { id: order.id },
+      data: {
+        calcGmv:         calc.gmv,
+        calcShopeeFee:   calc.marketplaceFee,
+        calcNetRevenue:  calc.netRevenue,
+        calcTax:         calc.taxAmount,
+        calcProductCost: calc.productCost,
+        calcPackaging:   calc.packaging,
+        calcGrossProfit: finalProfit,
+        calcMargin:      finalMargin,
+        hasCost:         calc.hasCost,
+        profit:          finalProfit,
+        margin:          finalMargin,
+        snapshotTaxRate: taxRate,
+      },
+    }));
+  }
+
+  // Salvar em batches
+  for (let i = 0; i < updates.length; i += BATCH) {
+    await Promise.all(updates.slice(i, i + BATCH));
+  }
+
+  return res.json({ success: true, updated: updates.length, months: months ?? 'current' });
 }
 
 // GET /api/orders/recalculate/:jobId — polling do job de recálculo
