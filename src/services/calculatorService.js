@@ -1,4 +1,42 @@
-// Tiers oficiais Shopee 2026 baseados no preço acordado por unidade
+// ── Tabela oficial Shopee 2026 ─────────────────────────────────────────────
+function calcShopeeFeePorUnidade(agreedPrice) {
+  if (agreedPrice < 80)  return (agreedPrice * 0.20) + 4.00;
+  if (agreedPrice < 100) return (agreedPrice * 0.14) + 16.00;
+  if (agreedPrice < 200) return (agreedPrice * 0.14) + 20.00;
+  return                        (agreedPrice * 0.14) + 26.00;
+}
+
+function r2(n) { return Math.round(n * 100) / 100; }
+
+// ── Fonte única de verdade para cálculo de lucro por pedido ──────────────────
+// Validação:
+//   agreedPrice=38.99, qty=97, costPrice=21.47, packaging=0.15, taxRate=5.2
+//   gmv=3782.03, shopeeFee=1144.51, netRevenue=2637.52
+//   tax=196.67, productCost=2082.59, packaging=14.55, grossProfit=343.71, margin=9.09%
+function calcOrderProfit({
+  agreedPrice,
+  quantity,
+  sellerCoupon   = 0,
+  lmmDiscount    = 0,
+  costPrice      = 0,
+  packagingCost  = 0,
+  taxRate        = 0,     // % (ex: 5.2)
+}) {
+  const gmv          = r2(agreedPrice * quantity);
+  const shopeeFee    = r2(calcShopeeFeePorUnidade(agreedPrice) * quantity);
+  const extraFees    = r2(sellerCoupon + lmmDiscount);
+  const netRevenue   = r2(gmv - shopeeFee - extraFees);
+  const taxAmount    = r2(gmv * (taxRate / 100));
+  const productCost  = r2(costPrice * quantity);
+  const packaging    = r2(packagingCost * quantity);
+  const grossProfit  = r2(netRevenue - taxAmount - productCost - packaging);
+  const margin       = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
+  const hasCost      = costPrice > 0;
+
+  return { gmv, shopeeFee, extraFees, netRevenue, taxAmount, productCost, packaging, grossProfit, margin, hasCost };
+}
+
+// ── Compat com código legado (dashboard, cashflow, etc.) ─────────────────────
 function getShopeeRates(unitPrice) {
   if (unitPrice < 80)  return { commissionPct: 20, fixedFee: 4.00 };
   if (unitPrice < 100) return { commissionPct: 14, fixedFee: 16.00 };
@@ -6,89 +44,46 @@ function getShopeeRates(unitPrice) {
   return                      { commissionPct: 14, fixedFee: 26.00 };
 }
 
-// Taxa Shopee por unidade (preço acordado unitário)
-function calcShopeeFeePorUnidade(agreedPrice) {
-  const { commissionPct, fixedFee } = getShopeeRates(agreedPrice);
-  return agreedPrice * (commissionPct / 100) + fixedFee;
-}
-
 function calcProfit(salePrice, quantity, product, store, freight = 0, discount = 0) {
-  const effectivePrice = salePrice - discount; // = GMV do pedido
-
+  const effectivePrice = salePrice - discount;
   if (store.marketplace?.toLowerCase() === 'shopee') {
-    // Preço unitário para determinar o tier
     const unitPrice  = quantity > 0 ? effectivePrice / quantity : effectivePrice;
     const feePerUnit = calcShopeeFeePorUnidade(unitPrice);
-    const shopeeFee  = parseFloat((feePerUnit * quantity).toFixed(2));
-
-    // Receita líquida SEMPRE menor que GMV (subtração, nunca soma)
-    const netRevenue = parseFloat((effectivePrice - shopeeFee).toFixed(2));
-
-    // Imposto sobre GMV (receita bruta MEI/Simples — base legal é o valor da venda ao consumidor)
-    const taxRate  = (store.taxRate ?? 0) / 100;
-    const tax      = parseFloat((effectivePrice * taxRate).toFixed(2));
-
-    const cogs      = parseFloat(((product.costPrice ?? 0) * quantity).toFixed(2));
-    const packaging = parseFloat(((product.packaging ?? 0) * quantity).toFixed(2));
-    const supplies  = parseFloat(((product.supplies  ?? 0) * quantity).toFixed(2));
-    const fr        = parseFloat((freight ?? 0).toFixed(2));
-
-    const profit = parseFloat((netRevenue - tax - cogs - packaging - supplies - fr).toFixed(2));
-    // Margem sempre sobre GMV (spec Shopee)
-    const margin = effectivePrice > 0 ? parseFloat(((profit / effectivePrice) * 100).toFixed(2)) : 0;
-
+    const shopeeFee  = r2(feePerUnit * quantity);
+    const netRevenue = r2(effectivePrice - shopeeFee);
+    const taxRate    = (store.taxRate ?? 0) / 100;
+    const tax        = r2(effectivePrice * taxRate);
+    const cogs       = r2((product.costPrice ?? 0) * quantity);
+    const packaging  = r2((product.packaging ?? 0) * quantity);
+    const supplies   = r2((product.supplies  ?? 0) * quantity);
+    const fr         = r2(freight ?? 0);
+    const profit     = r2(netRevenue - tax - cogs - packaging - supplies - fr);
+    const margin     = effectivePrice > 0 ? r2((profit / effectivePrice) * 100) : 0;
     return {
-      profit,
-      margin,
+      profit, margin,
       breakdown: {
-        salePrice:     parseFloat(effectivePrice.toFixed(2)),
-        commissionPct: parseFloat(((shopeeFee / Math.max(effectivePrice, 0.01)) * 100).toFixed(2)),
-        commission:    shopeeFee,
-        serviceFee:    0,
-        fixedFee:      0,
-        netRevenue,
-        tax,
-        cogs,
-        packaging,
-        supplies,
-        freight:       fr,
+        salePrice: r2(effectivePrice), commissionPct: r2((shopeeFee / Math.max(effectivePrice, 0.01)) * 100),
+        commission: shopeeFee, serviceFee: 0, fixedFee: 0, netRevenue, tax, cogs, packaging, supplies, freight: fr,
       },
     };
   }
-
-  // ── Outros marketplaces ──────────────────────────────────────────────────
   const commissionPct   = store.commission     ?? 0;
   const fixedFeePerItem = store.fixedFeePerItem ?? 0;
   const serviceFeeRate  = store.serviceFee      ?? 0;
-
-  const commission = parseFloat((effectivePrice * (commissionPct / 100)).toFixed(2));
-  const serviceFee = parseFloat((effectivePrice * (serviceFeeRate / 100)).toFixed(2));
-  const tax        = parseFloat((effectivePrice * ((store.taxRate ?? 0) / 100)).toFixed(2));
-  const cogs       = parseFloat(((product.costPrice ?? 0) * quantity).toFixed(2));
-  const packaging  = parseFloat(((product.packaging ?? 0) * quantity).toFixed(2));
-  const supplies   = parseFloat(((product.supplies  ?? 0) * quantity).toFixed(2));
-  const fixedFee   = parseFloat((fixedFeePerItem * quantity).toFixed(2));
-  const fr         = parseFloat((freight ?? 0).toFixed(2));
-
-  const profit = parseFloat((effectivePrice - commission - serviceFee - tax - cogs - packaging - supplies - fixedFee - fr).toFixed(2));
-  const margin = effectivePrice > 0 ? parseFloat(((profit / effectivePrice) * 100).toFixed(2)) : 0;
-
+  const commission  = r2(effectivePrice * (commissionPct / 100));
+  const serviceFee  = r2(effectivePrice * (serviceFeeRate / 100));
+  const tax         = r2(effectivePrice * ((store.taxRate ?? 0) / 100));
+  const cogs        = r2((product.costPrice ?? 0) * quantity);
+  const packaging   = r2((product.packaging ?? 0) * quantity);
+  const supplies    = r2((product.supplies  ?? 0) * quantity);
+  const fixedFee    = r2(fixedFeePerItem * quantity);
+  const fr          = r2(freight ?? 0);
+  const profit      = r2(effectivePrice - commission - serviceFee - tax - cogs - packaging - supplies - fixedFee - fr);
+  const margin      = effectivePrice > 0 ? r2((profit / effectivePrice) * 100) : 0;
   return {
-    profit,
-    margin,
-    breakdown: {
-      salePrice:     parseFloat(effectivePrice.toFixed(2)),
-      commissionPct: parseFloat(commissionPct.toFixed(2)),
-      commission,
-      serviceFee,
-      fixedFee,
-      tax,
-      cogs,
-      packaging,
-      supplies,
-      freight:       fr,
-    },
+    profit, margin,
+    breakdown: { salePrice: r2(effectivePrice), commissionPct: r2(commissionPct), commission, serviceFee, fixedFee, tax, cogs, packaging, supplies, freight: fr },
   };
 }
 
-module.exports = { calcProfit, getShopeeRates, calcShopeeFeePorUnidade };
+module.exports = { calcProfit, calcOrderProfit, getShopeeRates, calcShopeeFeePorUnidade };

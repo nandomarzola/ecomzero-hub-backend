@@ -1,24 +1,56 @@
-const XLSX  = require('xlsx');
-const prisma = require('../lib/prisma');
+const XLSX        = require('xlsx');
+const { randomUUID } = require('crypto');
+const prisma       = require('../lib/prisma');
+const { calcOrderProfit } = require('./calculatorService');
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
 
-function parseNum(value) {
-  if (value === null || value === undefined || value === '') return 0;
-  if (typeof value === 'number') return value;
-  return parseFloat(String(value).trim().replace(',', '.')) || 0;
+function parseNum(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return v;
+  return parseFloat(String(v).trim().replace(',', '.')) || 0;
 }
 
-function parseInt2(value) {
-  return Math.round(parseNum(value)) || 1;
+function parseQty(v) { return Math.max(1, Math.round(parseNum(v))); }
+
+function parseDate(v) {
+  if (!v) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const d = new Date(s.replace(' ', 'T') + (s.includes(':') ? ':00.000Z' : 'T00:00:00.000Z'));
+  return isNaN(d.getTime()) ? null : d;
 }
 
-function parseOrderDate(value) {
-  if (!value) return null;
-  const str = String(value).trim();
-  if (!str) return null;
-  const d = new Date(str.replace(' ', 'T') + ':00.000Z');
-  return isNaN(d) ? null : d;
+function normStr(s) {
+  return (s || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[–—\-]/g, ' ')
+    .replace(/[|]/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function extractNameAndVariation(productName, variationName) {
+  if (variationName && variationName.trim()) {
+    return { realName: productName, realVariation: variationName.trim() };
+  }
+  const idx = productName.lastIndexOf(' — ');
+  if (idx > -1) {
+    return { realName: productName.substring(0, idx).trim(), realVariation: productName.substring(idx + 3).trim() };
+  }
+  return { realName: productName, realVariation: '' };
+}
+
+function extractMonth(rows, fallbackFilename) {
+  const m = String(fallbackFilename || '').match(/(\d{4})(\d{2})\d{2}/);
+  if (m) return `${m[1]}-${m[2]}`;
+  for (const row of rows.slice(0, 20)) {
+    const d = parseDate(row['Data de criação do pedido'] || row['Hora do pagamento do pedido']);
+    if (d) return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  }
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
 function classifyOrder(row) {
@@ -28,22 +60,24 @@ function classifyOrder(row) {
   const cancelReason = String(row['Cancelar Motivo'] || '').trim().toLowerCase();
 
   if (status === 'Concluído') {
-    if (returnStatus === 'Solicitação aprovada') {
-      return globalTotal === 0 ? 'returned_full' : 'returned_partial';
-    }
+    if (returnStatus === 'Solicitação aprovada') return globalTotal === 0 ? 'returned_full' : 'returned_partial';
+    if (returnStatus === 'Devolução em Andamento') return globalTotal > 0 ? 'returned_partial' : 'returned_full';
     return 'valid';
   }
-  if (status === 'Cancelado') {
-    return cancelReason.includes('não pago') ? 'cancelled_unpaid' : 'cancelled_other';
+  if (status === 'Cancelado' || status === 'Não pago') {
+    return (cancelReason.includes('automaticamente') || cancelReason.includes('não pago') || status === 'Não pago')
+      ? 'cancelled_unpaid' : 'cancelled_other';
   }
-  return 'valid';
+  const pendingKws = ['A Enviar', 'Enviado', 'Entregue', 'Order Received'];
+  if (pendingKws.some((kw) => status.includes(kw))) return 'pending';
+  if (status.startsWith('O comprador pode pedir')) return 'pending';
+  return 'pending';
 }
 
-function extractMonth(filename) {
-  const m = String(filename || '').match(/(\d{4})(\d{2})\d{2}/);
-  if (m) return `${m[1]}-${m[2]}`;
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+function categoryToStatus(cat) {
+  if (cat === 'returned_full') return 'returned';
+  if (cat.startsWith('cancelled')) return 'cancelled';
+  return 'paid';
 }
 
 function chunkArr(arr, size) {
@@ -54,233 +88,431 @@ function chunkArr(arr, size) {
 
 // ── Import principal ──────────────────────────────────────────────────────────
 
-async function importShopeeOrderAll(filePath, storeId, userId, originalFilename, onProgress) {
-  // ── 1. Loja ───────────────────────────────────────────────────────────────
-  const store = await prisma.store.findFirst({
-    where: userId ? { id: storeId, userId } : { id: storeId },
-  });
-  if (!store) throw new Error('Loja não encontrada');
+async function importShopeeOrderAll(filePath, storeId, userId, originalFilename, onProgress, existingImportId = null) {
 
-  const monthKey = extractMonth(originalFilename);
-  const [year, mon] = monthKey.split('-').map(Number);
-  const fallbackDate = new Date(Date.UTC(year, mon - 1, 15));
+  // ═══ FASE 1: Carregar TUDO em memória — 2 queries paralelas ════════════════
+  await onProgress?.({ pct: 5, message: 'Carregando dados...' });
 
-  // ── 2. Ler XLSX completo de uma vez ───────────────────────────────────────
-  await onProgress?.({ step: 'Lendo arquivo...', current: 0, total: 0 });
-
-  const workbook = XLSX.readFile(filePath, { raw: false });
-  const sheet    = workbook.Sheets[workbook.SheetNames[0]];
-  const rows     = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-
-  // ── 3. Pre-fetch produtos ─────────────────────────────────────────────────
-  await onProgress?.({ step: 'Carregando produtos...', current: 0, total: rows.length });
-
-  const [products, aliases] = await Promise.all([
+  const [store, products] = await Promise.all([
+    prisma.store.findFirst({ where: userId ? { id: storeId, userId } : { id: storeId } }),
     prisma.product.findMany({
-      where:  { storeId },
-      select: { id: true, sku: true, name: true, costPrice: true, packaging: true, supplies: true },
-    }),
-    prisma.productAlias.findMany({
-      where:  { storeId },
-      select: { rawSku: true, product: { select: { id: true, sku: true, name: true, costPrice: true, packaging: true, supplies: true } } },
+      where: { storeId },
+      select: { id: true, sku: true, name: true, costPrice: true, packaging: true, parentId: true, listPrice: true },
     }),
   ]);
+  if (!store) throw new Error('Loja não encontrada');
 
-  const bySkuMap   = new Map(products.filter((p) => p.sku).map((p) => [p.sku.toLowerCase(), p]));
-  const byNameMap  = new Map(products.map((p) => [p.name.toLowerCase(), p]));
-  const byAliasMap = new Map(aliases.map((a) => [a.rawSku.toLowerCase(), a.product]));
+  // Índices O(1)
+  const bySkuMap      = new Map(); // sku.lower → product
+  const byNameMap     = new Map(); // name.lower → product
+  const byNormNameMap = new Map(); // normStr(name) → product
 
-  function findProduct(skuRef, productName, variationName) {
-    if (skuRef) {
-      // 1. Match direto por SKU no catálogo
-      const p = bySkuMap.get(skuRef.toLowerCase());
-      if (p) return p;
-      // 2. Match por alias (SKU renomeado mapeado pelo usuário)
-      const aliased = byAliasMap.get(skuRef.toLowerCase());
-      if (aliased) return aliased;
-    }
-    const withVar = variationName && variationName !== '-'
-      ? `${productName} — ${variationName}`.toLowerCase()
-      : null;
-    if (withVar) {
-      const p = byNameMap.get(withVar);
-      if (p) return p;
-    }
-    return byNameMap.get(productName.toLowerCase()) ?? null;
+  for (const p of products) {
+    if (p.sku) bySkuMap.set(p.sku.toLowerCase().trim(), p);
+    byNameMap.set(p.name.toLowerCase().trim(), p);
+    byNormNameMap.set(normStr(p.name), p);
   }
 
-  // ── 4. Parsear todas as linhas em memória ─────────────────────────────────
-  await onProgress?.({ step: 'Classificando pedidos...', current: 0, total: rows.length });
+  // ═══ FASE 2: Ler XLSX + criar Import record ════════════════════════════════
+  await onProgress?.({ pct: 8, message: 'Lendo arquivo...' });
 
-  const ordersData = [];  // dados completos para criar/atualizar
-  const itemsIndex = [];  // { externalId, product, quantity, unitPrice }
-  const errors     = [];
+  const workbook = XLSX.readFile(filePath, { raw: false });
+  const rows     = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: '' });
+  if (rows.length === 0) throw new Error('Arquivo vazio ou sem dados');
+
+  const periodMonth  = extractMonth(rows, originalFilename);
+  const [year, mon]  = periodMonth.split('-').map(Number);
+  const fallbackDate = new Date(Date.UTC(year, mon - 1, 15));
+
+  // Usar Import record existente (criado pelo controller) ou criar novo
+  let imp;
+  if (existingImportId) {
+    imp = await prisma.import.update({
+      where: { id: existingImportId },
+      data: { periodMonth, totalRows: rows.length },
+    });
+  } else {
+    imp = await prisma.import.create({
+      data: { storeId, filename: originalFilename, periodMonth, totalRows: rows.length, status: 'processing' },
+    });
+  }
+
+  // ═══ VALIDAÇÃO: SKU Principal obrigatório — bloquear antes de processar ═══
+  await onProgress?.({ pct: 10, message: 'Validando arquivo...' });
+
+  const semSkuPai = rows.filter(row => {
+    const sku = String(row['Nº de referência do SKU principal'] || '').trim();
+    return !sku || sku.toLowerCase() === 'nan';
+  });
+
+  if (semSkuPai.length > 0) {
+    const produtosSemSku = [...new Set(
+      semSkuPai.map(r => String(r['Nome do Produto'] || '').trim()).filter(Boolean)
+    )].slice(0, 20);
+
+    const errorData = JSON.stringify({
+      code:     'MISSING_SKU_PRINCIPAL',
+      count:    semSkuPai.length,
+      produtos: produtosSemSku,
+    });
+
+    await prisma.import.update({
+      where: { id: imp.id },
+      data:  { status: 'error', errorMessage: errorData },
+    });
+
+    throw new Error(errorData);
+  }
+  // ═══ FIM DA VALIDAÇÃO ═════════════════════════════════════════════════════
+
+  await onProgress?.({ pct: 12, message: `${rows.length} linhas encontradas — processando em memória...` });
+
+  // ═══ FASE 3: Processar TODOS os pedidos em memória — ZERO queries ══════════
+  const ordersData     = [];
+  const newParentsMap  = new Map(); // skuPrincipal → { id, sku, name, listPrice, variants: Map<skuVar, varData> }
+  const newProductsMap = new Map(); // key → { id, ...fields } — produtos simples ou filhos de pai já existente
+  const toUpdateSkus   = new Map(); // productId → sku
+
+  // Infere o SKU pai a partir do SKU de variação: EZ0333-6 → EZ0333
+  function inferPai(skuVar) {
+    if (!skuVar) return null;
+    const m = skuVar.match(/^(.+)-\d+$/);
+    return m ? m[1] : null;
+  }
+
+  function findProduct(skuVar, skuPai) {
+    if (skuVar) return bySkuMap.get(skuVar.toLowerCase().trim()) ?? null;
+    if (skuPai) return bySkuMap.get(skuPai.toLowerCase().trim()) ?? null;
+    return null;
+  }
+
+  function findProductByName(productName, variationName) {
+    const hasVar = !!variationName && variationName !== '-' && variationName.trim() !== '';
+    if (hasVar) {
+      const p = byNameMap.get(`${productName} — ${variationName}`.toLowerCase().trim());
+      if (p) return p;
+    }
+    const pByName = byNameMap.get(productName.toLowerCase().trim());
+    if (pByName) return pByName;
+    const normKey = hasVar ? `${normStr(productName)} ${normStr(variationName)}` : normStr(productName);
+    return byNormNameMap.get(normKey) ?? (hasVar ? byNormNameMap.get(normStr(productName)) : null) ?? null;
+  }
 
   for (const row of rows) {
     try {
       const orderId = String(row['ID do pedido'] || '').trim();
       if (!orderId) continue;
 
-      const orderCategory  = classifyOrder(row);
+      const skuVar       = String(row['Número de referência SKU'] || '').trim() || null;
+      const skuPai       = String(row['Nº de referência do SKU principal'] || '').trim() || null;
+      const rawName      = String(row['Nome do Produto'] || '').trim();
+      const rawVar       = String(row['Nome da variação'] || '').trim() || null;
+      const { realName: productName, realVariation: varStr } = extractNameAndVariation(rawName, rawVar);
+      const variationName = varStr || null;
+
       const agreedPrice    = parseNum(row['Preço acordado']);
-      const quantity       = parseInt2(row['Quantidade']);
-      const globalTotal    = parseNum(row['Total global']);
+      const originalPrice  = parseNum(row['Preço original']);
+      const salePrice      = agreedPrice > 0 ? agreedPrice : originalPrice;
+      const quantity       = parseQty(row['Quantidade']);
       const shopeeComm     = parseNum(row['Taxa de comissão líquida']);
-      const shopeeService  = parseNum(row['Taxa de serviço líquida']);
+      const shopeeFee      = parseNum(row['Taxa de serviço líquida']);
       const sellerCoupon   = parseNum(row['Cupom do vendedor']);
       const sellerDiscount = parseNum(row['Desconto do vendedor']);
-      const originalPrice  = parseNum(row['Preço original']);
-      const productName    = String(row['Nome do Produto'] || '').trim();
-      const variationName  = String(row['Nome da variação'] || '').trim();
-      const skuRef         = String(row['Nº de referência do SKU principal'] || '').trim();
-      const cancelReason   = String(row['Cancelar Motivo'] || '').trim();
-      const returnStatus   = String(row['Status da Devolução / Reembolso'] || '').trim();
+      const lmmDiscount    = parseNum(row['Desconto da Leve Mais por Menos do vendedor']);
+      const globalTotal    = parseNum(row['Total global']);
+      const orderTotal     = parseNum(row['Valor Total']);
+      const trackingNumber = String(row['Número de rastreamento'] || '').trim() || null;
+      const shippingOption = String(row['Opção de envio'] || '').trim() || null;
+      const cancelReason   = String(row['Cancelar Motivo'] || '').trim() || null;
+      const returnStatus   = String(row['Status da Devolução / Reembolso'] || '').trim() || null;
+      const orderCreatedAt   = parseDate(row['Data de criação do pedido']);
+      const orderPaidAt      = parseDate(row['Hora do pagamento do pedido']);
+      const orderDeliveredAt = parseDate(row['Hora completa do pedido']);
+      const soldAt = orderPaidAt ?? orderCreatedAt ?? fallbackDate;
+      const orderCategory = classifyOrder(row);
+      const orderStatus   = String(row['Status do pedido'] || '').trim();
 
-      const soldAt = parseOrderDate(row['Hora do pagamento do pedido'])
-                  ?? parseOrderDate(row['Data de criação do pedido'])
-                  ?? fallbackDate;
+      // LOOKUP O(1) — sem query
+      let product = findProduct(skuVar, skuPai);
 
-      const product   = findProduct(skuRef, productName, variationName);
-      const salePrice = parseFloat((agreedPrice * quantity).toFixed(2));
+      // Sem SKU → fallback por nome (pedidos legados)
+      if (!product && !skuVar && !skuPai) {
+        product = findProductByName(productName, variationName);
+      }
 
-      const status = orderCategory === 'cancelled_unpaid' || orderCategory === 'cancelled_other'
-        ? 'cancelled'
-        : orderCategory === 'returned_full' ? 'returned' : 'paid';
+      // Registrar SKU para atualizar produtos encontrados sem SKU
+      if (product && skuVar && !product.sku) {
+        toUpdateSkus.set(product.id, skuVar);
+        product.sku = skuVar;
+        bySkuMap.set(skuVar.toLowerCase(), product);
+      }
+
+      // Calcular lucro
+      const calc = calcOrderProfit({
+        agreedPrice:   salePrice,
+        quantity,
+        sellerCoupon,
+        lmmDiscount,
+        costPrice:     product?.costPrice ?? 0,
+        packagingCost: product?.packaging ?? 0,
+        taxRate:       store.taxRate ?? 0,
+      });
 
       ordersData.push({
         storeId,
-        externalId:       orderId,
-        salePrice,
-        freight:          0,
-        discount:         sellerDiscount,
-        status,
-        soldAt,
-        profit:           0,
-        margin:           0,
-        importSource:     'orderall',
+        importId:        imp.id,
+        orderId,
+        orderStatus,
         orderCategory,
-        agreedPrice,
+        cancelReason,
+        returnStatus,
+        skuPrincipal:    skuPai || null,
+        skuVariacao:     skuVar || null,
+        productName:     productName || null,
+        variationName,
+        productId:       product?.id ?? null,
         originalPrice,
-        sellerDiscount,
-        sellerCoupon,
+        agreedPrice:     salePrice,
+        quantity,
         shopeeCommission: shopeeComm,
-        shopeeServiceFee: shopeeService,
+        shopeeServiceFee: shopeeFee,
+        sellerCoupon,
+        sellerDiscount,
+        lmmDiscount,
         globalTotal,
-        cancelReason:     cancelReason  || null,
-        returnStatus:     returnStatus  || null,
-        variationName:    variationName || null,
-        productNameRaw:   productName   || null,
-        productSku:       skuRef        || null,
-        snapshotCommission: store.commission,
-        snapshotServiceFee: store.serviceFee,
-        snapshotTaxRate:    store.taxRate,
-        snapshotFixedFee:   store.fixedFeePerItem || 0,
+        orderTotal,
+        trackingNumber,
+        shippingOption,
+        orderCreatedAt,
+        orderPaidAt,
+        orderDeliveredAt,
+        calcGmv:         calc.gmv,
+        calcShopeeFee:   calc.shopeeFee,
+        calcNetRevenue:  calc.netRevenue,
+        calcTax:         calc.taxAmount,
+        calcProductCost: calc.productCost,
+        calcPackaging:   calc.packaging,
+        calcGrossProfit: calc.grossProfit,
+        calcMargin:      calc.margin,
+        hasCost:         calc.hasCost,
+        status:          categoryToStatus(orderCategory),
+        soldAt,
+        salePrice:       calc.gmv,
+        profit:          calc.grossProfit,
+        margin:          calc.margin,
+        snapshotTaxRate: store.taxRate ?? 0,
       });
 
-      itemsIndex.push({ externalId: orderId, product: product || null, quantity, unitPrice: agreedPrice, skuRef: skuRef || null, productName, variationName });
+      // Marcar produtos órfãos para criar depois
+      if (!product) {
+        // effectiveSkuPai: usa o skuPai do arquivo quando é diferente do skuVar,
+        // senão tenta inferir pelo padrão EZ0333-6 → EZ0333
+        const effectiveSkuPai = (skuPai && skuPai !== skuVar)
+          ? skuPai
+          : inferPai(skuVar);
+
+        const isVariant = !!(skuVar && effectiveSkuPai && skuVar !== effectiveSkuPai);
+        const hasVar    = !!(variationName && variationName !== '-');
+        const preco     = salePrice;
+
+        if (isVariant) {
+          const existingParent = bySkuMap.get(effectiveSkuPai.toLowerCase().trim());
+
+          if (existingParent && !newParentsMap.has(effectiveSkuPai)) {
+            // Pai já existe no DB — adicionar variação como filho do pai existente
+            if (!newProductsMap.has(skuVar)) {
+              const pid   = randomUUID();
+              const pname = hasVar ? `${existingParent.name} — ${variationName}` : productName;
+              newProductsMap.set(skuVar, {
+                id: pid, sku: skuVar, name: pname, storeId,
+                listPrice: preco,
+                parentId: existingParent.id,
+                costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5,
+              });
+              bySkuMap.set(skuVar.toLowerCase(), { id: pid, sku: skuVar, name: pname, parentId: existingParent.id });
+            }
+          } else {
+            // Pai não existe no DB — criar pai + variação no newParentsMap
+            if (!newParentsMap.has(effectiveSkuPai)) {
+              const parentId = randomUUID();
+              newParentsMap.set(effectiveSkuPai, { id: parentId, sku: effectiveSkuPai, name: productName, listPrice: preco, storeId, variants: new Map() });
+              bySkuMap.set(effectiveSkuPai.toLowerCase(), { id: parentId, sku: effectiveSkuPai, name: productName, parentId: null });
+            }
+            const parentEntry = newParentsMap.get(effectiveSkuPai);
+            if (!parentEntry.variants.has(skuVar)) {
+              const varId   = randomUUID();
+              const varName = hasVar ? `${productName} — ${variationName}` : productName;
+              parentEntry.variants.set(skuVar, { id: varId, sku: skuVar, name: varName, listPrice: preco });
+              bySkuMap.set(skuVar.toLowerCase(), { id: varId, sku: skuVar, name: varName, parentId: parentEntry.id });
+            }
+          }
+        } else {
+          // Produto simples — sem padrão de variação detectável
+          const key = skuVar || `${productName}||${variationName || ''}`;
+          if (!newProductsMap.has(key)) {
+            const pid   = randomUUID();
+            newProductsMap.set(key, {
+              id: pid, sku: skuVar, name: productName, storeId,
+              listPrice: preco,
+              parentId:  null,
+              costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5,
+            });
+            bySkuMap.set((skuVar || key).toLowerCase(), { id: pid, sku: skuVar, name: productName, parentId: null });
+          }
+        }
+      }
     } catch (err) {
-      errors.push({ row: String(row['ID do pedido'] || '?'), erro: err.message });
+      // linha com erro: continua
     }
   }
 
-  // ── 5. BULK INSERT: createMany + skipDuplicates (1 roundtrip para novos) ──
-  // A constraint @@unique([storeId, externalId]) garante idempotência.
-  await onProgress?.({ step: 'Salvando no banco...', current: 0, total: ordersData.length });
+  // ═══ FASE 4: Criar produtos órfãos — 2-4 queries totais ═══════════════════
+  if (newParentsMap.size > 0 || newProductsMap.size > 0) {
+    await onProgress?.({ pct: 55, message: `Criando ${newParentsMap.size + newProductsMap.size} produtos novos...` });
 
-  // Inserir em batches de 1000 para não estourar o max_allowed_packet
-  for (const batch of chunkArr(ordersData, 1000)) {
+    // 4a. Pais novos (createMany — 1 INSERT)
+    if (newParentsMap.size > 0) {
+      const parentRows = [...newParentsMap.values()].map(({ id, sku, name, listPrice, storeId: sid }) => ({
+        id, sku, name, storeId: sid, listPrice, costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5,
+      }));
+      await prisma.product.createMany({ data: parentRows, skipDuplicates: true });
+
+      // 4b. Variações (1 INSERT)
+      const varRows = [];
+      for (const parent of newParentsMap.values()) {
+        for (const v of parent.variants.values()) {
+          varRows.push({ id: v.id, sku: v.sku, name: v.name, storeId, parentId: parent.id, listPrice: v.listPrice, costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5 });
+        }
+      }
+      if (varRows.length > 0) await prisma.product.createMany({ data: varRows, skipDuplicates: true });
+    }
+
+    // 4c. Produtos simples / filhos de pai existente (1 INSERT)
+    if (newProductsMap.size > 0) {
+      const simpleRows = [...newProductsMap.values()];
+      for (const batch of chunkArr(simpleRows, 500)) {
+        await prisma.product.createMany({ data: batch, skipDuplicates: true });
+      }
+    }
+
+  } else {
+    await onProgress?.({ pct: 55, message: 'Nenhum produto novo.' });
+  }
+
+  // ═══ FASE 5: Salvar pedidos — createMany em batches de 200 ════════════════
+  await onProgress?.({ pct: 60, message: `Salvando ${ordersData.length} pedidos...` });
+
+  for (const batch of chunkArr(ordersData, 200)) {
     await prisma.order.createMany({ data: batch, skipDuplicates: true });
   }
 
-  // ── 6. Atualizar registros com status/categoria que pode ter mudado ────────
-  // Busca apenas os externalIds que já existiam antes do createMany acima
-  const allExternalIds = ordersData.map((o) => o.externalId);
+  // 5b. Vincular pedidos órfãos aos produtos pelo SKU (roda APÓS createMany)
+  // Necessário para produtos criados neste mesmo import (não estavam no bySkuMap no início)
+  await prisma.$executeRaw`
+    UPDATE \`Order\` o
+    INNER JOIN Product p
+      ON p.storeId = o.storeId
+      AND p.sku IS NOT NULL
+      AND (p.sku = o.skuVariacao OR (o.skuVariacao IS NULL AND p.sku = o.skuPrincipal))
+    SET o.productId = p.id
+    WHERE o.importId = ${imp.id} AND o.productId IS NULL
+  `;
 
-  // Para arquivos grandes (30k+), busca em batches de 1000 IDs
-  const existingOrders = [];
-  for (const batch of chunkArr(allExternalIds, 1000)) {
-    const chunk = await prisma.order.findMany({
-      where:  { storeId, externalId: { in: batch } },
-      select: { id: true, externalId: true, status: true, orderCategory: true, returnStatus: true },
-    });
-    existingOrders.push(...chunk);
-  }
+  await onProgress?.({ pct: 78, message: 'Pedidos salvos.' });
 
-  const existingMap = new Map(existingOrders.map((o) => [o.externalId, o]));
-
-  // Identificar apenas os que tiveram mudança de status/categoria (normalmente 0)
-  const toUpdate = ordersData.filter((d) => {
-    const ex = existingMap.get(d.externalId);
-    if (!ex) return false;
-    return ex.status !== d.status
-        || ex.orderCategory !== d.orderCategory
-        || ex.returnStatus  !== (d.returnStatus ?? null);
-  });
-
-  // Atualizar em paralelo com concorrência limitada (respeita pool de 13 conexões)
-  for (const batch of chunkArr(toUpdate, 8)) {
-    await Promise.all(
-      batch.map((d) => {
-        const ex = existingMap.get(d.externalId);
-        return prisma.order.update({
-          where: { id: ex.id },
-          data: {
-            status:          d.status,
-            orderCategory:   d.orderCategory,
-            returnStatus:    d.returnStatus,
-            cancelReason:    d.cancelReason,
-            globalTotal:     d.globalTotal,
-            shopeeCommission: d.shopeeCommission,
-            shopeeServiceFee: d.shopeeServiceFee,
-            sellerCoupon:    d.sellerCoupon,
-          },
-        });
-      })
-    );
-  }
-
-  await onProgress?.({ step: 'Criando itens...', current: ordersData.length, total: ordersData.length });
-
-  // ── 7. Bulk insert de OrderItems ──────────────────────────────────────────
-  const itemsData = itemsIndex
-    .filter((x) => existingMap.has(x.externalId))
-    .map((x) => ({
-      orderId:           existingMap.get(x.externalId).id,
-      productId:         x.product?.id         ?? null,
-      quantity:          x.quantity,
-      unitPrice:         x.unitPrice,
-      snapshotCostPrice: x.product?.costPrice  ?? 0,
-      snapshotPackaging: x.product?.packaging  ?? 0,
-      snapshotSupplies:  x.product?.supplies   ?? 0,
-    }));
-
-  if (itemsData.length > 0) {
-    for (const batch of chunkArr(itemsData, 1000)) {
-      await prisma.orderItem.createMany({ data: batch, skipDuplicates: true });
+  // ═══ FASE 6: Atualizar SKUs e preços — SQL puro, zero loops ══════════════
+  // 6a. Atualizar SKU em produtos encontrados por nome que ainda não tinham
+  if (toUpdateSkus.size > 0) {
+    const entries = [...toUpdateSkus];
+    for (const batch of chunkArr(entries, 50)) {
+      await prisma.$transaction(
+        batch.map(([productId, sku]) => prisma.product.update({ where: { id: productId }, data: { sku } }))
+      );
     }
   }
 
-  const imported = existingOrders.length;
-  const skipped  = rows.length - ordersData.length;
+  // 6b. Atualizar listPrice: variações (preço mais recente de cada produto via SQL)
+  await prisma.$executeRaw`
+    UPDATE Product p
+    INNER JOIN (
+      SELECT productId, agreedPrice
+      FROM \`Order\`
+      WHERE importId = ${imp.id}
+        AND productId IS NOT NULL
+        AND agreedPrice > 0
+      ORDER BY COALESCE(orderPaidAt, orderCreatedAt, soldAt) DESC
+    ) latest ON latest.productId = p.id
+    SET p.listPrice = latest.agreedPrice
+    WHERE p.storeId = ${storeId} AND p.listPrice = 0
+  `;
 
-  // Órfãos: itens de pedidos pagos/válidos sem produto vinculado
-  const orphanSkus = new Set(
-    itemsIndex
-      .filter((x) => !x.product && x.skuRef && existingMap.has(x.externalId))
-      .map((x) => x.skuRef)
-  );
+  // 6c. Propagar listPrice do pai (herda preço da variação mais barata)
+  await prisma.$executeRaw`
+    UPDATE Product p
+    JOIN (
+      SELECT parentId, MIN(listPrice) AS minPrice
+      FROM Product
+      WHERE parentId IS NOT NULL AND listPrice > 0
+      GROUP BY parentId
+    ) v ON v.parentId = p.id
+    SET p.listPrice = v.minPrice
+    WHERE p.storeId = ${storeId} AND p.listPrice = 0
+  `;
+
+  await onProgress?.({ pct: 87, message: 'Consolidando totais do período...' });
+
+  // ═══ FASE 7: Consolidar totais e finalizar Import ════════════════════════
+  const faturados  = ordersData.filter((o) => ['valid', 'pending', 'returned_partial'].includes(o.orderCategory));
+  const comCusto   = faturados.filter((o) => o.hasCost);
+  const sum        = (arr, f) => arr.reduce((s, o) => s + (o[f] ?? 0), 0);
+
+  const gmv              = sum(faturados, 'calcGmv');
+  const shopeeDeductions = sum(faturados, 'calcShopeeFee') + sum(faturados, 'sellerCoupon') + sum(faturados, 'lmmDiscount');
+  const netRevenue       = sum(faturados, 'calcNetRevenue');
+  const grossProfit      = sum(comCusto,  'calcGrossProfit');
+  const validCount       = ordersData.filter((o) => o.orderCategory === 'valid').length;
+  const pendingCount     = ordersData.filter((o) => o.orderCategory === 'pending').length;
+  const cancelledCount   = ordersData.filter((o) => o.orderCategory.startsWith('cancelled')).length;
+  const retFullCount     = ordersData.filter((o) => o.orderCategory === 'returned_full').length;
+  const retPartCount     = ordersData.filter((o) => o.orderCategory === 'returned_partial').length;
+
+  await prisma.import.update({
+    where: { id: imp.id },
+    data: {
+      validCount, pendingCount, cancelledCount,
+      returnedFullCount: retFullCount, returnedPartialCount: retPartCount,
+      gmv:              parseFloat(gmv.toFixed(2)),
+      shopeeDeductions: parseFloat(shopeeDeductions.toFixed(2)),
+      netRevenue:       parseFloat(netRevenue.toFixed(2)),
+      grossProfit:      parseFloat(grossProfit.toFixed(2)),
+      status:           'done',
+    },
+  });
+
+  await onProgress?.({ pct: 92, message: 'Atualizando resumo financeiro...' });
+
+  // Atualizar ShopeePeriodSummary (compat dashboard)
+  const unitCount    = faturados.reduce((s, o) => s + o.quantity, 0);
+  const cancelledGmv = sum(ordersData.filter((o) => o.orderCategory.startsWith('cancelled')), 'calcGmv');
+  const tax          = sum(faturados, 'calcTax');
+  const margin       = gmv > 0 ? parseFloat(((grossProfit / gmv) * 100).toFixed(2)) : 0;
+
+  await prisma.shopeePeriodSummary.upsert({
+    where:  { storeId_month: { storeId, month: periodMonth } },
+    create: { storeId, month: periodMonth, gmv: parseFloat(gmv.toFixed(2)), shopeeDeductions: parseFloat(shopeeDeductions.toFixed(2)), netRevenue: parseFloat(netRevenue.toFixed(2)), tax: parseFloat(tax.toFixed(2)), grossProfit: parseFloat(grossProfit.toFixed(2)), margin, validCount, unitCount, cancelledCount, cancelledGmv: parseFloat(cancelledGmv.toFixed(2)) },
+    update: { gmv: parseFloat(gmv.toFixed(2)), shopeeDeductions: parseFloat(shopeeDeductions.toFixed(2)), netRevenue: parseFloat(netRevenue.toFixed(2)), tax: parseFloat(tax.toFixed(2)), grossProfit: parseFloat(grossProfit.toFixed(2)), margin, validCount, unitCount, cancelledCount, cancelledGmv: parseFloat(cancelledGmv.toFixed(2)) },
+  });
+
+  await onProgress?.({ pct: 100, message: 'Concluído!' });
 
   return {
-    imported,
-    skipped,
-    updated:      toUpdate.length,
-    totalRevenue: 0,
-    totalProfit:  0,
-    avgMargin:    0,
-    orphanCount:  orphanSkus.size,
-    errors:       errors.slice(0, 20),
-    source:       'orderall',
-    month:        monthKey,
+    imported:   ordersData.length,
+    valid:      validCount,
+    pending:    pendingCount,
+    cancelled:  cancelledCount,
+    skipped:    rows.length - ordersData.length,
+    newProducts: newParentsMap.size + newProductsMap.size,
+    periodMonth,
   };
 }
 

@@ -36,11 +36,12 @@ model Store {
   taxRate         Float     @default(5.0)
   fixedFeePerItem Float     @default(0)
   createdAt       DateTime  @default(now())
-  products             Product[]
-  orders               Order[]
-  bills                Bill[]
-  shopeeSummaries      ShopeePeriodSummary[]
-  productAliases       ProductAlias[]
+  products         Product[]
+  orders           Order[]
+  imports          Import[]
+  bills            Bill[]
+  shopeeSummaries  ShopeePeriodSummary[]
+  monthlyClosings  MonthlyClosing[]
 }
 
 model Product {
@@ -61,75 +62,101 @@ model Product {
   parent     Product?    @relation("Variants", fields: [parentId], references: [id], onDelete: SetNull)
   variants   Product[]   @relation("Variants")
   createdAt  DateTime    @default(now())
-  orderItems         OrderItem[]
+  orders             Order[]
   purchaseOrderItems PurchaseOrderItem[]
-  aliases            ProductAlias[]
 }
 
+// ── Controle de importações ──────────────────────────────────────────────────
+model Import {
+  id                   String   @id @default(uuid())
+  storeId              String
+  store                Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  filename             String
+  periodMonth          String   // "YYYY-MM"
+  importedAt           DateTime @default(now())
+  totalRows            Int      @default(0)
+  validCount           Int      @default(0)
+  pendingCount         Int      @default(0)
+  cancelledCount       Int      @default(0)
+  returnedFullCount    Int      @default(0)
+  returnedPartialCount Int      @default(0)
+  gmv                  Float    @default(0)
+  shopeeDeductions     Float    @default(0)
+  netRevenue           Float    @default(0)
+  grossProfit          Float    @default(0)
+  status               String   @default("processing") // processing|done|error
+  errorMessage         String?
+  jobId                String?
+  orders               Order[]
+}
+
+// ── Pedidos (1 linha = 1 linha do arquivo Shopee) ────────────────────────────
 model Order {
-  id         String      @id @default(uuid())
-  storeId    String
-  store      Store       @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  externalId String?
-  salePrice  Float
-  freight    Float       @default(0)
-  discount   Float       @default(0)
-  status     String
-  soldAt     DateTime
-  createdAt  DateTime    @default(now())
-  items      OrderItem[]
-  profit     Float?
-  margin     Float?
-  snapshotCommission  Float  @default(0)
-  snapshotServiceFee  Float  @default(0)
-  snapshotTaxRate     Float  @default(0)
-  snapshotFixedFee    Float  @default(0)
-  // Order_all import fields
-  importSource     String?
-  orderCategory    String?
-  agreedPrice      Float    @default(0)
-  originalPrice    Float    @default(0)
-  sellerDiscount   Float    @default(0)
-  sellerCoupon     Float    @default(0)
-  shopeeCommission Float    @default(0)
-  shopeeServiceFee Float    @default(0)
-  globalTotal      Float    @default(0)
-  cancelReason     String?  @db.Text
-  returnStatus     String?
-  variationName    String?
-  productNameRaw   String?  @db.Text
-  productSku       String?
-
-  @@unique([storeId, externalId])
-}
-
-model OrderItem {
   id        String   @id @default(uuid())
-  orderId   String
-  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId String?
-  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
-  quantity  Int
-  unitPrice Float
-  snapshotCostPrice Float @default(0)
-  snapshotPackaging Float @default(0)
-  snapshotSupplies  Float @default(0)
-  profit            Float @default(0)
-  shopeeCommission  Float @default(0)
-}
+  storeId   String
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  importId  String?
+  import    Import?  @relation(fields: [importId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
 
-model ProductAlias {
-  id         String   @id @default(uuid())
-  storeId    String
-  store      Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  rawSku     String
-  rawName    String?
-  productId  String
-  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  source     String   @default("manual")
-  createdAt  DateTime @default(now())
+  // ── Identidade do pedido ──────────────────────────────────────────────────
+  orderId       String   // "ID do pedido" Shopee
+  orderStatus   String   @default("")
+  orderCategory String   @default("valid")  // valid|pending|cancelled_unpaid|cancelled_other|returned_full|returned_partial
+  cancelReason  String?  @db.Text
+  returnStatus  String?
 
-  @@unique([storeId, rawSku])
+  // ── Identidade do produto ─────────────────────────────────────────────────
+  skuPrincipal  String?
+  skuVariacao   String?
+  productName   String?  @db.Text
+  variationName String?
+  productId     String?
+  product       Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  // ── Preços (do arquivo) ───────────────────────────────────────────────────
+  originalPrice Float    @default(0)
+  agreedPrice   Float    @default(0)
+  quantity      Int      @default(1)
+
+  // ── Custos Shopee (do arquivo — para referência, NÃO usado no cálculo) ───
+  shopeeCommission Float  @default(0)
+  shopeeServiceFee Float  @default(0)
+  sellerCoupon     Float  @default(0)
+  sellerDiscount   Float  @default(0)
+  lmmDiscount      Float  @default(0)
+
+  // ── Totais do arquivo ─────────────────────────────────────────────────────
+  globalTotal Float  @default(0)
+  orderTotal  Float  @default(0)
+
+  // ── Logística ─────────────────────────────────────────────────────────────
+  trackingNumber   String?
+  shippingOption   String?
+  orderCreatedAt   DateTime?
+  orderPaidAt      DateTime?
+  orderDeliveredAt DateTime?
+
+  // ── Campos calculados (salvos no banco, fonte única: calcOrderProfit) ─────
+  calcGmv         Float   @default(0)
+  calcShopeeFee   Float   @default(0)
+  calcNetRevenue  Float   @default(0)
+  calcTax         Float   @default(0)
+  calcProductCost Float   @default(0)
+  calcPackaging   Float   @default(0)
+  calcGrossProfit Float   @default(0)
+  calcMargin      Float   @default(0)
+  hasCost         Boolean @default(false)
+
+  // ── Compat com dashboard/cashflow existentes ──────────────────────────────
+  status    String   @default("paid")  // paid|cancelled|returned
+  soldAt    DateTime?
+  salePrice Float    @default(0)
+  profit    Float?
+  margin    Float?
+  snapshotTaxRate Float @default(0)
+
+  @@unique([storeId, orderId])
 }
 
 // ───────────────────────────────────────────
@@ -166,16 +193,16 @@ model Bill {
   amount      Float
   dueDate     DateTime
   paidAt      DateTime?
-  status      String    @default("pending") // pending, paid
-  category    String    @default("outros")  // embalagem, marketing, logistica, taxa, outros, compra
+  status      String    @default("pending")
+  category    String    @default("outros")
   recurring   Boolean   @default(false)
-  recurrence  String?   // monthly, weekly
+  recurrence  String?
   notes       String?
   createdAt   DateTime  @default(now())
 }
 
 // ───────────────────────────────────────────
-// PEDIDOS DE COMPRA (controle de reposição)
+// PEDIDOS DE COMPRA
 // ───────────────────────────────────────────
 model PurchaseOrder {
   id         String              @id @default(uuid())
@@ -183,7 +210,7 @@ model PurchaseOrder {
   user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   supplierId String?
   supplier   Supplier?           @relation(fields: [supplierId], references: [id])
-  status     String              @default("draft") // draft, ordered, received, cancelled
+  status     String              @default("draft")
   orderedAt  DateTime?
   expectedAt DateTime?
   receivedAt DateTime?
@@ -204,13 +231,13 @@ model PurchaseOrderItem {
 }
 
 // ───────────────────────────────────────────
-// NOVIDADES DO SISTEMA (admin)
+// NOVIDADES DO SISTEMA
 // ───────────────────────────────────────────
 model SystemNews {
   id          String     @id @default(uuid())
   title       String
   content     String     @db.Text
-  type        String     @default("feature") // feature, fix, announcement
+  type        String     @default("feature")
   createdBy   String
   publishedAt DateTime   @default(now())
   reads       NewsRead[]
@@ -233,7 +260,7 @@ model Goal {
   id        String   @id @default(uuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  month     String   // "2026-04"
+  month     String
   revenue   Float    @default(0)
   profit    Float    @default(0)
   orders    Int      @default(0)
@@ -245,11 +272,50 @@ model Goal {
 // ───────────────────────────────────────────
 // RESUMO FINANCEIRO SHOPEE POR PERÍODO
 // ───────────────────────────────────────────
+// ───────────────────────────────────────────
+// FECHAMENTOS MENSAIS
+// ───────────────────────────────────────────
+model MonthlyClosing {
+  id              String   @id @default(cuid())
+  storeId         String
+  store           Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  periodMonth     String   // "2026-05"
+  closedAt        DateTime @default(now())
+  closedBy        String   @default("")
+  status          String   @default("closed") // "open" | "closed"
+
+  totalOrders     Int      @default(0)
+  confirmedOrders Int      @default(0)
+  pendingOrders   Int      @default(0)
+  cancelledOrders Int      @default(0)
+  returnedOrders  Int      @default(0)
+  unitCount       Int      @default(0)
+
+  gmvTotal         Float   @default(0)
+  gmvConfirmed     Float   @default(0)
+  gmvPending       Float   @default(0)
+  shopeeDeductions Float   @default(0)
+  sellerDiscounts  Float   @default(0)
+  netRevenue       Float   @default(0)
+  taxAmount        Float   @default(0)
+  productCost      Float   @default(0)
+  packagingCost    Float   @default(0)
+  grossProfit      Float   @default(0)
+  avgMargin        Float   @default(0)
+
+  cancelledGmv  Float @default(0)
+  returnedValue Float @default(0)
+
+  productsSnapshot Json
+
+  @@unique([storeId, periodMonth])
+}
+
 model ShopeePeriodSummary {
   id                   String   @id @default(uuid())
   storeId              String
   store                Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  month                String   // "2026-04"
+  month                String
   gmv                  Float    @default(0)
   shopeeDeductions     Float    @default(0)
   netRevenue           Float    @default(0)

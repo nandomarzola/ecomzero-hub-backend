@@ -28,31 +28,27 @@ async function getInsights(req, res) {
 
   const [orders, products, recentItems] = await Promise.all([
     prisma.order.findMany({
-      where:  orderWhere,
+      where:  { ...orderWhere, productId: { not: null } },
       select: {
-        profit:  true,
-        soldAt:  true,
-        items: {
-          select: {
-            productId:  true,
-            quantity:   true,
-            unitPrice:  true,
-            product:    { select: { name: true } },
-          },
-        },
+        profit:          true,
+        soldAt:          true,
+        productId:       true,
+        quantity:        true,
+        calcGmv:         true,
+        calcGrossProfit: true,
+        product: { select: { name: true } },
       },
     }),
     prisma.product.findMany({
       where:  { storeId: { in: storeIds } },
       select: { id: true, name: true, stock: true, costPrice: true },
     }),
-    prisma.orderItem.findMany({
+    prisma.order.findMany({
       where: {
-        order: {
-          storeId: { in: storeIds },
-          status:  'paid',
-          soldAt:  { gte: new Date(Date.now() - 30 * 86400000) },
-        },
+        storeId: { in: storeIds },
+        status:  'paid',
+        productId: { not: null },
+        soldAt:  { gte: new Date(Date.now() - 30 * 86400000) },
       },
       select: { productId: true, quantity: true },
     }),
@@ -67,17 +63,11 @@ async function getInsights(req, res) {
   const prodNames   = {};
 
   for (const order of orders) {
-    const totalItemRev = order.items.reduce((s, i) => s + (i.unitPrice ?? 0) * i.quantity, 0);
-    for (const item of order.items) {
-      if (!item.productId) continue;
-      const share = totalItemRev > 0
-        ? (item.unitPrice ?? 0) * item.quantity / totalItemRev
-        : 1 / Math.max(1, order.items.length);
-      prodProfit[item.productId]  = (prodProfit[item.productId]  ?? 0) + (order.profit ?? 0) * share;
-      prodRevenue[item.productId] = (prodRevenue[item.productId] ?? 0) + (item.unitPrice ?? 0) * item.quantity;
-      prodQty[item.productId]     = (prodQty[item.productId]     ?? 0) + item.quantity;
-      if (item.product?.name) prodNames[item.productId] = item.product.name;
-    }
+    if (!order.productId) continue;
+    prodProfit[order.productId]  = (prodProfit[order.productId]  ?? 0) + (order.calcGrossProfit ?? 0);
+    prodRevenue[order.productId] = (prodRevenue[order.productId] ?? 0) + order.calcGmv;
+    prodQty[order.productId]     = (prodQty[order.productId]     ?? 0) + order.quantity;
+    if (order.product?.name) prodNames[order.productId] = order.product.name;
   }
 
   // 1. Most profitable product

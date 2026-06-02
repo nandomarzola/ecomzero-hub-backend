@@ -17,8 +17,8 @@ const cashflowRoutes      = require('./routes/cashflow');
 const adminPanelRoutes    = require('./routes/adminPanel');
 const goalsRoutes         = require('./routes/goals');
 const insightsRoutes      = require('./routes/insights');
-const productAliasRoutes  = require('./routes/productAliases');
-const { startWorker }             = require('./services/importQueue');
+const closingRoutes       = require('./routes/closing');
+
 const { startRecalculateWorker }  = require('./services/recalculateQueue');
 
 const app = express();
@@ -75,7 +75,7 @@ app.use('/api/cashflow',       cashflowRoutes);
 app.use('/api/admin',          adminPanelRoutes);
 app.use('/api/goals',           goalsRoutes);
 app.use('/api/insights',        insightsRoutes);
-app.use('/api/product-aliases', productAliasRoutes);
+app.use('/api/closing',         closingRoutes);
 
 // Tratamento de erros global
 app.use((err, req, res, next) => {
@@ -87,13 +87,10 @@ const PORT = process.env.PORT || 3333;
 app.listen(PORT, () => {
   console.log(`ProfitTrack API rodando na porta ${PORT}`);
 
+  // Import roda direto em background (sem BullMQ/Redis)
   if (process.env.ENABLE_WORKER === 'true') {
-    startWorker();
-    console.log('[import-worker] Worker de importação iniciado');
     startRecalculateWorker();
     console.log('[recalculate-worker] Worker de recálculo iniciado');
-  } else {
-    console.log('[workers] DESABILITADOS — defina ENABLE_WORKER=true para ativar');
   }
 });
 
