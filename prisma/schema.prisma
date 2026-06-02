@@ -53,7 +53,9 @@ model Product {
   id         String      @id @default(uuid())
   storeId    String
   store      Store       @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  externalId String?
+  externalId    String?   // ML: item_id do anúncio
+  mlListingType String?   // gold_pro | gold_special | free
+  mlFeeRate     Float?    // taxa de comissão real (%) cobrada pelo ML
   name       String
   sku        String?
   barcode    String?
@@ -136,6 +138,7 @@ model Order {
   orderTotal  Float  @default(0)
 
   // ── Logística ─────────────────────────────────────────────────────────────
+  listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
   trackingNumber   String?
   shippingOption   String?
   orderCreatedAt   DateTime?

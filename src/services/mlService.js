@@ -178,9 +178,10 @@ function convertMlOrder(mlOrder, storeId, importId, store) {
   const orderCategory = classifyMlOrder(mlOrder.status);
   const isRevenue     = ['valid', 'pending', 'returned_partial'].includes(orderCategory);
 
-  const sku       = item?.item?.seller_sku ?? null;
-  const itemId    = item?.item?.id ?? null;
-  const title     = item?.item?.title ?? '';
+  const sku         = item?.item?.seller_sku ?? null;
+  const itemId      = item?.item?.id ?? null;
+  const title       = item?.item?.title ?? '';
+  const listingType = item?.listing_type_id ?? item?.item?.listing_type_id ?? null;
 
   const createdAt   = mlOrder.date_created   ? new Date(mlOrder.date_created)   : null;
   const paidAt      = payment?.date_approved  ? new Date(payment.date_approved)  : null;
@@ -210,6 +211,7 @@ function convertMlOrder(mlOrder, storeId, importId, store) {
     lmmDiscount:      0,
     globalTotal:      r2(mlOrder.total_amount ?? 0),
     orderTotal:       r2(mlOrder.paid_amount ?? 0),
+    listingType:      listingType,
     trackingNumber:   String(shipping?.id ?? '') || null,
     shippingOption:   shipping?.shipping_mode ?? null,
     orderCreatedAt:   createdAt,
@@ -233,6 +235,90 @@ function convertMlOrder(mlOrder, storeId, importId, store) {
   };
 }
 
+// ── Buscar IDs de todos os anúncios ativos do seller ──────────────────────────
+async function fetchItemIds(accessToken, sellerId, status = 'active') {
+  const ids = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const params = new URLSearchParams({ seller_id: sellerId, status, offset: String(offset), limit: String(limit) });
+    const res = await mlGet(`/users/${sellerId}/items/search?${params}`, accessToken);
+    if (res.status !== 200) break;
+
+    const results = res.body.results ?? [];
+    ids.push(...results);
+
+    const paging = res.body.paging ?? {};
+    offset += limit;
+    if (offset >= (paging.total ?? 0) || results.length === 0) break;
+  }
+  return ids;
+}
+
+// ── Buscar detalhes de itens em lotes de 20 ────────────────────────────────────
+async function fetchItemDetails(accessToken, itemIds) {
+  const attrs = 'id,title,price,listing_type_id,seller_sku,available_quantity,thumbnail,permalink,variations,category_id,status';
+  const items = [];
+
+  for (let i = 0; i < itemIds.length; i += 20) {
+    const batch = itemIds.slice(i, i + 20);
+    const params = new URLSearchParams({ ids: batch.join(','), attributes: attrs });
+    const res = await mlGet(`/items?${params}`, accessToken);
+    if (res.status !== 200) continue;
+
+    const results = Array.isArray(res.body) ? res.body : [res.body];
+    for (const r of results) {
+      if (r.code === 200 || r.body) items.push(r.body ?? r);
+      else if (r.id) items.push(r);
+    }
+  }
+  return items;
+}
+
+// ── Buscar taxas reais por item ────────────────────────────────────────────────
+// Retorna { itemId: { saleFeeRate, listingFeeAmount, ... } }
+async function fetchItemFees(accessToken, itemIds) {
+  const feesMap = {};
+
+  for (let i = 0; i < itemIds.length; i += 20) {
+    const batch = itemIds.slice(i, i + 20);
+    const params = new URLSearchParams({ ids: batch.join(',') });
+    const res = await mlGet(`/items/fees?${params}`, accessToken);
+    if (res.status !== 200) continue;
+
+    const results = Array.isArray(res.body) ? res.body : [res.body];
+    for (const r of results) {
+      const id = r.id ?? r.item_id;
+      if (!id) continue;
+
+      // ML retorna sale_fee como percentual (ex: 11.0) ou valor fixo dependendo do endpoint
+      const saleFee   = r.sale_fee?.value ?? r.sale_fee_amount ?? 0;
+      const listFee   = r.listing_fee?.amount ?? r.listing_fee_amount ?? 0;
+      const freeShip  = r.free_shipping ?? false;
+
+      feesMap[id] = {
+        saleFeeRate:    typeof saleFee === 'number' && saleFee <= 100 ? saleFee : null,
+        listingFee:     listFee,
+        freeShipping:   freeShip,
+        raw:            r,
+      };
+    }
+  }
+  return feesMap;
+}
+
+// ── Label legível do tipo de anúncio ──────────────────────────────────────────
+function listingTypeLabel(id) {
+  const map = {
+    gold_pro:     { label: 'Premium',  feeRate: 16, color: 'yellow' },
+    gold_special: { label: 'Clássico', feeRate: 11, color: 'gray'   },
+    gold_premium: { label: 'Premium',  feeRate: 16, color: 'yellow' },
+    free:         { label: 'Grátis',   feeRate: 0,  color: 'green'  },
+  };
+  return map[(id ?? '').toLowerCase()] ?? { label: id ?? 'Desconhecido', feeRate: null, color: 'gray' };
+}
+
 module.exports = {
   getAuthUrl,
   exchangeCode,
@@ -241,4 +327,8 @@ module.exports = {
   fetchOrders,
   convertMlOrder,
   classifyMlOrder,
+  fetchItemIds,
+  fetchItemDetails,
+  fetchItemFees,
+  listingTypeLabel,
 };

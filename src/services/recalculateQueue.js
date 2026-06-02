@@ -46,7 +46,7 @@ async function doRecalculate(jobId, userId, all, months) {
     const orders = await prisma.order.findMany({
       where:   whereOrder,
       include: {
-        store:   { select: { taxRate: true } },
+        store:   { select: { taxRate: true, marketplace: true } },
         product: { select: { costPrice: true, packaging: true } },
       },
     });
@@ -83,6 +83,11 @@ async function doRecalculate(jobId, userId, all, months) {
       const summary  = getSummary(month, order.storeId);
       const taxRate  = order.store?.taxRate ?? 0;
 
+      const marketplace = order.store?.marketplace ?? 'shopee';
+      // ML: usa a taxa real gravada pela API (shopeeCommission = sale_fee do ML)
+      // Shopee: recalcula pelos tiers de preço
+      const precomputedFee = marketplace === 'mercadolivre' ? (order.shopeeCommission ?? null) : null;
+
       const calc = calcOrderProfit({
         agreedPrice:   order.agreedPrice,
         quantity:      order.quantity,
@@ -91,6 +96,9 @@ async function doRecalculate(jobId, userId, all, months) {
         costPrice:     order.product?.costPrice ?? 0,
         packagingCost: order.product?.packaging ?? 0,
         taxRate,
+        marketplace,
+        precomputedFee,
+        listingType:   order.listingType ?? null,
       });
 
       if (['valid', 'pending', 'returned_partial'].includes(category)) {

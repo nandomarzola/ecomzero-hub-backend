@@ -1,5 +1,5 @@
 const prisma = require('../lib/prisma');
-const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder } = require('../services/mlService');
+const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchItemFees } = require('../services/mlService');
 
 const FRONTEND_URL = process.env.ML_FRONTEND_URL || 'http://localhost:5173';
 
@@ -171,4 +171,81 @@ async function syncOrders(req, res) {
   }
 }
 
-module.exports = { getAuth, handleCallback, getStatus, disconnect, syncOrders };
+// POST /api/ml/sync-items — sincroniza anúncios ML → Products
+async function syncItems(req, res) {
+  const { storeId } = req.body;
+  if (!storeId) return res.status(400).json({ error: 'storeId obrigatório' });
+
+  const store = await prisma.store.findFirst({ where: { id: storeId, userId: req.userId } });
+  if (!store?.mlAccessToken) return res.status(400).json({ error: 'Loja não conectada ao Mercado Livre' });
+
+  let accessToken = store.mlAccessToken;
+
+  // Refresh se necessário
+  if (store.mlTokenExpiresAt && new Date(store.mlTokenExpiresAt) < new Date()) {
+    try {
+      const { refreshAccessToken } = require('../services/mlService');
+      const newT = await refreshAccessToken(store.mlRefreshToken);
+      accessToken = newT.access_token;
+      await prisma.store.update({ where: { id: storeId }, data: { mlAccessToken: newT.access_token, mlRefreshToken: newT.refresh_token ?? store.mlRefreshToken, mlTokenExpiresAt: new Date(Date.now() + newT.expires_in * 1000) } });
+    } catch { return res.status(401).json({ error: 'Token expirado — reconecte o ML' }); }
+  }
+
+  try {
+    // 1. Buscar todos os IDs de anúncios ativos
+    const itemIds = await fetchItemIds(accessToken, store.mlSellerId, 'active');
+    if (!itemIds.length) return res.json({ synced: 0, message: 'Nenhum anúncio ativo encontrado' });
+
+    // 2. Detalhes em lotes de 20
+    const items = await fetchItemDetails(accessToken, itemIds);
+
+    // 3. Taxas reais por item
+    const feesMap = await fetchItemFees(accessToken, itemIds);
+
+    let synced = 0;
+    let created = 0;
+    let updated = 0;
+
+    for (const item of items) {
+      if (!item?.id) continue;
+
+      const fees        = feesMap[item.id] ?? {};
+      const listingType = item.listing_type_id ?? null;
+      const feeRate     = fees.saleFeeRate ?? null;
+      const sku         = item.seller_sku ?? null;
+
+      const data = {
+        storeId,
+        externalId:    item.id,
+        mlListingType: listingType,
+        mlFeeRate:     feeRate,
+        name:          item.title ?? 'Sem título',
+        sku:           sku,
+        listPrice:     item.price ?? 0,
+        stock:         item.available_quantity ?? 0,
+      };
+
+      // Upsert por externalId (ML item_id)
+      const existing = await prisma.product.findFirst({ where: { storeId, externalId: item.id } });
+
+      if (existing) {
+        await prisma.product.update({
+          where: { id: existing.id },
+          data: { mlListingType: data.mlListingType, mlFeeRate: data.mlFeeRate, listPrice: data.listPrice, stock: data.stock, name: data.name, sku: data.sku ?? existing.sku },
+        });
+        updated++;
+      } else {
+        await prisma.product.create({ data: { ...data, costPrice: 0, packaging: 0, supplies: 0, minStock: 5 } });
+        created++;
+      }
+      synced++;
+    }
+
+    return res.json({ synced, created, updated, total: itemIds.length });
+  } catch (err) {
+    console.error('[ML] sync-items erro:', err.message);
+    return res.status(500).json({ error: 'Erro ao sincronizar anúncios: ' + err.message });
+  }
+}
+
+module.exports = { getAuth, handleCallback, getStatus, disconnect, syncOrders, syncItems };

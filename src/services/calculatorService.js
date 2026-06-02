@@ -1,4 +1,6 @@
-// ── Tabela oficial Shopee 2026 ─────────────────────────────────────────────
+function r2(n) { return Math.round(n * 100) / 100; }
+
+// ── Taxas Shopee 2026 (tiers por preço unitário) ──────────────────────────────
 function calcShopeeFeePorUnidade(agreedPrice) {
   if (agreedPrice < 80)  return (agreedPrice * 0.20) + 4.00;
   if (agreedPrice < 100) return (agreedPrice * 0.14) + 16.00;
@@ -6,13 +8,39 @@ function calcShopeeFeePorUnidade(agreedPrice) {
   return                        (agreedPrice * 0.14) + 26.00;
 }
 
-function r2(n) { return Math.round(n * 100) / 100; }
+// ── Taxas Mercado Livre 2026 ───────────────────────────────────────────────────
+// listingType: 'gold_pro' = Premium (16%), 'gold_special' = Clássico (11%), 'free' = Grátis (0%)
+function calcMLFeePorUnidade(price, listingType = 'gold_special') {
+  const type = (listingType ?? 'gold_special').toLowerCase();
+  if (type === 'gold_pro')  return r2(price * 0.16);
+  if (type === 'free')      return 0;
+  // Clássico (gold_special / padrão): 11%
+  return r2(price * 0.11);
+}
+
+// ── Rates compat (usado no simulador de produtos) ─────────────────────────────
+function getMarketplaceRates(marketplace, unitPrice, listingType) {
+  const mp = (marketplace ?? '').toLowerCase();
+  if (mp === 'shopee') {
+    if (unitPrice < 80)  return { commissionPct: 20, fixedFee: 4.00 };
+    if (unitPrice < 100) return { commissionPct: 14, fixedFee: 16.00 };
+    if (unitPrice < 200) return { commissionPct: 14, fixedFee: 20.00 };
+    return                      { commissionPct: 14, fixedFee: 26.00 };
+  }
+  if (mp === 'mercadolivre') {
+    const type = (listingType ?? 'gold_special').toLowerCase();
+    const pct  = type === 'gold_pro' ? 16 : type === 'free' ? 0 : 11;
+    return { commissionPct: pct, fixedFee: 0 };
+  }
+  return { commissionPct: 0, fixedFee: 0 };
+}
+
+// Alias para compatibilidade
+function getShopeeRates(unitPrice) { return getMarketplaceRates('shopee', unitPrice); }
 
 // ── Fonte única de verdade para cálculo de lucro por pedido ──────────────────
-// Validação:
-//   agreedPrice=38.99, qty=97, costPrice=21.47, packaging=0.15, taxRate=5.2
-//   gmv=3782.03, shopeeFee=1144.51, netRevenue=2637.52
-//   tax=196.67, productCost=2082.59, packaging=14.55, grossProfit=343.71, margin=9.09%
+// marketplace: identifica a plataforma — determina como calcular a taxa
+// precomputedFee: quando fornecido (ex: sale_fee da API ML), usa direto sem recalcular
 function calcOrderProfit({
   agreedPrice,
   quantity,
@@ -20,28 +48,41 @@ function calcOrderProfit({
   lmmDiscount    = 0,
   costPrice      = 0,
   packagingCost  = 0,
-  taxRate        = 0,     // % (ex: 5.2)
+  taxRate        = 0,
+  marketplace    = 'shopee',
+  precomputedFee = null,   // taxa já calculada pela API (pedidos ML via sync)
+  listingType    = null,
 }) {
-  const gmv          = r2(agreedPrice * quantity);
-  const shopeeFee    = r2(calcShopeeFeePorUnidade(agreedPrice) * quantity);
-  const extraFees    = r2(sellerCoupon + lmmDiscount);
-  const netRevenue   = r2(gmv - shopeeFee - extraFees);
-  const taxAmount    = r2(gmv * (taxRate / 100));
-  const productCost  = r2(costPrice * quantity);
-  const packaging    = r2(packagingCost * quantity);
-  const grossProfit  = r2(netRevenue - taxAmount - productCost - packaging);
-  const margin       = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
-  const hasCost      = costPrice > 0;
+  const gmv = r2(agreedPrice * quantity);
 
-  return { gmv, shopeeFee, extraFees, netRevenue, taxAmount, productCost, packaging, grossProfit, margin, hasCost };
-}
+  // Taxa: se veio da API (ML sync) usa diretamente; senão calcula pelo marketplace
+  let marketplaceFee;
+  if (precomputedFee !== null && precomputedFee >= 0) {
+    marketplaceFee = r2(precomputedFee);
+  } else {
+    const mp = (marketplace ?? 'shopee').toLowerCase();
+    if (mp === 'shopee') {
+      marketplaceFee = r2(calcShopeeFeePorUnidade(agreedPrice) * quantity);
+    } else if (mp === 'mercadolivre') {
+      marketplaceFee = r2(calcMLFeePorUnidade(agreedPrice, listingType) * quantity);
+    } else {
+      marketplaceFee = 0;
+    }
+  }
 
-// ── Compat com código legado (dashboard, cashflow, etc.) ─────────────────────
-function getShopeeRates(unitPrice) {
-  if (unitPrice < 80)  return { commissionPct: 20, fixedFee: 4.00 };
-  if (unitPrice < 100) return { commissionPct: 14, fixedFee: 16.00 };
-  if (unitPrice < 200) return { commissionPct: 14, fixedFee: 20.00 };
-  return                      { commissionPct: 14, fixedFee: 26.00 };
+  const extraFees   = r2(sellerCoupon + lmmDiscount);
+  const netRevenue  = r2(gmv - marketplaceFee - extraFees);
+  const taxAmount   = r2(gmv * (taxRate / 100));
+  const productCost = r2(costPrice * quantity);
+  const packaging   = r2(packagingCost * quantity);
+  const grossProfit = r2(netRevenue - taxAmount - productCost - packaging);
+  const margin      = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
+  const hasCost     = costPrice > 0;
+
+  return {
+    gmv, shopeeFee: marketplaceFee, marketplaceFee, extraFees,
+    netRevenue, taxAmount, productCost, packaging, grossProfit, margin, hasCost,
+  };
 }
 
 function calcProfit(salePrice, quantity, product, store, freight = 0, discount = 0) {
@@ -86,4 +127,4 @@ function calcProfit(salePrice, quantity, product, store, freight = 0, discount =
   };
 }
 
-module.exports = { calcProfit, calcOrderProfit, getShopeeRates, calcShopeeFeePorUnidade };
+module.exports = { calcProfit, calcOrderProfit, getShopeeRates, getMarketplaceRates, calcShopeeFeePorUnidade, calcMLFeePorUnidade };
