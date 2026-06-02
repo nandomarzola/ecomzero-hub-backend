@@ -37,22 +37,14 @@ async function getSummary(req, res) {
     prisma.order.findMany({
       where:  orderWhere,
       select: {
-        salePrice:          true,
-        freight:            true,
-        discount:           true,
-        soldAt:             true,
-        snapshotCommission: true,
-        snapshotServiceFee: true,
-        snapshotTaxRate:    true,
-        snapshotFixedFee:   true,
-        items: {
-          select: {
-            quantity:         true,
-            snapshotCostPrice:true,
-            snapshotPackaging:true,
-            snapshotSupplies: true,
-          },
-        },
+        calcGmv:         true,
+        calcShopeeFee:   true,
+        calcNetRevenue:  true,
+        calcTax:         true,
+        calcProductCost: true,
+        calcPackaging:   true,
+        calcGrossProfit: true,
+        soldAt:          true,
       },
     }),
     prisma.bill.findMany({ where: billWhere }),
@@ -62,53 +54,32 @@ async function getSummary(req, res) {
   let totalRevenue    = 0;
   let totalCmv        = 0;
   let totalPackaging  = 0;
-  let totalSupplies   = 0;
-  let totalFreight    = 0;
   let totalCommission = 0;
-  let totalServiceFee = 0;
-  let totalFixedFee   = 0;
   let totalTaxProv    = 0;
 
   const monthlyMap = {};
 
   for (const o of orders) {
-    const effective = (o.salePrice ?? 0) - (o.discount ?? 0);
-    totalRevenue    += effective;
-    totalCommission += effective * ((o.snapshotCommission ?? 0) / 100);
-    totalServiceFee += effective * ((o.snapshotServiceFee ?? 0) / 100);
-    totalTaxProv    += effective * ((o.snapshotTaxRate    ?? 0) / 100);
-    totalFreight    += o.freight ?? 0;
+    totalRevenue    += o.calcGmv;
+    totalCommission += o.calcShopeeFee;
+    totalTaxProv    += o.calcTax;
+    totalCmv        += o.calcProductCost;
+    totalPackaging  += o.calcPackaging;
 
-    const key = o.soldAt.toISOString().substring(0, 7);
+    const key = o.soldAt ? o.soldAt.toISOString().substring(0, 7) : 'unknown';
     if (!monthlyMap[key]) {
       monthlyMap[key] = { month: key, revenue: 0, cmv: 0, fees: 0, operational: 0, bills: 0, taxProvision: 0 };
     }
     const m = monthlyMap[key];
-    m.revenue    += effective;
-    m.fees       += effective * (((o.snapshotCommission ?? 0) + (o.snapshotServiceFee ?? 0)) / 100);
-    m.taxProvision += effective * ((o.snapshotTaxRate ?? 0) / 100);
-    m.operational  += o.freight ?? 0;
-
-    for (const item of o.items) {
-      const qty  = item.quantity ?? 0;
-      const cost = (item.snapshotCostPrice ?? 0) * qty;
-      const pack = (item.snapshotPackaging  ?? 0) * qty;
-      const supp = (item.snapshotSupplies   ?? 0) * qty;
-      const fixd = (o.snapshotFixedFee      ?? 0) * qty;
-
-      totalCmv       += cost;
-      totalPackaging += pack;
-      totalSupplies  += supp;
-      totalFixedFee  += fixd;
-
-      m.cmv         += cost;
-      m.operational += pack + supp;
-      m.fees        += fixd;
-    }
+    m.revenue     += o.calcGmv;
+    m.fees        += o.calcShopeeFee;
+    m.taxProvision += o.calcTax;
+    m.cmv         += o.calcProductCost;
+    m.operational += o.calcPackaging;
   }
 
-  const totalMarketplaceFees   = totalCommission + totalServiceFee + totalFixedFee;
-  const totalOperationalCosts  = totalPackaging  + totalSupplies   + totalFreight;
+  const totalMarketplaceFees  = totalCommission;
+  const totalOperationalCosts = totalPackaging;
 
   // Bills
   const enrichedBills  = bills.map((b) => ({ ...b, computedStatus: computeBillStatus(b) }));
@@ -126,6 +97,9 @@ async function getSummary(req, res) {
   const grossProfit      = totalRevenue - totalCmv;
   const operatingProfit  = grossProfit - totalMarketplaceFees - totalOperationalCosts - totalPaid;
   const netProfit        = operatingProfit - totalTaxProv;
+  // Projeção incluindo contas pendentes do período
+  const operatingProfitProjected = operatingProfit - totalPending;
+  const netProfitProjected       = operatingProfitProjected - totalTaxProv;
 
   // Bills into monthly map
   for (const b of enrichedBills) {
@@ -169,19 +143,23 @@ async function getSummary(req, res) {
       marketplaceFees: r(totalMarketplaceFees),
       marketplaceFeesBreakdown: {
         commission: r(totalCommission),
-        serviceFee: r(totalServiceFee),
-        fixedFee:   r(totalFixedFee),
+        serviceFee: 0,
+        fixedFee:   0,
       },
       operationalCosts: r(totalOperationalCosts),
       operationalCostsBreakdown: {
         packaging: r(totalPackaging),
-        supplies:  r(totalSupplies),
-        freight:   r(totalFreight),
+        supplies:  0,
+        freight:   0,
       },
-      billsPaid:       r(totalPaid),
-      operatingProfit: r(operatingProfit),
-      taxProvision:    r(totalTaxProv),
-      netProfit:       r(netProfit),
+      billsPaid:                  r(totalPaid),
+      billsPending:               r(totalPending),
+      billsOverdue:               r(totalOverdue),
+      operatingProfit:            r(operatingProfit),
+      operatingProfitProjected:   r(operatingProfitProjected),
+      taxProvision:               r(totalTaxProv),
+      netProfit:                  r(netProfit),
+      netProfitProjected:         r(netProfitProjected),
     },
     bills: {
       totalPaid:    r(totalPaid),

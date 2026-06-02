@@ -76,11 +76,18 @@ async function getSummary(req, res) {
       where:  { storeId: { in: storeIds }, status: 'paid', soldAt: { gte: sixMonthsAgo } },
       select: { salePrice: true, profit: true, margin: true, soldAt: true },
     }),
-    prisma.orderItem.findMany({
-      where: { order: orderWhere },
-      include: {
-        product: { select: { id: true, name: true, costPrice: true, packaging: true, supplies: true } },
-        order:   { select: { profit: true, margin: true, salePrice: true, freight: true, discount: true } },
+    prisma.order.findMany({
+      where:   { ...orderWhere, productId: { not: null } },
+      select: {
+        productId:       true,
+        quantity:        true,
+        calcGmv:         true,
+        calcGrossProfit: true,
+        calcProductCost: true,
+        calcShopeeFee:   true,
+        profit:          true,
+        margin:          true,
+        product: { select: { id: true, name: true, costPrice: true, packaging: true } },
       },
     }),
     storeIds.length === 1
@@ -138,39 +145,33 @@ async function getSummary(req, res) {
 
   // ── Top / worst products + costs breakdown ─────────────────────────────────
   const productMap = {};
-  const costsAcc   = { commission: 0, serviceFee: 0, tax: 0, cogs: 0, packaging: 0, freight: 0 };
+  const costsAcc   = { commission: 0, tax: 0, cogs: 0, packaging: 0 };
 
-  for (const item of itemsRaw) {
-    const pid = item.product?.id;
+  for (const o of itemsRaw) {
+    const pid = o.product?.id ?? o.productId;
     if (!pid) continue;
     if (!productMap[pid]) {
-      productMap[pid] = { productId: pid, name: item.product.name, profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0 };
+      productMap[pid] = { productId: pid, name: o.product?.name ?? '', profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0 };
     }
-    const effectivePrice = item.order.salePrice - (item.order.discount ?? 0);
-    productMap[pid].profit   += item.order.profit ?? 0;
-    productMap[pid].margin   += item.order.margin ?? 0;
-    productMap[pid].quantity += item.quantity;
-    productMap[pid].revenue  += item.order.salePrice;
-    productMap[pid].cogs     += item.product.costPrice * item.quantity;
+    productMap[pid].profit   += o.calcGrossProfit ?? 0;
+    productMap[pid].margin   += o.margin          ?? 0;
+    productMap[pid].quantity += o.quantity;
+    productMap[pid].revenue  += o.calcGmv;
+    productMap[pid].cogs     += o.calcProductCost;
     productMap[pid].count++;
 
-    if (singleStore) {
-      costsAcc.commission += effectivePrice * (singleStore.commission / 100);
-      costsAcc.serviceFee += effectivePrice * (singleStore.serviceFee / 100);
-      costsAcc.tax        += effectivePrice * (singleStore.taxRate    / 100);
-    }
-    costsAcc.cogs      += item.product.costPrice * item.quantity;
-    costsAcc.packaging += (item.product.packaging + item.product.supplies) * item.quantity;
-    costsAcc.freight   += item.order.freight ?? 0;
+    costsAcc.commission += o.calcShopeeFee;
+    costsAcc.cogs       += o.calcProductCost;
+    costsAcc.packaging  += o.product ? (o.product.packaging ?? 0) * o.quantity : 0;
   }
 
   const costsBreakdown = {
     commission: parseFloat(costsAcc.commission.toFixed(2)),
-    serviceFee: parseFloat(costsAcc.serviceFee.toFixed(2)),
+    serviceFee: 0,
     tax:        parseFloat(costsAcc.tax.toFixed(2)),
     cogs:       parseFloat(costsAcc.cogs.toFixed(2)),
     packaging:  parseFloat(costsAcc.packaging.toFixed(2)),
-    freight:    parseFloat(costsAcc.freight.toFixed(2)),
+    freight:    0,
   };
 
   const productList = Object.values(productMap).map((p) => ({
@@ -263,19 +264,19 @@ async function getAlerts(req, res) {
 
   const negOrders = await prisma.order.findMany({
     where: { storeId: { in: storeIds }, status: 'paid', profit: { lt: 0 }, soldAt: { gte: since } },
-    include: { items: { include: { product: { select: { name: true } } } } },
+    include: { product: { select: { name: true } } },
     orderBy: { profit: 'asc' },
     take: 20,
   });
 
   for (const o of negOrders) {
-    const productNames = o.items.map((i) => i.product?.name ?? '—').join(', ');
+    const productName = o.product?.name ?? o.productName ?? '—';
     alerts.push({
       type:     'negative_margin',
       severity: o.profit < -50 ? 'high' : 'medium',
       orderId:  o.id,
-      message:  `Pedido ${o.externalId || o.id} com margem negativa: R$ ${o.profit.toFixed(2)}`,
-      products: productNames,
+      message:  `Pedido ${o.orderId || o.id} com margem negativa: R$ ${(o.profit ?? 0).toFixed(2)}`,
+      products: productName,
       soldAt:   o.soldAt,
     });
   }
@@ -326,37 +327,39 @@ async function getMonthlyReport(req, res) {
   const totalProfit  = orders.reduce((s, o) => s + (o.profit ?? 0), 0);
   const avgMargin    = totalOrders ? orders.reduce((s, o) => s + (o.margin ?? 0), 0) / totalOrders : 0;
 
-  const itemsRaw = await prisma.orderItem.findMany({
-    where: { order: orderWhere },
-    include: {
-      product: { select: { id: true, name: true, costPrice: true, packaging: true, supplies: true } },
-      order:   { select: { profit: true, margin: true, salePrice: true, freight: true, discount: true } },
+  const ordersWithProducts = await prisma.order.findMany({
+    where:  { ...orderWhere, productId: { not: null } },
+    select: {
+      productId:       true,
+      quantity:        true,
+      calcGmv:         true,
+      calcGrossProfit: true,
+      calcProductCost: true,
+      calcShopeeFee:   true,
+      profit:          true,
+      margin:          true,
+      product: { select: { id: true, name: true, packaging: true } },
     },
   });
 
   const productMap = {};
-  const costsAcc   = { commission: 0, serviceFee: 0, tax: 0, cogs: 0, packaging: 0, freight: 0 };
+  const costsAcc   = { commission: 0, cogs: 0, packaging: 0 };
 
-  for (const item of itemsRaw) {
-    const pid = item.product?.id;
-    if (!pid) continue;
+  for (const o of ordersWithProducts) {
+    const pid = o.productId;
     if (!productMap[pid]) {
-      productMap[pid] = { productId: pid, name: item.product.name, profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0 };
+      productMap[pid] = { productId: pid, name: o.product?.name ?? '', profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0 };
     }
-    const effectivePrice = item.order.salePrice - (item.order.discount ?? 0);
-    productMap[pid].profit   += item.order.profit ?? 0;
-    productMap[pid].margin   += item.order.margin ?? 0;
-    productMap[pid].quantity += item.quantity;
-    productMap[pid].revenue  += item.order.salePrice;
-    productMap[pid].cogs     += item.product.costPrice * item.quantity;
+    productMap[pid].profit   += o.calcGrossProfit ?? 0;
+    productMap[pid].margin   += o.margin ?? 0;
+    productMap[pid].quantity += o.quantity;
+    productMap[pid].revenue  += o.calcGmv;
+    productMap[pid].cogs     += o.calcProductCost;
     productMap[pid].count++;
 
-    costsAcc.commission += effectivePrice * (store.commission / 100);
-    costsAcc.serviceFee += effectivePrice * (store.serviceFee / 100);
-    costsAcc.tax        += effectivePrice * (store.taxRate    / 100);
-    costsAcc.cogs       += item.product.costPrice * item.quantity;
-    costsAcc.packaging  += (item.product.packaging + item.product.supplies) * item.quantity;
-    costsAcc.freight    += item.order.freight ?? 0;
+    costsAcc.commission += o.calcShopeeFee;
+    costsAcc.cogs       += o.calcProductCost;
+    costsAcc.packaging  += (o.product?.packaging ?? 0) * o.quantity;
   }
 
   const topProducts = Object.values(productMap)
@@ -371,11 +374,11 @@ async function getMonthlyReport(req, res) {
 
   const costsBreakdown = {
     commission: parseFloat(costsAcc.commission.toFixed(2)),
-    serviceFee: parseFloat(costsAcc.serviceFee.toFixed(2)),
-    tax:        parseFloat(costsAcc.tax.toFixed(2)),
+    serviceFee: 0,
+    tax:        0,
     cogs:       parseFloat(costsAcc.cogs.toFixed(2)),
     packaging:  parseFloat(costsAcc.packaging.toFixed(2)),
-    freight:    parseFloat(costsAcc.freight.toFixed(2)),
+    freight:    0,
   };
 
   const summary = {
@@ -555,8 +558,7 @@ async function getShopeeLosses(req, res) {
 
   const dateFilter = buildDateFilter(startDate, endDate);
   const where = {
-    storeId:      { in: storeIds },
-    importSource: 'orderall',
+    storeId: { in: storeIds },
     ...(dateFilter ? { soldAt: dateFilter } : {}),
   };
 
@@ -571,8 +573,8 @@ async function getShopeeLosses(req, res) {
       agreedPrice:   true,
       returnStatus:  true,
       globalTotal:   true,
-      productNameRaw: true,
-      variationName:  true,
+      productName:   true,
+      variationName: true,
     },
   });
 
@@ -605,7 +607,7 @@ async function getShopeeLosses(req, res) {
   );
   const outOfStockCount   = outOfStock.length;
   const outOfStockRate    = cancelledCount > 0 ? parseFloat(((outOfStockCount / cancelledCount) * 100).toFixed(1)) : 0;
-  const outOfStockProducts = [...new Set(outOfStock.map((o) => o.productNameRaw).filter(Boolean))].slice(0, 10);
+  const outOfStockProducts = [...new Set(outOfStock.map((o) => o.productName).filter(Boolean))].slice(0, 10);
 
   // ── Devoluções ─────────────────────────────────────────────────────────────
   const returnedFull    = byCategory.returned_full;

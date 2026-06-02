@@ -1,347 +1,447 @@
-const fs     = require('fs');
-const prisma  = require('../lib/prisma');
-const { calcProfit } = require('../services/calculatorService');
-const { Job }        = require('bullmq');
-const { importQueue }       = require('../services/importQueue');
-const { recalculateQueue }  = require('../services/recalculateQueue');
-const connection = require('../lib/redisConnection');
+const fs    = require('fs');
+const prisma = require('../lib/prisma');
+const { recalculateQueue, recalcProgress } = require('../services/recalculateQueue');
+const { importShopeeOrderAll } = require('../services/importOrderAll');
 
-// POST /api/orders/import — enfileira job, responde 202 + jobId imediatamente
+function r2(n) { return Math.round(n * 100) / 100; }
+
+// Progress em memória — sem Redis, sem BullMQ
+// importId → { pct, message }
+const importProgress = new Map();
+
+// POST /api/orders/import — dispara import em background, responde imediatamente
 async function importOrders(req, res) {
   if (!req.file) return res.status(400).json({ error: 'Arquivo .xlsx obrigatório' });
-
   const { storeId } = req.body;
   if (!storeId) {
     try { fs.unlinkSync(req.file.path); } catch {}
     return res.status(400).json({ error: 'storeId obrigatório' });
   }
 
-  const job = await importQueue.add('import', {
-    filePath: req.file.path,
-    filename: req.file.originalname,
-    storeId,
-    userId:   req.userId,
+  // Criar Import record imediatamente para ter o ID
+  const imp = await prisma.import.create({
+    data: { storeId, filename: req.file.originalname, periodMonth: '0000-00', totalRows: 0, status: 'processing' },
   });
 
-  return res.status(202).json({ jobId: job.id });
-}
+  importProgress.set(imp.id, { pct: 2, message: 'Iniciando...' });
 
-// GET /api/orders/import/:jobId — retorna status do job via BullMQ/Redis
-async function importStatus(req, res) {
-  const job = await Job.fromId(importQueue, req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
-  if (job.data.userId !== req.userId) return res.status(403).json({ error: 'Acesso negado' });
-
-  const state = await job.getState(); // waiting | active | completed | failed | delayed
-
-  const statusMap = { waiting: 'pending', active: 'processing', completed: 'done', failed: 'error', delayed: 'pending' };
-
-  return res.json({
-    jobId:    job.id,
-    status:   statusMap[state] ?? state,
-    progress: job.progress ?? { step: 'aguardando', current: 0, total: 0 },
-    result:   state === 'completed' ? job.returnvalue : null,
-    error:    state === 'failed'    ? job.failedReason : null,
-  });
-}
-
-// GET /api/orders
-async function listOrders(req, res) {
-  const { storeId, startDate, endDate, status, orderCategory, page = 1, limit = 20, grouped } = req.query;
-
-  // baseWhere — sem filtro de status/categoria (usado para contagem das abas)
-  const baseWhere = { store: { userId: req.userId } };
-  if (storeId) baseWhere.storeId = storeId;
-  if (startDate || endDate) {
-    baseWhere.soldAt = {};
-    if (startDate) baseWhere.soldAt.gte = new Date(startDate);
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setUTCHours(23, 59, 59, 999);
-      baseWhere.soldAt.lte = end;
+  // Disparar em background — sem await
+  setImmediate(async () => {
+    try {
+      await importShopeeOrderAll(
+        req.file.path,
+        storeId,
+        req.userId,
+        req.file.originalname,
+        (progress) => importProgress.set(imp.id, progress),
+        imp.id,
+      );
+    } catch (err) {
+      console.error('[import] erro:', err.message);
+      await prisma.import.update({
+        where: { id: imp.id },
+        data: { status: 'error', errorMessage: err.message },
+      }).catch(() => {});
+    } finally {
+      importProgress.delete(imp.id);
+      try { fs.unlinkSync(req.file.path); } catch {}
     }
-  }
+  });
 
-  // where — inclui filtros de status/categoria para a listagem paginada
-  const where = { ...baseWhere };
-  if (status)        where.status        = status;
-  if (orderCategory) where.orderCategory = orderCategory;
+  return res.status(202).json({ jobId: imp.id });
+}
 
-  // ── Modo agrupado: agrega por item (correto para pedidos multi-produto) ────
-  if (grouped === 'true') {
-    const groupWhere = { ...where, importSource: 'orderall' };
+// GET /api/orders/import/:jobId — lê do Import record + progress em memória
+async function importStatus(req, res) {
+  const importId = req.params.jobId;
+  const imp = await prisma.import.findUnique({ where: { id: importId } }).catch(() => null);
+  if (!imp) return res.status(404).json({ error: 'Import não encontrado' });
 
-    const orders = await prisma.order.findMany({
-      where: groupWhere,
-      select: {
-        id:             true,
-        productNameRaw: true,
-        variationName:  true,
-        productSku:     true,
-        items: {
-          select: {
-            productId:        true,
-            unitPrice:        true,
-            quantity:         true,
-            profit:           true,
-            shopeeCommission: true,
-            snapshotCostPrice: true,
-            product: { select: { id: true, name: true } },
-          },
-        },
+  const progress = importProgress.get(importId);
+
+  if (imp.status === 'done') {
+    return res.json({
+      jobId:  importId,
+      status: 'done',
+      pct:    100,
+      message: 'Concluído!',
+      result: {
+        imported:    (imp.validCount ?? 0) + (imp.pendingCount ?? 0),
+        valid:       imp.validCount ?? 0,
+        pending:     imp.pendingCount ?? 0,
+        cancelled:   imp.cancelledCount ?? 0,
+        skipped:     0,
+        periodMonth: imp.periodMonth,
       },
     });
+  }
 
-    // Agrega por produto × preço unitário (cada item vai para o grupo do seu produto)
-    const groupMap = new Map();
-    for (const order of orders) {
-      for (const item of order.items) {
-        const groupKey = item.productId
-          ? `${item.productId}::${item.unitPrice}`
-          : `${order.productNameRaw ?? ''}::${order.variationName ?? ''}::${item.unitPrice}`;
+  if (imp.status === 'error') {
+    return res.json({ jobId: importId, status: 'error', error: imp.errorMessage ?? 'Erro na importação' });
+  }
 
-        if (!groupMap.has(groupKey)) {
-          groupMap.set(groupKey, {
-            productName:   item.product?.name ?? order.productNameRaw ?? '(sem nome)',
-            variationName: order.variationName ?? null,
-            agreedPrice:   item.unitPrice,
-            productId:     item.productId ?? null,
-            productSku:    order.productSku ?? null,
-            rawName:       order.productNameRaw ?? null,
-            orderIds:      new Set(),
-            totalQty:      0,
-            totalGMV:      0,
-            totalShopee:   0,
-            totalProfit:   0,
-            allHaveCost:   true,
-          });
-        }
-        const g = groupMap.get(groupKey);
-        g.orderIds.add(order.id);
-        g.totalQty    += item.quantity;
-        g.totalGMV    += item.quantity * item.unitPrice;
-        g.totalShopee += item.shopeeCommission;
-        g.totalProfit += item.profit;
-        if (item.snapshotCostPrice === 0) g.allHaveCost = false;
-      }
+  if (imp.status === 'cancelled') {
+    return res.json({ jobId: importId, status: 'error', error: 'Importação cancelada' });
+  }
+
+  // processing
+  return res.json({
+    jobId:   importId,
+    status:  'processing',
+    pct:     progress?.pct    ?? 5,
+    message: progress?.message ?? 'Processando...',
+  });
+}
+
+// GET /api/orders/closing?storeId=&month= — dados agregados para Fechamento Mensal
+async function getClosing(req, res) {
+  const { storeId, month } = req.query;
+  if (!month) return res.status(400).json({ error: 'month obrigatório (YYYY-MM)' });
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+  if (!storeIds.length) return res.json({ summary: null, groups: [], orphanCount: 0, month });
+
+  const [y, mo] = month.split('-').map(Number);
+  const start = new Date(Date.UTC(y, mo - 1, 1));
+  const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
+
+  const revenueOrders = await prisma.order.findMany({
+    where: {
+      storeId:       { in: storeIds },
+      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+      soldAt:        { gte: start, lte: end },
+    },
+    include: { product: { select: { id: true, name: true, sku: true } } },
+  });
+
+  let gmv = 0, shopeeFee = 0, netRevenue = 0, tax = 0, productCost = 0, packaging = 0, grossProfit = 0;
+  let validCount = 0, pendingCount = 0, unitCount = 0;
+  let validGmv = 0, pendingGmv = 0;
+
+  const groupMap = new Map();
+
+  for (const o of revenueOrders) {
+    gmv         += o.calcGmv;
+    shopeeFee   += o.calcShopeeFee;
+    netRevenue  += o.calcNetRevenue;
+    tax         += o.calcTax;
+    productCost += o.calcProductCost;
+    packaging   += o.calcPackaging;
+    grossProfit += o.calcGrossProfit;
+    unitCount   += o.quantity;
+    if (o.orderCategory === 'valid') { validCount++; validGmv += o.calcGmv; }
+    else if (o.orderCategory === 'pending') { pendingCount++; pendingGmv += o.calcGmv; }
+
+    const groupKey = o.productId
+      ? `pid:${o.productId}`
+      : `sku:${o.skuVariacao || o.skuPrincipal || o.productName || o.orderId}`;
+
+    if (!groupMap.has(groupKey)) {
+      groupMap.set(groupKey, {
+        productId:    o.productId,
+        productName:  o.product?.name ?? o.productName ?? '(sem nome)',
+        sku:          o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
+        variationName: o.variationName ?? null,
+        hasCost:      true,
+        orderCount:   0,
+        qty:          0,
+        gmv:          0,
+        shopeeFee:    0,
+        netRevenue:   0,
+        productCost:  0,
+        packaging:    0,
+        grossProfit:  0,
+      });
     }
 
-    const items = [...groupMap.values()]
-      .map((g) => {
-        const totalGMV    = parseFloat(g.totalGMV.toFixed(2));
-        const totalShopee = parseFloat(g.totalShopee.toFixed(2));
-        const totalProfit = parseFloat(g.totalProfit.toFixed(2));
-        const avgMargin   = totalGMV > 0 ? parseFloat((totalProfit / totalGMV * 100).toFixed(1)) : 0;
-        return {
-          productName:   g.productName,
-          variationName: g.variationName,
-          agreedPrice:   g.agreedPrice,
-          productId:     g.productId,
-          productSku:    g.productSku,
-          rawName:       g.rawName,
-          orderIds:      [...g.orderIds],
-          orderCount:    g.orderIds.size,
-          totalQty:      g.totalQty,
-          totalGMV,
-          totalShopee,
-          totalNetRev:   parseFloat((totalGMV - totalShopee).toFixed(2)),
-          totalProfit,
-          avgMargin,
-          hasCost:       g.allHaveCost,
-        };
-      })
-      .sort((a, b) => b.totalGMV - a.totalGMV);
+    const g = groupMap.get(groupKey);
+    g.orderCount  += 1;
+    g.qty         += o.quantity;
+    g.gmv         += o.calcGmv;
+    g.shopeeFee   += o.calcShopeeFee;
+    g.netRevenue  += o.calcNetRevenue;
+    g.productCost += o.calcProductCost;
+    g.packaging   += o.calcPackaging;
+    g.grossProfit += o.calcGrossProfit;
+    if (!o.hasCost) g.hasCost = false;
+  }
 
-    return res.json({ grouped: true, total: items.length, items });
+  const summary = gmv > 0
+    ? {
+        gmv:          r2(gmv),
+        shopeeFee:    r2(shopeeFee),
+        netRevenue:   r2(netRevenue),
+        tax:          r2(tax),
+        productCost:  r2(productCost),
+        packaging:    r2(packaging),
+        grossProfit:  r2(grossProfit),
+        margin:       r2((grossProfit / gmv) * 100),
+        validCount,
+        pendingCount,
+        validGmv:     r2(validGmv),
+        pendingGmv:   r2(pendingGmv),
+        unitCount,
+      }
+    : null;
+
+  const groups = [...groupMap.values()]
+    .map((g) => ({
+      productId:    g.productId,
+      productName:  g.productName,
+      sku:          g.sku,
+      variationName: g.variationName,
+      hasCost:      g.hasCost,
+      orderCount:   g.orderCount,
+      qty:          g.qty,
+      gmv:          r2(g.gmv),
+      shopeeFee:    r2(g.shopeeFee),
+      netRevenue:   r2(g.netRevenue),
+      productCost:  r2(g.productCost),
+      packaging:    r2(g.packaging),
+      grossProfit:  r2(g.grossProfit),
+      margin:       g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
+    }))
+    .sort((a, b) => b.gmv - a.gmv);
+
+  const orphanCount = groups.filter((g) => !g.hasCost).length;
+
+  return res.json({ summary, groups, orphanCount, month });
+}
+
+// GET /api/orders — lista paginada com contagem por aba
+async function listOrders(req, res) {
+  const { storeId, month, orderCategory, status, search, page = 1, limit = 30 } = req.query;
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+
+  const baseWhere = { storeId: { in: storeIds } };
+
+  if (month) {
+    const [y, mo] = month.split('-').map(Number);
+    baseWhere.soldAt = {
+      gte: new Date(Date.UTC(y, mo - 1, 1)),
+      lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+    };
+  }
+
+  const where = { ...baseWhere };
+  if (orderCategory === 'cancelled') {
+    where.status = 'cancelled';
+  } else if (orderCategory === 'returned') {
+    where.status = 'returned';
+  } else if (orderCategory) {
+    where.orderCategory = orderCategory;
+  }
+  if (status) where.status = status;
+
+  if (search && search.trim()) {
+    const q = search.trim();
+    where.OR = [
+      { orderId:      { contains: q } },
+      { productName:  { contains: q } },
+      { skuVariacao:  { contains: q } },
+      { skuPrincipal: { contains: q } },
+      { product:      { name: { contains: q } } },
+      { product:      { sku:  { contains: q } } },
+    ];
   }
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const take = parseInt(limit);
 
-  const [orders, total, agg, tabGroups] = await Promise.all([
+  const [orders, total, tabGroups, agg, aggCancelled] = await Promise.all([
     prisma.order.findMany({
       where,
-      include: { items: { orderBy: { quantity: 'desc' }, include: { product: { select: { name: true, sku: true } } } } },
+      include: { product: { select: { name: true, sku: true } } },
       orderBy: { soldAt: 'desc' },
       skip,
       take,
     }),
     prisma.order.count({ where }),
-    prisma.order.aggregate({
-      where,
-      _sum: {
-        salePrice: true, profit: true,
-        shopeeCommission: true, shopeeServiceFee: true, sellerCoupon: true,
-        globalTotal: true,
-      },
-    }),
     prisma.order.groupBy({
-      by: ['status', 'orderCategory'],
+      by:    ['orderCategory', 'status'],
       where: baseWhere,
+      _count: { _all: true },
+    }),
+    // Totais financeiros de pedidos com receita (valid + pending + returned_partial)
+    prisma.order.aggregate({
+      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      _sum:  { calcGmv: true, calcShopeeFee: true, calcNetRevenue: true, calcGrossProfit: true, calcTax: true, quantity: true },
+      _count: { _all: true },
+    }),
+    // Totais de cancelados
+    prisma.order.aggregate({
+      where: { ...baseWhere, status: 'cancelled' },
+      _sum:  { calcGmv: true },
       _count: { _all: true },
     }),
   ]);
 
-  const tabCounts = { all: 0, paid: 0, cancelled: 0, returned: 0, unpaid: 0, returnedFull: 0, returnedPartial: 0 };
+  const tabCounts = { all: 0, valid: 0, cancelled: 0, returned: 0, pending: 0 };
   for (const g of tabGroups) {
     tabCounts.all += g._count._all;
-    if (g.status === 'paid')      tabCounts.paid      += g._count._all;
-    if (g.status === 'cancelled') tabCounts.cancelled += g._count._all;
-    if (g.status === 'returned')  tabCounts.returned  += g._count._all;
-    if (g.orderCategory === 'cancelled_unpaid') tabCounts.unpaid         += g._count._all;
-    if (g.orderCategory === 'returned_full')    tabCounts.returnedFull   += g._count._all;
-    if (g.orderCategory === 'returned_partial') tabCounts.returnedPartial += g._count._all;
+    if (g.orderCategory === 'valid')   tabCounts.valid     += g._count._all;
+    if (g.status === 'cancelled')      tabCounts.cancelled += g._count._all;
+    if (g.status === 'returned')       tabCounts.returned  += g._count._all;
+    if (g.orderCategory === 'pending') tabCounts.pending   += g._count._all;
   }
 
-  const s = agg._sum;
-  const totalRevenue          = parseFloat((s.salePrice ?? 0).toFixed(2));
-  const totalShopeeDeductions = parseFloat(((s.shopeeCommission ?? 0) + (s.shopeeServiceFee ?? 0)).toFixed(2));
-  // Receita líquida = GMV - taxas Shopee (nunca usa globalTotal do Excel que inclui subsídios Shopee)
-  const totalNetRevenue       = parseFloat((totalRevenue - totalShopeeDeductions).toFixed(2));
+  const r2 = (n) => Math.round((n ?? 0) * 100) / 100;
+  const gmv        = r2(agg._sum.calcGmv);
+  const shopeeFee  = r2(agg._sum.calcShopeeFee);
+  const netRevenue = r2(agg._sum.calcNetRevenue);
+  const grossProfit= r2(agg._sum.calcGrossProfit);
+  const summary = {
+    gmv,
+    shopeeFee,
+    netRevenue,
+    grossProfit,
+    margin:       gmv > 0 ? r2((grossProfit / gmv) * 100) : 0,
+    units:        agg._sum.quantity ?? 0,
+    cancelledGmv: r2(aggCancelled._sum.calcGmv),
+    cancelledCount: aggCancelled._count._all,
+  };
 
-  return res.json({
-    orders,
-    total,
-    page:                parseInt(page),
-    limit:               take,
-    totalRevenue,
-    totalProfit:         parseFloat((s.profit ?? 0).toFixed(2)),
-    totalShopeeDeductions,
-    totalNetRevenue,
-    tabCounts,
-  });
+  return res.json({ orders, total, page: parseInt(page), limit: take, tabCounts, summary });
 }
 
-// GET /api/orders/:id
+// GET /api/orders/:id — detalhe de um pedido
 async function getOrder(req, res) {
   const order = await prisma.order.findFirst({
-    where: { id: req.params.id, store: { userId: req.userId } },
+    where:   { id: req.params.id, store: { userId: req.userId } },
     include: {
-      store: { select: { name: true, marketplace: true, commission: true, serviceFee: true, taxRate: true, fixedFeePerItem: true } },
-      items: { include: { product: true } },
+      store:   { select: { name: true, marketplace: true, taxRate: true } },
+      product: true,
     },
   });
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
-
-  const breakdowns = order.items.map((item) =>
-    calcProfit(item.unitPrice * item.quantity, item.quantity, item.product, order.store, 0, 0)
-  );
-
-  return res.json({ order, breakdowns });
+  return res.json({ order });
 }
 
-// DELETE /api/orders/:id — soft delete, reverte estoque
+// DELETE /api/orders/:id — marca como cancelado
 async function deleteOrder(req, res) {
   const order = await prisma.order.findFirst({
     where: { id: req.params.id, store: { userId: req.userId } },
-    include: { items: true },
   });
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
   if (order.status === 'cancelled') return res.status(400).json({ error: 'Pedido já cancelado' });
 
-  await prisma.$transaction(async (tx) => {
-    await tx.order.update({ where: { id: order.id }, data: { status: 'cancelled' } });
-
-    if (order.status === 'paid') {
-      for (const item of order.items) {
-        await tx.product.update({
-          where: { id: item.productId },
-          data:  { stock: { increment: item.quantity } },
-        });
-      }
-    }
+  await prisma.order.update({
+    where: { id: order.id },
+    data:  { status: 'cancelled', orderCategory: 'cancelled_other' },
   });
-
-  return res.json({ message: 'Pedido cancelado e estoque revertido' });
+  return res.json({ message: 'Pedido cancelado' });
 }
 
-// POST /api/orders/recalculate — enfileira job de recálculo, retorna jobId imediatamente
+// POST /api/orders/recalculate — enfileira job de recálculo
 async function recalculateOrders(req, res) {
   const body = req.body ?? {};
-
-  const job = await recalculateQueue.add('recalculate', {
+  const job  = await recalculateQueue.add('recalculate', {
     userId: req.userId,
     all:    body.all    ?? false,
     months: body.months ?? null,
   });
-
   return res.status(202).json({ jobId: job.id });
 }
 
-// GET /api/orders/recalculate/:jobId — polling de progresso do job
+// GET /api/orders/recalculate/:jobId — polling do job de recálculo
 async function recalculateStatus(req, res) {
-  const job = await Job.fromId(recalculateQueue, req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job não encontrado' });
-  if (job.data.userId !== req.userId) return res.status(403).json({ error: 'Acesso negado' });
-
-  const state     = await job.getState();
-  const statusMap = { waiting: 'pending', active: 'active', completed: 'completed', failed: 'failed', delayed: 'pending' };
-  const progress  = job.progress ?? { pct: 0, message: 'Aguardando...' };
+  const jobId = req.params.jobId;
+  const prog  = recalcProgress.get(jobId);
+  if (!prog) return res.status(404).json({ error: 'Job nao encontrado' });
 
   return res.json({
-    jobId:   job.id,
-    status:  statusMap[state] ?? state,
-    pct:     typeof progress === 'object' ? (progress.pct ?? 0)      : progress,
-    message: typeof progress === 'object' ? (progress.message ?? '')  : '',
-    result:  state === 'completed' ? job.returnvalue : null,
-    error:   state === 'failed'    ? job.failedReason : null,
+    jobId,
+    status:  prog.status  ?? 'active',
+    pct:     prog.pct     ?? 0,
+    message: prog.message ?? '',
+    result:  prog.result  ?? null,
+    error:   prog.error   ?? null,
   });
 }
 
-// GET /api/orders/export — retorna CSV com todos os pedidos do período (sem paginação)
+// GET /api/orders/export — CSV
 async function exportOrders(req, res) {
-  const { storeId, startDate, endDate, status, orderCategory } = req.query;
+  const { storeId, month, orderCategory, status } = req.query;
 
-  const where = { store: { userId: req.userId } };
-  if (storeId)       where.storeId       = storeId;
-  if (status)        where.status        = status;
-  if (orderCategory) where.orderCategory = orderCategory;
-  if (startDate || endDate) {
-    where.soldAt = {};
-    if (startDate) where.soldAt.gte = new Date(startDate);
-    if (endDate) {
-      const end = new Date(endDate);
-      end.setUTCHours(23, 59, 59, 999);
-      where.soldAt.lte = end;
-    }
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+
+  const where = { storeId: { in: storeIds } };
+  if (month) {
+    const [y, mo] = month.split('-').map(Number);
+    where.soldAt = {
+      gte: new Date(Date.UTC(y, mo - 1, 1)),
+      lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+    };
   }
+  if (orderCategory === 'cancelled') {
+    where.status = 'cancelled';
+  } else if (orderCategory === 'returned') {
+    where.status = 'returned';
+  } else if (orderCategory) {
+    where.orderCategory = orderCategory;
+  }
+  if (status) where.status = status;
 
   const orders = await prisma.order.findMany({
     where,
-    include: { items: { include: { product: { select: { name: true, sku: true } } } } },
+    include: { product: { select: { name: true, sku: true } } },
     orderBy: { soldAt: 'desc' },
   });
 
-  const header = ['Data', 'ID Externo', 'Produto', 'SKU', 'Qtd', 'Faturado', 'Lucro', 'Margem (%)', 'Status'];
+  const header = ['Data', 'Nº Pedido', 'SKU', 'Produto', 'Qtd', 'Preço Acordado', 'GMV', 'Taxa Shopee', 'Lucro Bruto', 'Margem (%)', 'Categoria'];
+
+  const catLabel = {
+    valid: 'Faturado', pending: 'Pendente',
+    cancelled_unpaid: 'Cancelado (Não pago)', cancelled_other: 'Cancelado',
+    returned_full: 'Devolvido (total)', returned_partial: 'Devolvido (parcial)',
+  };
 
   const rows = orders.map((o) => {
-    const date    = new Date(o.soldAt).toLocaleDateString('pt-BR');
-    const extId   = o.externalId ?? '';
-    const name    = o.items?.[0]?.product?.name ?? '';
-    const sku     = o.items?.[0]?.product?.sku  ?? '';
-    const qty     = o.items?.reduce((s, it) => s + it.quantity, 0) ?? 0;
-    const revenue = Number(o.salePrice ?? 0).toFixed(2).replace('.', ',');
-    const profit  = Number(o.profit   ?? 0).toFixed(2).replace('.', ',');
-    const margin  = Number(o.margin   ?? 0).toFixed(1).replace('.', ',');
-    const statusLabel = { paid: 'Pago', cancelled: 'Cancelado', returned: 'Devolvido' }[o.status] ?? o.status;
-    return [date, extId, name, sku, qty, revenue, profit, margin, statusLabel]
-      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-      .join(';');
+    const date = o.soldAt ? new Date(o.soldAt).toLocaleDateString('pt-BR') : '';
+    const sku  = o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '';
+    const name = o.product?.name ?? o.productName ?? '';
+    return [
+      date, o.orderId, sku, name, o.quantity,
+      o.agreedPrice.toFixed(2).replace('.', ','),
+      o.calcGmv.toFixed(2).replace('.', ','),
+      o.calcShopeeFee.toFixed(2).replace('.', ','),
+      o.calcGrossProfit.toFixed(2).replace('.', ','),
+      o.calcMargin.toFixed(1).replace('.', ','),
+      catLabel[o.orderCategory] ?? o.orderCategory,
+    ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(';');
   });
 
   const csv = [header.join(';'), ...rows].join('\r\n');
-
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="pedidos.csv"');
-  res.send('﻿' + csv); // BOM para Excel reconhecer UTF-8
+  res.send('﻿' + csv);
 }
 
-// GET /api/orders/sku-report — performance por produto no período
+// GET /api/orders/sku-report — performance e inteligência de estoque por produto
 async function skuReport(req, res) {
   const { storeId, startDate, endDate } = req.query;
 
-  const where = { store: { userId: req.userId }, status: { not: 'cancelled' } };
-  if (storeId) where.storeId = storeId;
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const storeIds = stores.map((s) => s.id);
+  if (!storeIds.length) return res.json({ products: [], totals: { qty: 0, revenue: 0, profit: 0 } });
+
+  const where = {
+    storeId:       { in: storeIds },
+    orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+    productId:     { not: null },
+  };
   if (startDate || endDate) {
     where.soldAt = {};
     if (startDate) where.soldAt.gte = new Date(startDate);
@@ -352,129 +452,92 @@ async function skuReport(req, res) {
     }
   }
 
-  // Pre-fetch all store configs needed (avoid N+1 on current-month orders)
-  const storeCache = new Map();
-  const getStore = async (storeId) => {
-    if (!storeCache.has(storeId)) {
-      storeCache.set(storeId, await prisma.store.findUnique({ where: { id: storeId } }));
-    }
-    return storeCache.get(storeId);
-  };
-
-  const orders = await prisma.order.findMany({
-    where,
-    include: {
-      store: true,
-      items: { include: { product: { select: { id: true, name: true, sku: true, costPrice: true, packaging: true, supplies: true } } } },
-    },
-  });
-
-  // Agrega por produto usando cálculo por item.
-  // Regra de custo: snapshot se não-zero, senão custo atual do produto (fix para pedidos
-  // importados antes dos custos serem cadastrados).
-  const map = new Map();
-
-  for (const order of orders) {
-    const isCurrentMonth = (() => {
-      const now = new Date();
-      const d   = new Date(order.soldAt);
-      return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
-    })();
-
-    const storeConfig = isCurrentMonth
-      ? await getStore(order.storeId)
-      : {
-          marketplace:     order.store.marketplace,
-          commission:      order.snapshotCommission || order.store.commission,
-          serviceFee:      order.snapshotServiceFee || order.store.serviceFee,
-          taxRate:         order.snapshotTaxRate    || order.store.taxRate,
-          fixedFeePerItem: order.snapshotFixedFee   || order.store.fixedFeePerItem,
-        };
-
-    for (const item of order.items) {
-      // Fallback: se snapshot zerado (importado antes do custo ser cadastrado), usa custo atual
-      const costPrice = isCurrentMonth ? (item.product?.costPrice ?? 0) : (item.snapshotCostPrice || item.product?.costPrice || 0);
-      const packaging = isCurrentMonth ? (item.product?.packaging ?? 0) : (item.snapshotPackaging || item.product?.packaging || 0);
-      const supplies  = isCurrentMonth ? (item.product?.supplies  ?? 0) : (item.snapshotSupplies  || item.product?.supplies  || 0);
-      const productConfig = { costPrice, packaging, supplies };
-
-      const revenue = item.unitPrice * item.quantity;
-      const calc    = calcProfit(revenue, item.quantity, productConfig, storeConfig, 0, 0);
-
-      if (!item.product) continue;
-      const pid = item.product.id;
-      if (!map.has(pid)) {
-        map.set(pid, {
-          productId:    pid,
-          name:         item.product.name,
-          sku:          item.product.sku ?? '',
-          totalQty:     0,
-          totalRevenue: 0,
-          totalProfit:  0,
-          orderCount:   0,
-        });
-      }
-
-      const row = map.get(pid);
-      row.totalQty     += item.quantity;
-      row.totalRevenue += revenue;
-      row.totalProfit  += calc.profit;
-      row.orderCount   += 1;
-    }
-  }
-
-  // Enriquece com dados de estoque e vendas dos últimos 30 dias
-  const productIds = Array.from(map.keys()).filter(Boolean);
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-  const [productsStock, items30] = await Promise.all([
-    prisma.product.findMany({
-      where:  { id: { in: productIds } },
-      select: { id: true, stock: true, minStock: true },
+  const [orders, productsStock, orders30, lastPurchases] = await Promise.all([
+    prisma.order.findMany({
+      where,
+      select: {
+        productId:       true,
+        quantity:        true,
+        calcGmv:         true,
+        calcGrossProfit: true,
+      },
     }),
-    prisma.orderItem.findMany({
+    prisma.product.findMany({
+      where:  { storeId: { in: storeIds } },
+      select: { id: true, name: true, sku: true, stock: true, minStock: true },
+    }),
+    prisma.order.findMany({
       where: {
-        productId: { in: productIds },
-        order: { status: { not: 'cancelled' }, soldAt: { gte: thirtyDaysAgo } },
+        storeId:       { in: storeIds },
+        productId:     { not: null },
+        orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+        soldAt:        { gte: thirtyDaysAgo },
       },
       select: { productId: true, quantity: true },
     }),
+    prisma.purchaseOrderItem.findMany({
+      where:   { purchaseOrder: { userId: req.userId, status: 'received' } },
+      select:  { productId: true, purchaseOrder: { select: { receivedAt: true } } },
+      orderBy: { purchaseOrder: { receivedAt: 'desc' } },
+    }),
   ]);
 
-  const stockByPid  = Object.fromEntries(productsStock.map((p) => [p.id, p]));
-  const sales30ByPid = {};
-  for (const it of items30) {
-    sales30ByPid[it.productId] = (sales30ByPid[it.productId] ?? 0) + it.quantity;
+  const map = new Map();
+  for (const o of orders) {
+    if (!o.productId) continue;
+    if (!map.has(o.productId)) {
+      map.set(o.productId, { productId: o.productId, totalQty: 0, totalGmv: 0, totalProfit: 0, orderCount: 0 });
+    }
+    const r = map.get(o.productId);
+    r.totalQty    += o.quantity;
+    r.totalGmv    += o.calcGmv;
+    r.totalProfit += o.calcGrossProfit;
+    r.orderCount  += 1;
   }
 
-  const products = Array.from(map.values()).map((r) => {
-    const st          = stockByPid[r.productId] ?? { stock: 0, minStock: 5 };
+  const stockByPid   = Object.fromEntries(productsStock.map((p) => [p.id, p]));
+  const sales30ByPid = {};
+  for (const o of orders30) {
+    if (!o.productId) continue;
+    sales30ByPid[o.productId] = (sales30ByPid[o.productId] ?? 0) + o.quantity;
+  }
+
+  const products = [...map.values()].map((r) => {
+    const p           = stockByPid[r.productId];
     const sales30     = sales30ByPid[r.productId] ?? 0;
     const salesPerDay = sales30 / 30;
-    const daysRem     = salesPerDay > 0 ? st.stock / salesPerDay : null;
-    const suggested   = salesPerDay > 0 ? Math.max(0, Math.round(salesPerDay * 60 - st.stock)) : 0;
+    const daysRem     = salesPerDay > 0 ? (p?.stock ?? 0) / salesPerDay : null;
+    const suggested   = salesPerDay > 0 ? Math.max(0, Math.round(salesPerDay * 60 - (p?.stock ?? 0))) : 0;
     return {
-      ...r,
-      totalRevenue:    parseFloat(r.totalRevenue.toFixed(2)),
-      totalProfit:     parseFloat(r.totalProfit.toFixed(2)),
-      avgMargin:       r.totalRevenue > 0 ? parseFloat(((r.totalProfit / r.totalRevenue) * 100).toFixed(1)) : 0,
-      stock:           st.stock,
-      minStock:        st.minStock,
-      salesLast30:     sales30,
-      salesPerDay:     parseFloat(salesPerDay.toFixed(2)),
-      daysRemaining:   daysRem !== null ? parseFloat(daysRem.toFixed(1)) : null,
+      productId:        r.productId,
+      name:             p?.name   ?? '',
+      sku:              p?.sku    ?? '',
+      totalQty:         r.totalQty,
+      totalRevenue:     parseFloat(r.totalGmv.toFixed(2)),
+      totalProfit:      parseFloat(r.totalProfit.toFixed(2)),
+      avgMargin:        r.totalGmv > 0 ? parseFloat(((r.totalProfit / r.totalGmv) * 100).toFixed(1)) : 0,
+      orderCount:       r.orderCount,
+      stock:            p?.stock    ?? 0,
+      minStock:         p?.minStock ?? 5,
+      salesLast30:      sales30,
+      salesPerDay:      parseFloat(salesPerDay.toFixed(2)),
+      daysRemaining:    daysRem !== null ? parseFloat(daysRem.toFixed(1)) : null,
       suggestedReorder: suggested,
     };
   }).sort((a, b) => b.totalRevenue - a.totalRevenue);
 
-  const totals = products.reduce((s, p) => ({
-    qty:     s.qty     + p.totalQty,
-    revenue: s.revenue + p.totalRevenue,
-    profit:  s.profit  + p.totalProfit,
-  }), { qty: 0, revenue: 0, profit: 0 });
+  const totals = products.reduce(
+    (s, p) => ({ qty: s.qty + p.totalQty, revenue: s.revenue + p.totalRevenue, profit: s.profit + p.totalProfit }),
+    { qty: 0, revenue: 0, profit: 0 },
+  );
 
   return res.json({ products, totals });
 }
 
-module.exports = { importOrders, importStatus, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport };
+module.exports = {
+  importOrders, importStatus, getClosing, listOrders, getOrder, deleteOrder,
+  recalculateOrders, recalculateStatus, exportOrders, skuReport,
+};

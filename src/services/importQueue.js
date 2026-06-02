@@ -1,14 +1,7 @@
 const { Queue, Worker } = require('bullmq');
-const { importShopeeParentSKU } = require('./importService');
-const { importShopeeOrderAll }  = require('./importOrderAll');
+const { importShopeeOrderAll } = require('./importOrderAll');
 const fs = require('fs');
 const connection = require('../lib/redisConnection');
-
-function detectImportType(filename) {
-  const lower = String(filename || '').toLowerCase();
-  if (lower.startsWith('order.all') || lower.startsWith('order_all')) return 'orderall';
-  return 'parentsku';
-}
 
 const QUEUE_NAME = 'import-orders';
 
@@ -32,10 +25,7 @@ function startWorker() {
 
       await job.updateProgress({ step: 'aguardando', current: 0, total: 0 });
 
-      const importType = detectImportType(filename);
-      const importFn   = importType === 'orderall' ? importShopeeOrderAll : importShopeeParentSKU;
-
-      const result = await importFn(
+      const result = await importShopeeOrderAll(
         filePath,
         storeId,
         userId,
