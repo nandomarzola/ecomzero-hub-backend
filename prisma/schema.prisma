@@ -42,6 +42,11 @@ model Store {
   mlSellerId       String?
   mlTokenExpiresAt DateTime?
 
+  ttAccessToken    String?   // TikTok Shop access token
+  ttRefreshToken   String?
+  ttShopId         String?   // TikTok Shop ID
+  ttTokenExpiresAt DateTime?
+
   products         Product[]
   orders           Order[]
   imports          Import[]
