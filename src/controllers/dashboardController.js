@@ -32,9 +32,10 @@ async function getSummary(req, res) {
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
 
-  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true } });
-  const storeIds          = stores.map((s) => s.id);
+  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, name: true, marketplace: true } });
+  const storeIds           = stores.map((s) => s.id);
   const marketplaceByStore = Object.fromEntries(stores.map((s) => [s.id, s.marketplace]));
+  const storeNameByStore   = Object.fromEntries(stores.map((s) => [s.id, s.name]));
 
   if (!storeIds.length) {
     return res.json({
@@ -151,7 +152,13 @@ async function getSummary(req, res) {
     const pid = o.product?.id ?? o.productId;
     if (!pid) continue;
     if (!productMap[pid]) {
-      productMap[pid] = { productId: pid, name: o.product?.name ?? '', profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0 };
+      productMap[pid] = {
+        productId:   pid,
+        name:        o.product?.name ?? '',
+        storeName:   storeNameByStore[o.storeId] ?? '',
+        marketplace: marketplaceByStore[o.storeId] ?? 'outros',
+        profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0,
+      };
     }
     productMap[pid].profit   += o.calcGrossProfit ?? 0;
     productMap[pid].margin   += o.margin          ?? 0;
@@ -214,17 +221,34 @@ async function getSummary(req, res) {
     share:   totalRevenue > 0 ? parseFloat(((c.revenue / totalRevenue) * 100).toFixed(1)) : 0,
   })).sort((a, b) => b.revenue - a.revenue);
 
-  // ── Heatmap diário ─────────────────────────────────────────────────────────
-  const dailyMap = {};
+  // ── Heatmap diário (total + por loja) ─────────────────────────────────────
+  const dailyMap      = {};
+  const dailyByStore  = {}; // storeId → { date → { revenue, orders } }
+  const storeNameMap  = Object.fromEntries(stores.map((s) => [s.id, { name: s.name, marketplace: s.marketplace }]));
+
   for (const o of orders) {
     const day = o.soldAt.toISOString().substring(0, 10);
+    // Total
     if (!dailyMap[day]) dailyMap[day] = { date: day, revenue: 0, orders: 0 };
     dailyMap[day].revenue += o.salePrice;
     dailyMap[day].orders++;
+    // Por loja
+    if (!dailyByStore[o.storeId]) dailyByStore[o.storeId] = {};
+    if (!dailyByStore[o.storeId][day]) dailyByStore[o.storeId][day] = { date: day, revenue: 0, orders: 0 };
+    dailyByStore[o.storeId][day].revenue += o.salePrice;
+    dailyByStore[o.storeId][day].orders++;
   }
+
   const dailyHeatmap = Object.values(dailyMap).map((d) => ({
-    ...d,
-    revenue: parseFloat(d.revenue.toFixed(2)),
+    ...d, revenue: parseFloat(d.revenue.toFixed(2)),
+  }));
+
+  // Heatmap por loja: só inclui se há mais de 1 loja com pedidos
+  const heatmapByStore = Object.entries(dailyByStore).map(([sid, dayMap]) => ({
+    storeId:     sid,
+    storeName:   storeNameMap[sid]?.name ?? sid,
+    marketplace: storeNameMap[sid]?.marketplace ?? 'outros',
+    days: Object.values(dayMap).map((d) => ({ ...d, revenue: parseFloat(d.revenue.toFixed(2)) })),
   }));
 
   return res.json({
@@ -242,6 +266,7 @@ async function getSummary(req, res) {
     sparkline,
     channelBreakdown,
     dailyHeatmap,
+    heatmapByStore,
   });
 }
 
