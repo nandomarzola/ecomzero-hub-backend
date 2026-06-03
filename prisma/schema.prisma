@@ -286,6 +286,19 @@ model Goal {
 // ───────────────────────────────────────────
 // FECHAMENTOS MENSAIS
 // ───────────────────────────────────────────
+// ── Logs de acesso ────────────────────────────────────────────────────────────
+model AccessLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  email     String?
+  action    String   // login | logout | api_call | login_failed
+  ip        String?
+  userAgent String?  @db.Text
+  endpoint  String?
+  status    Int?     // HTTP status
+  createdAt DateTime @default(now())
+}
+
 model MonthlyClosing {
   id              String   @id @default(cuid())
   storeId         String

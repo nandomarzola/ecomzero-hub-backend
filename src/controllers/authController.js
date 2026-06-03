@@ -46,16 +46,23 @@ async function login(req, res) {
   }
 
   const { email, password } = parsed.data;
+  const { logLogin, getIP } = require('../middleware/accessLog');
+  const ip = getIP(req);
+  const ua = req.headers['user-agent'] ?? null;
 
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user) {
+    await logLogin(email, null, ip, ua, false);
     return res.status(401).json({ error: 'Credenciais inválidas' });
   }
 
   const valid = await bcrypt.compare(password, user.password);
   if (!valid) {
+    await logLogin(email, user.id, ip, ua, false);
     return res.status(401).json({ error: 'Credenciais inválidas' });
   }
+
+  await logLogin(email, user.id, ip, ua, true);
 
   const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
 

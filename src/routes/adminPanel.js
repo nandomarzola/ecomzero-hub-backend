@@ -1,7 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
-const { getStats, listUsers, updateUser, getPlans } = require('../controllers/adminController');
+const { getStats, listUsers, updateUser, getPlans, getAccessLogs } = require('../controllers/adminController');
 
 router.use(authMiddleware, adminMiddleware); // todas as rotas exigem admin
 
@@ -9,5 +9,6 @@ router.get('/stats',        getStats);
 router.get('/users',        listUsers);
 router.put('/users/:id',    updateUser);
 router.get('/plans',        getPlans);
+router.get('/access-logs',  getAccessLogs);
 
 module.exports = router;

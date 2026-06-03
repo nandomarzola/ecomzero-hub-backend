@@ -59,6 +59,10 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Log de todos os acessos à API
+const { logAccess } = require('./middleware/accessLog');
+app.use('/api', logAccess);
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });

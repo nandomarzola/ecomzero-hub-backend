@@ -146,4 +146,24 @@ async function getPlans(req, res) {
   return res.json({ plans: PLANS });
 }
 
-module.exports = { getStats, listUsers, updateUser, getPlans };
+// GET /api/admin/access-logs — logs de acesso para monitoramento
+async function getAccessLogs(req, res) {
+  const { email, action, limit = 100, page = 1 } = req.query;
+  const where = {};
+  if (email)  where.email  = { contains: email };
+  if (action) where.action = action;
+
+  const [logs, total] = await Promise.all([
+    prisma.accessLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: parseInt(limit),
+      skip: (parseInt(page) - 1) * parseInt(limit),
+    }),
+    prisma.accessLog.count({ where }),
+  ]);
+
+  return res.json({ logs, total, page: parseInt(page) });
+}
+
+module.exports = { getStats, listUsers, updateUser, getPlans, getAccessLogs };
