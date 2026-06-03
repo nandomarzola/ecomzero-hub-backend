@@ -4,9 +4,10 @@ const { z } = require('zod');
 const prisma = require('../lib/prisma');
 
 const registerSchema = z.object({
-  name: z.string().min(2, 'Nome deve ter ao menos 2 caracteres'),
-  email: z.string().email('E-mail inválido'),
+  name:     z.string().min(2, 'Nome deve ter ao menos 2 caracteres'),
+  email:    z.string().email('E-mail inválido'),
   password: z.string().min(6, 'Senha deve ter ao menos 6 caracteres'),
+  document: z.string().optional(), // CPF ou CNPJ
 });
 
 const loginSchema = z.object({
@@ -20,7 +21,7 @@ async function register(req, res) {
     return res.status(400).json({ error: 'Dados inválidos', issues: parsed.error.issues });
   }
 
-  const { name, email, password } = parsed.data;
+  const { name, email, password, document } = parsed.data;
 
   const exists = await prisma.user.findUnique({ where: { email } });
   if (exists) {
@@ -29,7 +30,7 @@ async function register(req, res) {
 
   const hashed = await bcrypt.hash(password, 12);
   const user = await prisma.user.create({
-    data: { name, email, password: hashed },
+    data: { name, email, password: hashed, ...(document ? { cnpj: document } : {}) },
     select: { id: true, name: true, email: true, plan: true, role: true, createdAt: true },
   });
 

@@ -378,9 +378,11 @@ async function recalculateOrders(req, res) {
   for (const order of orders) {
     const marketplace    = order.store?.marketplace ?? 'shopee';
     const taxRate        = order.store?.taxRate ?? 0;
-    const mlFrete        = order.mlShippingCost ?? 0;
+    const mlFrete        = order.mlShippingCost     ?? 0;
+    const mlParcelamento = order.mlInstallmentFee   ?? 0;
+    // Para ML: precomputedFee = comissão + frete vendedor + taxa de parcelamento
     const precomputedFee = marketplace === 'mercadolivre'
-      ? r2((order.shopeeCommission ?? 0) + mlFrete)
+      ? r2((order.shopeeCommission ?? 0) + mlFrete + mlParcelamento)
       : null;
 
     const calc = calcOrderProfit({

@@ -172,7 +172,18 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
   // ML fornece o valor real da taxa no campo sale_fee
   const saleFee      = r2(item?.sale_fee ?? 0);
   const freight      = r2(sellerShippingCost ?? 0); // frete que o VENDEDOR paga
-  const netRevenue   = r2(gmv - saleFee - freight);
+
+  // Taxa de parcelamento: cobrada pelo ML quando comprador paga parcelado
+  // total_paid_amount = o que o comprador pagou (com acréscimo de parcelamento)
+  // paid_amount = o que o ML credita ao pedido (sem o acréscimo)
+  // diferença = taxa de parcelamento descontada do vendedor
+  const totalPaid    = r2(payment?.total_paid_amount ?? 0);
+  const paidAmount   = r2(mlOrder.paid_amount ?? 0);
+  const installmentFee = r2(Math.max(0, totalPaid - paidAmount));
+
+  // Total de deduções do marketplace
+  const totalMarketplaceFee = r2(saleFee + freight + installmentFee);
+  const netRevenue   = r2(gmv - totalMarketplaceFee);
   const taxRate      = store.taxRate ?? 0;
   const taxAmount    = r2(gmv * (taxRate / 100));
   const grossProfit  = r2(netRevenue - taxAmount); // sem custo de produto ainda
@@ -220,9 +231,10 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
     orderCreatedAt:   createdAt,
     orderPaidAt:      paidAt,
     orderDeliveredAt: deliveredAt,
-    mlShippingCost:   freight,
-    calcGmv:          isRevenue ? gmv : 0,
-    calcShopeeFee:    isRevenue ? r2(saleFee + freight) : 0, // taxa total = comissão + frete vendedor
+    mlShippingCost:    freight,
+    mlInstallmentFee:  installmentFee,
+    calcGmv:           isRevenue ? gmv : 0,
+    calcShopeeFee:     isRevenue ? totalMarketplaceFee : 0, // taxa total = comissão + frete + parcelamento
     calcNetRevenue:   isRevenue ? netRevenue : 0,
     calcTax:          isRevenue ? taxAmount : 0,
     calcProductCost:  0,
