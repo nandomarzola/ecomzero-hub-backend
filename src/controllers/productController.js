@@ -1,4 +1,5 @@
 const { z } = require('zod');
+const { Prisma } = require('@prisma/client');
 const prisma = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 const { getShopeeRates, calcOrderProfit } = require('../services/calculatorService');
@@ -76,6 +77,32 @@ async function list(req, res) {
     }),
     prisma.product.count({ where }),
   ]);
+
+  // Agrega effectiveRate por produto (últimos 90 dias) quando uma loja está selecionada
+  if (storeId && products.length > 0) {
+    const allIds = [];
+    for (const p of products) {
+      allIds.push(p.id);
+      for (const v of p.variants) allIds.push(v.id);
+    }
+    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const rows = await prisma.$queryRaw`
+      SELECT productId,
+             AVG((calcGmv - calcNetRevenue) / calcGmv * 100) AS productEffectiveRate
+      FROM \`Order\`
+      WHERE storeId = ${storeId}
+        AND productId IN (${Prisma.join(allIds)})
+        AND orderCategory NOT IN ('cancelled_unpaid', 'cancelled_other', 'returned_full')
+        AND soldAt >= ${cutoff}
+        AND calcGmv > 0
+      GROUP BY productId
+    `;
+    const rateMap = new Map(rows.map((r) => [r.productId, parseFloat(r.productEffectiveRate)]));
+    for (const p of products) {
+      p.productEffectiveRate = rateMap.get(p.id) ?? null;
+      for (const v of p.variants) v.productEffectiveRate = rateMap.get(v.id) ?? null;
+    }
+  }
 
   return res.json({ products: products.map(withAlerts), total, page: parseInt(page), limit: take });
 }
