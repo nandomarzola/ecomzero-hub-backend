@@ -301,6 +301,8 @@ async function importSheinOrderAll(filePath, storeId, userId, originalFilename, 
       shopeeDeductions: parseFloat(deductions.toFixed(2)),
       netRevenue:       parseFloat(netRevenue.toFixed(2)),
       grossProfit:      parseFloat(grossProfit.toFixed(2)),
+      skippedCount:     orderGroups.size - ordersData.length,
+      newProductCount:  newProductsMap.size,
       status:           'done',
     },
   });

@@ -98,6 +98,8 @@ model Import {
   shopeeDeductions     Float    @default(0)
   netRevenue           Float    @default(0)
   grossProfit          Float    @default(0)
+  skippedCount         Int      @default(0)
+  newProductCount      Int      @default(0)
   status               String   @default("processing") // processing|done|error
   errorMessage         String?
   jobId                String?

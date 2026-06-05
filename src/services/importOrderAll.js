@@ -491,6 +491,8 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
       shopeeDeductions: parseFloat(shopeeDeductions.toFixed(2)),
       netRevenue:       parseFloat(netRevenue.toFixed(2)),
       grossProfit:      parseFloat(grossProfit.toFixed(2)),
+      skippedCount:     rows.length - ordersData.length,
+      newProductCount:  newParentsMap.size + newProductsMap.size,
       status:           'done',
     },
   });

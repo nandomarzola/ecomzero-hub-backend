@@ -71,7 +71,11 @@ async function importStatus(req, res) {
         valid:       imp.validCount ?? 0,
         pending:     imp.pendingCount ?? 0,
         cancelled:   imp.cancelledCount ?? 0,
-        skipped:     0,
+        skipped:     imp.skippedCount ?? 0,
+        newProducts: imp.newProductCount ?? 0,
+        gmv:         imp.gmv ?? 0,
+        netRevenue:  imp.netRevenue ?? 0,
+        grossProfit: imp.grossProfit ?? 0,
         periodMonth: imp.periodMonth,
       },
     });
