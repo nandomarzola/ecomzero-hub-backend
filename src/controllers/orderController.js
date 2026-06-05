@@ -156,6 +156,7 @@ async function getClosing(req, res) {
         qty:          0,
         gmv:          0,
         shopeeFee:    0,
+        shippingCost: 0,
         netRevenue:   0,
         productCost:  0,
         packaging:    0,
@@ -168,6 +169,7 @@ async function getClosing(req, res) {
     g.qty         += o.quantity;
     g.gmv         += o.calcGmv;
     g.shopeeFee   += o.calcShopeeFee;
+    g.shippingCost += o.mlShippingCost ?? 0;
     g.netRevenue  += o.calcNetRevenue;
     g.productCost += o.calcProductCost;
     g.packaging   += o.calcPackaging;
@@ -204,6 +206,7 @@ async function getClosing(req, res) {
       qty:          g.qty,
       gmv:          r2(g.gmv),
       shopeeFee:    r2(g.shopeeFee),
+      shippingCost: r2(g.shippingCost),
       netRevenue:   r2(g.netRevenue),
       productCost:  r2(g.productCost),
       packaging:    r2(g.packaging),

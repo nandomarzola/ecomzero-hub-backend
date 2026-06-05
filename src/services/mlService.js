@@ -173,18 +173,11 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
   const saleFee  = r2(item?.sale_fee ?? 0);
   const freight  = r2(sellerShippingCost ?? 0); // frete que o VENDEDOR paga
 
-  // Soma todos os payments para cobrir pedidos com múltiplos pagamentos (renegociações, split)
-  // total_paid_amount = o que o comprador pagou (com acréscimo de parcelamento)
-  // total_amount      = o que o ML credita ao vendedor por esse payment (sem acréscimo)
-  const totalPaid  = r2(payments.reduce((s, p) => s + (p.total_paid_amount ?? 0), 0));
-  const paidAmount = r2(payments.reduce((s, p) => s + (p.total_amount      ?? 0), 0));
-
-  // financing_fee = campo direto da taxa de parcelamento quando disponível na API ML
-  // Fallback: diferença entre o que o comprador pagou e o que o ML creditou ao vendedor
-  const hasFinancingFee = payments.length > 0 && payments.every((p) => p.financing_fee !== undefined);
-  const installmentFee  = r2(hasFinancingFee
-    ? payments.reduce((s, p) => s + (p.financing_fee ?? 0), 0)
-    : Math.max(0, totalPaid - paidAmount));
+  // total_paid_amount = o que o comprador pagou (pode incluir acréscimo de parcelamento)
+  // paid_amount (raiz do pedido) = o que o ML credita ao vendedor — já consolidado pelo ML
+  const totalPaid      = r2(payments.reduce((s, p) => s + (p.total_paid_amount ?? 0), 0));
+  const paidAmount     = r2(mlOrder.paid_amount ?? 0);
+  const installmentFee = r2(Math.max(0, totalPaid - paidAmount));
 
   // Total de deduções do marketplace
   const totalMarketplaceFee = r2(saleFee + freight + installmentFee);
