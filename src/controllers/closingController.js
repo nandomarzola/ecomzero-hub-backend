@@ -26,7 +26,44 @@ function monthLabel(month) {
   return new Date(y, m - 1, 1).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
 }
 
-// ── Núcleo: computa todos os dados do mês ─────────────────────────────────────
+// Fix 1 — dynamic marketplace fee label
+function marketplaceFeeLabel(marketplace) {
+  const m = (marketplace || '').toLowerCase();
+  if (m === 'mercadolivre') return 'Taxas Mercado Livre';
+  if (m === 'shein')        return 'Taxas Shein';
+  if (m === 'tiktok')       return 'Taxas TikTok Shop';
+  if (m === 'shopee')       return 'Taxas Shopee';
+  return 'Taxas Marketplace';
+}
+
+// PDF pure helpers (no doc dependency)
+function fmtBRLpdf(v) {
+  if (v === null || v === undefined) return '—';
+  const abs = Math.abs(v ?? 0);
+  const str = abs.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return v < 0 ? `-R$ ${str}` : `R$ ${str}`;
+}
+function pctOf(v, total) {
+  return total > 0 ? ` (${(Math.abs(v) / total * 100).toFixed(1)}%)` : '';
+}
+function trunc(str, max = 46) {
+  const s = String(str || '');
+  return s.length > max ? s.substring(0, max) + '...' : s;
+}
+function taxRateStr(r) { return String(r ?? 0).replace('.', ','); }
+
+// Shared doc-bound helpers factory
+function makeH(doc, ML = 42, MR = 553) {
+  return {
+    ds:    (x, y, txt)          => doc.text(String(txt), x, y, { lineBreak: false }),
+    drs:   (rx, y, txt, w = 200) => doc.text(String(txt), rx - w, y, { width: w, align: 'right', lineBreak: false }),
+    sep:   (y, lw = 0.5)        => doc.moveTo(ML, y).lineTo(MR, y).lineWidth(lw).strokeColor('black').stroke(),
+    fc:    (r, g, b)            => doc.fillColor([r, g, b]),
+    black: ()                   => doc.fillColor('black'),
+  };
+}
+
+// ── Core: compute monthly data ─────────────────────────────────────────────────
 async function buildClosingData(storeIds, month) {
   const [y, mo] = month.split('-').map(Number);
   const start = new Date(Date.UTC(y, mo - 1, 1));
@@ -47,14 +84,14 @@ async function buildClosingData(storeIds, month) {
   const groupMap = new Map();
 
   for (const o of allOrders) {
-    const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+    const isRevenue  = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
     const isCancelled = o.orderCategory.startsWith('cancelled');
     const isReturned  = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
 
-    if (o.orderCategory === 'valid')             confirmedCount++;
-    else if (o.orderCategory === 'pending')      pendingCount++;
-    else if (isCancelled)                        cancelledCount++;
-    if (isReturned)                              returnedCount++;
+    if (o.orderCategory === 'valid')        confirmedCount++;
+    else if (o.orderCategory === 'pending') pendingCount++;
+    else if (isCancelled)                   cancelledCount++;
+    if (isReturned)                         returnedCount++;
 
     if (isRevenue) {
       gmvTotal         += o.calcGmv;
@@ -66,11 +103,11 @@ async function buildClosingData(storeIds, month) {
       packagingCost    += o.calcPackaging;
       grossProfit      += o.calcGrossProfit;
       unitCount        += o.quantity;
-      if (o.orderCategory === 'valid')             gmvConfirmed += o.calcGmv;
-      if (o.orderCategory === 'pending')           gmvPending   += o.calcGmv;
-      if (o.orderCategory === 'returned_partial')  returnedValue += o.calcGmv;
+      if (o.orderCategory === 'valid')            gmvConfirmed += o.calcGmv;
+      if (o.orderCategory === 'pending')          gmvPending   += o.calcGmv;
+      if (o.orderCategory === 'returned_partial') returnedValue += o.calcGmv;
     }
-    if (isCancelled)                     cancelledGmv  += o.calcGmv;
+    if (isCancelled)                        cancelledGmv  += o.calcGmv;
     if (o.orderCategory === 'returned_full') returnedValue += o.calcGmv;
 
     if (isRevenue) {
@@ -80,12 +117,11 @@ async function buildClosingData(storeIds, month) {
 
       if (!groupMap.has(key)) {
         groupMap.set(key, {
-          productId:    o.productId,
-          productName:  o.product?.name ?? o.productName ?? '(sem nome)',
-          sku:          o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
+          productId: o.productId,
+          productName: o.product?.name ?? o.productName ?? '(sem nome)',
+          sku: o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
           variationName: o.variationName ?? null,
-          hasCost:   true,
-          hasPending: false,
+          hasCost: true, hasPending: false,
           orderCount: 0, qty: 0,
           gmv: 0, shopeeFee: 0, netRevenue: 0,
           productCost: 0, packaging: 0, grossProfit: 0,
@@ -128,26 +164,26 @@ async function buildClosingData(storeIds, month) {
     .sort((a, b) => b.gmv - a.gmv);
 
   return {
-    totalOrders:     allOrders.length,
-    confirmedOrders: confirmedCount,
-    pendingOrders:   pendingCount,
-    cancelledOrders: cancelledCount,
-    returnedOrders:  returnedCount,
+    totalOrders:      allOrders.length,
+    confirmedOrders:  confirmedCount,
+    pendingOrders:    pendingCount,
+    cancelledOrders:  cancelledCount,
+    returnedOrders:   returnedCount,
     unitCount,
-    gmvTotal:        r2(gmvTotal),
-    gmvConfirmed:    r2(gmvConfirmed),
-    gmvPending:      r2(gmvPending),
+    gmvTotal:         r2(gmvTotal),
+    gmvConfirmed:     r2(gmvConfirmed),
+    gmvPending:       r2(gmvPending),
     shopeeDeductions: r2(shopeeDeductions),
-    sellerDiscounts: r2(sellerDiscounts),
-    netRevenue:      r2(netRevenue),
-    taxAmount:       r2(taxAmount),
-    productCost:     r2(productCost),
-    packagingCost:   r2(packagingCost),
-    grossProfit:     r2(grossProfit),
-    avgMargin:       r2(avgMargin),
-    cancelledGmv:    r2(cancelledGmv),
-    returnedValue:   r2(returnedValue),
-    orphanCount:     groups.filter(g => !g.hasCost).length,
+    sellerDiscounts:  r2(sellerDiscounts),
+    netRevenue:       r2(netRevenue),
+    taxAmount:        r2(taxAmount),
+    productCost:      r2(productCost),
+    packagingCost:    r2(packagingCost),
+    grossProfit:      r2(grossProfit),
+    avgMargin:        r2(avgMargin),
+    cancelledGmv:     r2(cancelledGmv),
+    returnedValue:    r2(returnedValue),
+    orphanCount:      groups.filter(g => !g.hasCost).length,
     groups,
   };
 }
@@ -196,26 +232,26 @@ async function getClosing(req, res) {
         closedAt: closing.closedAt,
         closedBy: closing.closedBy,
         data: {
-          totalOrders:     closing.totalOrders,
-          confirmedOrders: closing.confirmedOrders,
-          pendingOrders:   closing.pendingOrders,
-          cancelledOrders: closing.cancelledOrders,
-          returnedOrders:  closing.returnedOrders,
-          unitCount:       closing.unitCount,
-          gmvTotal:        closing.gmvTotal,
-          gmvConfirmed:    closing.gmvConfirmed,
-          gmvPending:      closing.gmvPending,
+          totalOrders:      closing.totalOrders,
+          confirmedOrders:  closing.confirmedOrders,
+          pendingOrders:    closing.pendingOrders,
+          cancelledOrders:  closing.cancelledOrders,
+          returnedOrders:   closing.returnedOrders,
+          unitCount:        closing.unitCount,
+          gmvTotal:         closing.gmvTotal,
+          gmvConfirmed:     closing.gmvConfirmed,
+          gmvPending:       closing.gmvPending,
           shopeeDeductions: closing.shopeeDeductions,
-          sellerDiscounts: closing.sellerDiscounts,
-          netRevenue:      closing.netRevenue,
-          taxAmount:       closing.taxAmount,
-          productCost:     closing.productCost,
-          packagingCost:   closing.packagingCost,
-          grossProfit:     closing.grossProfit,
-          avgMargin:       closing.avgMargin,
-          cancelledGmv:    closing.cancelledGmv,
-          returnedValue:   closing.returnedValue,
-          orphanCount:     Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+          sellerDiscounts:  closing.sellerDiscounts,
+          netRevenue:       closing.netRevenue,
+          taxAmount:        closing.taxAmount,
+          productCost:      closing.productCost,
+          packagingCost:    closing.packagingCost,
+          grossProfit:      closing.grossProfit,
+          avgMargin:        closing.avgMargin,
+          cancelledGmv:     closing.cancelledGmv,
+          returnedValue:    closing.returnedValue,
+          orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
         },
         groups: Array.isArray(snap) ? snap : [],
       });
@@ -311,6 +347,241 @@ async function reopenMonth(req, res) {
   }
 }
 
+// ── Per-store section renderer ────────────────────────────────────────────────
+// Renders one store's full closing section on the current page of doc.
+// Always starts at y=27 (top of page). Draws footer at H-32 absolute.
+function renderStoreSection(doc, store, d, month, opts = {}) {
+  const { isClosed = false, closedAt = null } = opts;
+
+  const H  = 841.89;
+  const ML = 42;
+  const MR = 553;
+  const { ds, drs, sep, fc, black } = makeH(doc, ML, MR);
+
+  const mLabel    = monthLabel(month);
+  const mLabelCap = mLabel.charAt(0).toUpperCase() + mLabel.slice(1);
+  const top10     = d.groups.slice(0, 10);
+  const negMargin = d.groups.filter(g => g.hasCost && g.margin < 0).length;
+  const hasCosts  = d.orphanCount === 0;
+  const totalOrd  = d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders;
+  const cancelPct = totalOrd > 0 ? ((d.cancelledOrders / totalOrd) * 100).toFixed(1) : '0.0';
+  const returnPct = totalOrd > 0 ? ((d.returnedOrders  / totalOrd) * 100).toFixed(1) : '0.0';
+
+  let y = 27;
+
+  // ── 1. HEADER ───────────────────────────────────────────────────────────────
+  doc.font('Helvetica-Bold').fontSize(14).fillColor('black');
+  ds(ML, y, 'ECOMZERO HUB');
+  doc.font('Helvetica').fontSize(11);
+  drs(MR, y, 'RELATORIO DE FECHAMENTO');
+
+  y += 14;
+  doc.font('Helvetica').fontSize(10);
+  ds(ML, y, `${store.name} — ${store.marketplace ?? 'Shopee'}`);
+  drs(MR, y, mLabelCap);
+
+  if (isClosed) {
+    y += 12;
+    fc(120, 120, 120);
+    doc.font('Helvetica').fontSize(9);
+    ds(ML, y, `Fechado em: ${fmtDate(closedAt)}`);
+    black();
+  }
+
+  y += 16;
+  sep(y, 0.8);
+
+  // ── 2. RESUMO DO PERÍODO ─────────────────────────────────────────────────
+  y += 9;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+  ds(ML, y, 'RESUMO DO PERIODO');
+  y += 12;
+  sep(y, 0.3);
+  y += 12;
+
+  const rsV1 = 185, rsL2 = 285, rsV2 = MR;
+  const resumoRows = [
+    ['Pedidos faturados:', d.confirmedOrders + d.pendingOrders, 'Unidades vendidas:', d.unitCount],
+    ['Confirmados:',       d.confirmedOrders,                   'Cancelamentos:',     d.cancelledOrders],
+    ['Pendentes:',         d.pendingOrders,                     'Devolucoes:',        d.returnedOrders],
+  ];
+  for (const [l1, v1, l2, v2] of resumoRows) {
+    doc.font('Helvetica').fontSize(9).fillColor('black');
+    ds(ML, y, l1);
+    doc.font('Helvetica-Bold').fontSize(9);
+    drs(rsV1, y, String(v1));
+    doc.font('Helvetica').fontSize(9);
+    ds(rsL2, y, l2);
+    doc.font('Helvetica-Bold').fontSize(9);
+    drs(rsV2, y, String(v2));
+    y += 14;
+  }
+  y += 4;
+  sep(y, 0.3);
+
+  // ── 3. DEMONSTRATIVO FINANCEIRO ──────────────────────────────────────────
+  y += 9;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+  ds(ML, y, 'DEMONSTRATIVO FINANCEIRO');
+  y += 12;
+  sep(y, 0.3);
+  y += 14;
+
+  const dreIndX  = ML + 12;
+  const feeLabel = marketplaceFeeLabel(store.marketplace);
+  const dreRows  = [
+    { l: 'GMV Bruto',                                                v: fmtBRLpdf(d.gmvTotal),                                                 bold: false, sepBefore: false },
+    { l: `(-) ${feeLabel}`,                                          v: fmtBRLpdf(-d.shopeeDeductions) + pctOf(d.shopeeDeductions, d.gmvTotal), bold: false, sepBefore: false },
+    { l: '(-) Descontos do vendedor',                                v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
+    { l: '(=) Receita Liquida',                                      v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
+    { l: `(-) Imposto provisionado (${taxRateStr(store.taxRate)}%)`, v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+    { l: '(-) Custo dos produtos',                                   v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
+    { l: '(-) Embalagens',                                           v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
+  ];
+
+  for (const row of dreRows) {
+    if (row.sepBefore) { sep(y - 3, 0.3); y += 4; }
+    doc.font(row.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(9).fillColor('black');
+    ds(dreIndX, y, row.l);
+    drs(MR, y, row.v);
+    y += 14;
+    if (row.bold) { sep(y - 3, 0.3); y += 4; }
+  }
+  sep(y, 0.8);
+
+  // ── 4. LUCRO BRUTO ───────────────────────────────────────────────────────
+  y += 8;
+  doc.font('Helvetica-Bold').fontSize(12).fillColor('black');
+  ds(ML, y, 'LUCRO BRUTO:');
+  drs(MR, y, fmtBRLpdf(d.grossProfit));
+
+  y += 20;
+  const barTotalW = 285;
+  const margPct   = Math.max(0, Math.min(100, d.avgMargin ?? 0));
+  const filledW   = (margPct / 100) * barTotalW;
+  doc.rect(ML, y, barTotalW, 9).fillColor([210, 210, 210]).fill();
+  if (filledW > 0) doc.rect(ML, y, filledW, 9).fillColor([130, 130, 130]).fill();
+  black();
+  doc.font('Helvetica').fontSize(9);
+  ds(ML + barTotalW + 10, y + 0.5, `Margem: ${margPct.toFixed(1)}%`);
+  y += 16;
+
+  if (!hasCosts) {
+    fc(140, 140, 140);
+    doc.font('Helvetica').fontSize(8);
+    ds(ML, y, '* Produtos sem custo cadastrado — lucro estimado sem deducao de CMV');
+    black();
+    y += 13;
+  }
+
+  // ── 5. PERDAS DO PERÍODO ─────────────────────────────────────────────────
+  y += 8;
+  sep(y, 0.3);
+  y += 9;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+  ds(ML, y, 'PERDAS DO PERIODO');
+  y += 12;
+  sep(y, 0.3);
+  y += 12;
+
+  const pdL2 = 280, pdV1 = 185;
+  doc.font('Helvetica').fontSize(9).fillColor('black');
+  ds(ML, y, 'Cancelamentos:');
+  doc.font('Helvetica-Bold'); drs(pdV1, y, `${d.cancelledOrders} pedidos`);
+  doc.font('Helvetica');      ds(pdL2, y, 'GMV perdido:');
+  doc.font('Helvetica-Bold'); drs(MR, y, fmtBRLpdf(d.cancelledGmv));
+
+  y += 14;
+  doc.font('Helvetica').fillColor('black');
+  ds(ML, y, 'Devolucoes:');
+  doc.font('Helvetica-Bold'); drs(pdV1, y, `${d.returnedOrders} pedidos`);
+  doc.font('Helvetica');      ds(pdL2, y, 'Valor devolvido:');
+  doc.font('Helvetica-Bold'); drs(MR, y, fmtBRLpdf(d.returnedValue));
+
+  // ── 6. TOP 10 PRODUTOS ───────────────────────────────────────────────────
+  y += 22;
+  sep(y, 0.3);
+  y += 9;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+  ds(ML, y, 'TOP 10 PRODUTOS DO PERIODO');
+  y += 12;
+  sep(y, 0.3);
+  y += 12;
+
+  const tNx = ML + 20, tPED = 342, tGMV = 418, tLUC = 492, tMAR = MR;
+  fc(100, 100, 100);
+  doc.font('Helvetica-Bold').fontSize(8.5);
+  ds(ML, y, '#');
+  ds(tNx, y, 'PRODUTO');
+  doc.text('PED.',  tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
+  doc.text('GMV',   tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
+  doc.text('LUCRO', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+  doc.text('MARG.', tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+  black();
+  y += 10;
+  sep(y, 0.3);
+  y += 5;
+
+  doc.font('Helvetica').fontSize(9);
+  for (let i = 0; i < top10.length; i++) {
+    const g = top10[i];
+    black();
+    ds(ML, y, String(i + 1));
+    ds(tNx, y, trunc(g.productName, 46));
+    doc.text(String(g.orderCount), tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
+    doc.text(fmtBRLpdf(g.gmv),    tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
+    if (g.hasCost) {
+      black();
+      doc.text(fmtBRLpdf(g.grossProfit), tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+      doc.text(`${g.margin.toFixed(1)}%`, tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+    } else {
+      fc(140, 140, 140);
+      doc.text('s/ custo', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+      doc.text('—',        tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+      black();
+    }
+    y += 13;
+  }
+
+  // ── 7. ALERTAS ───────────────────────────────────────────────────────────
+  y += 10;
+  sep(y, 0.3);
+  y += 9;
+  doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+  ds(ML, y, 'ALERTAS DO PERIODO');
+  y += 12;
+  sep(y, 0.3);
+  y += 12;
+
+  const alertTxtX = ML + 28;
+  const alertas = [
+    { warn: negMargin > 0,              prefix: '!',  text: `${negMargin} produto(s) com margem negativa` },
+    { warn: d.orphanCount > 0,          prefix: '!',  text: `${d.orphanCount} produto(s) sem custo cadastrado — lucro nao calculado` },
+    { warn: parseFloat(returnPct) > 2,  prefix: 'OK', text: `Taxa de devolucao: ${returnPct}% (normal < 2%)` },
+    { warn: parseFloat(cancelPct) > 15, prefix: 'OK', text: `Taxa de cancelamento: ${cancelPct}% (normal < 15%)` },
+  ];
+  for (const a of alertas) {
+    const fn  = a.warn ? 'Helvetica-Bold' : 'Helvetica';
+    const clr = a.warn ? [0, 0, 0] : [100, 100, 100];
+    doc.font(fn).fontSize(9).fillColor(clr);
+    ds(ML, y, a.prefix);
+    ds(alertTxtX, y, a.text);
+    y += 14;
+  }
+  black();
+
+  // ── 8. FOOTER ────────────────────────────────────────────────────────────
+  const footerLineY = H - 32;
+  sep(footerLineY, 0.3);
+  fc(140, 140, 140);
+  doc.font('Helvetica').fontSize(8);
+  if (!isClosed) {
+    ds(ML, footerLineY + 6, '* Valores nao finalizados — fechamento ainda aberto');
+  }
+  drs(MR, footerLineY + 6, `EcomZero Hub  |  Gerado em ${fmtDateTime(new Date())}`);
+  black();
+}
+
 // ── GET /api/closing/:month/pdf ───────────────────────────────────────────────
 async function getPdf(req, res) {
   try {
@@ -324,344 +595,320 @@ async function getPdf(req, res) {
       include: { user: { select: { name: true, email: true } } },
     });
     if (!stores.length) return res.status(404).json({ error: 'Loja nao encontrada' });
-    const store    = stores[0];
-    const storeIds = [store.id];
 
-    const closing = await prisma.monthlyClosing.findFirst({
-      where: { storeId: { in: storeIds }, periodMonth: month, status: 'closed' },
-    });
-
-    let d, isClosed = false, closedAt = null;
-    if (closing) {
-      isClosed = true;
-      closedAt = closing.closedAt;
-      const snap = closing.productsSnapshot ?? [];
-      d = {
-        totalOrders: closing.totalOrders, confirmedOrders: closing.confirmedOrders,
-        pendingOrders: closing.pendingOrders, cancelledOrders: closing.cancelledOrders,
-        returnedOrders: closing.returnedOrders, unitCount: closing.unitCount,
-        gmvTotal: closing.gmvTotal, gmvConfirmed: closing.gmvConfirmed,
-        gmvPending: closing.gmvPending, shopeeDeductions: closing.shopeeDeductions,
-        sellerDiscounts: closing.sellerDiscounts, netRevenue: closing.netRevenue,
-        taxAmount: closing.taxAmount, productCost: closing.productCost,
-        packagingCost: closing.packagingCost, grossProfit: closing.grossProfit,
-        avgMargin: closing.avgMargin, cancelledGmv: closing.cancelledGmv,
-        returnedValue: closing.returnedValue,
-        orphanCount: Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
-        groups: Array.isArray(snap) ? snap : [],
-      };
-    } else {
-      d = await buildClosingData(storeIds, month);
-    }
-
-    // ── Constantes de layout (PDFKit: y=0 no TOPO, aumenta para baixo) ──────
-    const H  = 841.89;
-    const W  = 595.28;
-    const ML = 42;     // margem esquerda
-    const MR = 553;    // borda direita (x máximo para right-align)
-    const TW = MR - ML;
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-    // ds  = drawString   → texto left-aligned a partir de x
-    // drs = drawRightString → texto right-aligned, caixa de w=200 terminando em rx
-    // sep = linha horizontal
-    function ds(x, y, txt) {
-      doc.text(String(txt), x, y, { lineBreak: false });
-    }
-    function drs(rx, y, txt, w = 200) {
-      doc.text(String(txt), rx - w, y, { width: w, align: 'right', lineBreak: false });
-    }
-    function sep(y, lw = 0.5) {
-      doc.moveTo(ML, y).lineTo(MR, y).lineWidth(lw).strokeColor('black').stroke();
-    }
-    function fc(r, g, b) { doc.fillColor([r, g, b]); }
-    function black()     { doc.fillColor('black'); }
-
-    function fmtBRLpdf(v) {
-      if (v === null || v === undefined) return '—';
-      const abs = Math.abs(v ?? 0);
-      const str = abs.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-      return v < 0 ? `-R$ ${str}` : `R$ ${str}`;
-    }
-    function pctOf(v, total) {
-      return total > 0 ? ` (${(Math.abs(v) / total * 100).toFixed(1)}%)` : '';
-    }
-    function trunc(str, max = 46) {
-      return str.length > max ? str.substring(0, max) + '...' : str;
-    }
-    function taxRateStr(r) {
-      return String(r ?? 0).replace('.', ',');
-    }
-
-    // ── Dados derivados ───────────────────────────────────────────────────────
-    const mLabel     = monthLabel(month);
-    const mLabelCap  = mLabel.charAt(0).toUpperCase() + mLabel.slice(1);
-    const top10      = d.groups.slice(0, 10);
-    const negMargin  = d.groups.filter(g => g.hasCost && g.margin < 0).length;
-    const hasCosts   = d.orphanCount === 0;
-    const totalOrd   = d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders;
-    const cancelPct  = totalOrd > 0 ? ((d.cancelledOrders / totalOrd) * 100).toFixed(1) : '0.0';
-    const returnPct  = totalOrd > 0 ? ((d.returnedOrders  / totalOrd) * 100).toFixed(1) : '0.0';
-
-    // ── Documento ─────────────────────────────────────────────────────────────
     const doc = new PDFDocument({ size: 'A4', margin: 0, bufferPages: true });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="fechamento-${month}.pdf"`);
     doc.pipe(res);
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // 1. HEADER
-    // ══════════════════════════════════════════════════════════════════════════
-    let y = 27;
-    doc.font('Helvetica-Bold').fontSize(14).fillColor('black');
-    ds(ML, y, 'ECOMZERO HUB');
-    doc.font('Helvetica').fontSize(11);
-    drs(MR, y, 'RELATORIO DE FECHAMENTO');
+    const isConsolidated = !storeId && stores.length > 1;
 
-    y += 14;
-    doc.font('Helvetica').fontSize(10);
-    ds(ML, y, `${store.name} — ${store.marketplace ?? 'Shopee'}`);
-    drs(MR, y, mLabelCap);
+    if (!isConsolidated) {
+      // ── SINGLE STORE PATH ──────────────────────────────────────────────────
+      const store   = stores[0];
+      const closing = await prisma.monthlyClosing.findFirst({
+        where: { storeId: store.id, periodMonth: month, status: 'closed' },
+      });
 
-    if (isClosed) {
+      let d, isClosed = false, closedAt = null;
+      if (closing) {
+        isClosed = true;
+        closedAt = closing.closedAt;
+        const snap = closing.productsSnapshot ?? [];
+        d = {
+          totalOrders:      closing.totalOrders,      confirmedOrders:  closing.confirmedOrders,
+          pendingOrders:    closing.pendingOrders,     cancelledOrders:  closing.cancelledOrders,
+          returnedOrders:   closing.returnedOrders,    unitCount:        closing.unitCount,
+          gmvTotal:         closing.gmvTotal,          gmvConfirmed:     closing.gmvConfirmed,
+          gmvPending:       closing.gmvPending,        shopeeDeductions: closing.shopeeDeductions,
+          sellerDiscounts:  closing.sellerDiscounts,   netRevenue:       closing.netRevenue,
+          taxAmount:        closing.taxAmount,         productCost:      closing.productCost,
+          packagingCost:    closing.packagingCost,     grossProfit:      closing.grossProfit,
+          avgMargin:        closing.avgMargin,         cancelledGmv:     closing.cancelledGmv,
+          returnedValue:    closing.returnedValue,
+          orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+          groups:           Array.isArray(snap) ? snap : [],
+        };
+      } else {
+        d = await buildClosingData([store.id], month);
+      }
+
+      renderStoreSection(doc, store, d, month, { isClosed, closedAt });
+
+    } else {
+      // ── CONSOLIDATED MULTI-STORE PATH (Fix 2) ──────────────────────────────
+      const allStoreIds = stores.map(s => s.id);
+
+      // Parallel: consolidated total + per-store breakdown
+      const [consolidatedData, ...storeDataArr] = await Promise.all([
+        buildClosingData(allStoreIds, month),
+        ...stores.map(s => buildClosingData([s.id], month)),
+      ]);
+      const storeResults = stores.map((s, i) => ({ store: s, data: storeDataArr[i] }));
+
+      // Fix 3 — stores with negative margin products
+      const storesWithNegMargin = storeResults
+        .filter(sr => sr.data.groups.some(g => g.hasCost && g.margin < 0))
+        .map(sr => sr.store.name);
+      const totalNegMargin = consolidatedData.groups.filter(g => g.hasCost && g.margin < 0).length;
+
+      const H  = 841.89;
+      const ML = 42;
+      const MR = 553;
+      const { ds, drs, sep, fc, black } = makeH(doc, ML, MR);
+
+      const mLabel    = monthLabel(month);
+      const mLabelCap = mLabel.charAt(0).toUpperCase() + mLabel.slice(1);
+      const d         = consolidatedData;
+      const hasCosts  = d.orphanCount === 0;
+      const totalOrd  = d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders;
+      const cancelPct = totalOrd > 0 ? ((d.cancelledOrders / totalOrd) * 100).toFixed(1) : '0.0';
+      const returnPct = totalOrd > 0 ? ((d.returnedOrders  / totalOrd) * 100).toFixed(1) : '0.0';
+
+      let y = 27;
+
+      // ── PÁGINA 1: CONSOLIDADO GERAL ─────────────────────────────────────
+
+      // 1. HEADER
+      doc.font('Helvetica-Bold').fontSize(14).fillColor('black');
+      ds(ML, y, 'ECOMZERO HUB');
+      doc.font('Helvetica').fontSize(11);
+      drs(MR, y, 'FECHAMENTO CONSOLIDADO');
+
+      y += 14;
+      doc.font('Helvetica').fontSize(10);
+      ds(ML, y, `Todas as lojas (${stores.length} lojas ativas no período)`);
+      drs(MR, y, mLabelCap);
+
+      y += 16;
+      sep(y, 0.8);
+
+      // 2. RESUMO CONSOLIDADO
+      y += 9;
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+      ds(ML, y, 'RESUMO CONSOLIDADO');
       y += 12;
-      fc(120, 120, 120);
-      doc.font('Helvetica').fontSize(9);
-      ds(ML, y, `Fechado em: ${fmtDate(closedAt)}`);
+      sep(y, 0.3);
+      y += 12;
+
+      const rsV1 = 185, rsL2 = 285, rsV2 = MR;
+      const resumoRows = [
+        ['Pedidos faturados:', d.confirmedOrders + d.pendingOrders, 'Unidades vendidas:', d.unitCount],
+        ['Confirmados:',       d.confirmedOrders,                   'Cancelamentos:',     d.cancelledOrders],
+        ['Pendentes:',         d.pendingOrders,                     'Devolucoes:',        d.returnedOrders],
+      ];
+      for (const [l1, v1, l2, v2] of resumoRows) {
+        doc.font('Helvetica').fontSize(9).fillColor('black');
+        ds(ML, y, l1);
+        doc.font('Helvetica-Bold').fontSize(9);
+        drs(rsV1, y, String(v1));
+        doc.font('Helvetica').fontSize(9);
+        ds(rsL2, y, l2);
+        doc.font('Helvetica-Bold').fontSize(9);
+        drs(rsV2, y, String(v2));
+        y += 14;
+      }
+      y += 4;
+      sep(y, 0.3);
+
+      // 3. DEMONSTRATIVO FINANCEIRO (consolidado)
+      y += 9;
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+      ds(ML, y, 'DEMONSTRATIVO FINANCEIRO');
+      y += 12;
+      sep(y, 0.3);
+      y += 14;
+
+      const dreIndX = ML + 12;
+      const dreRows = [
+        { l: 'GMV Bruto',                    v: fmtBRLpdf(d.gmvTotal),                                                 bold: false, sepBefore: false },
+        { l: '(-) Taxas Marketplace',        v: fmtBRLpdf(-d.shopeeDeductions) + pctOf(d.shopeeDeductions, d.gmvTotal), bold: false, sepBefore: false },
+        { l: '(-) Descontos do vendedor',    v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
+        { l: '(=) Receita Liquida',          v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
+        { l: '(-) Imposto provisionado',     v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+        { l: '(-) Custo dos produtos',       v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
+        { l: '(-) Embalagens',              v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
+      ];
+      for (const row of dreRows) {
+        if (row.sepBefore) { sep(y - 3, 0.3); y += 4; }
+        doc.font(row.bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(9).fillColor('black');
+        ds(dreIndX, y, row.l);
+        drs(MR, y, row.v);
+        y += 14;
+        if (row.bold) { sep(y - 3, 0.3); y += 4; }
+      }
+      sep(y, 0.8);
+
+      // 4. LUCRO BRUTO
+      y += 8;
+      doc.font('Helvetica-Bold').fontSize(12).fillColor('black');
+      ds(ML, y, 'LUCRO BRUTO TOTAL:');
+      drs(MR, y, fmtBRLpdf(d.grossProfit));
+
+      y += 20;
+      const barTotalW = 285;
+      const margPct   = Math.max(0, Math.min(100, d.avgMargin ?? 0));
+      const filledW   = (margPct / 100) * barTotalW;
+      doc.rect(ML, y, barTotalW, 9).fillColor([210, 210, 210]).fill();
+      if (filledW > 0) doc.rect(ML, y, filledW, 9).fillColor([130, 130, 130]).fill();
       black();
-    }
-
-    y += 16;
-    sep(y, 0.8);
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 2. RESUMO DO PERÍODO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 9;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-    ds(ML, y, 'RESUMO DO PERIODO');
-
-    y += 12;
-    sep(y, 0.3);
-
-    y += 12;
-    // Colunas: label1 | value1 (right em x=185) | label2 | value2 (right em x=553)
-    const rsV1 = 185, rsL2 = 285, rsV2 = MR;
-    const resumoRows = [
-      ['Pedidos faturados:', d.confirmedOrders + d.pendingOrders, 'Unidades vendidas:', d.unitCount],
-      ['Confirmados:',       d.confirmedOrders,                   'Cancelamentos:',     d.cancelledOrders],
-      ['Pendentes:',         d.pendingOrders,                     'Devolucoes:',        d.returnedOrders],
-    ];
-    for (const [l1, v1, l2, v2] of resumoRows) {
-      doc.font('Helvetica').fontSize(9).fillColor('black');
-      ds(ML, y, l1);
-      doc.font('Helvetica-Bold').fontSize(9);
-      drs(rsV1, y, String(v1));
       doc.font('Helvetica').fontSize(9);
-      ds(rsL2, y, l2);
-      doc.font('Helvetica-Bold').fontSize(9);
-      drs(rsV2, y, String(v2));
-      y += 14;
-    }
+      ds(ML + barTotalW + 10, y + 0.5, `Margem media: ${margPct.toFixed(1)}%`);
+      y += 16;
 
-    y += 4;
-    sep(y, 0.3);
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 3. DEMONSTRATIVO FINANCEIRO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 9;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-    ds(ML, y, 'DEMONSTRATIVO FINANCEIRO');
-
-    y += 12;
-    sep(y, 0.3);
-
-    y += 14;
-    const dreIndX = ML + 12; // indent leve nas linhas do DRE
-    const dreRows = [
-      { l: 'GMV Bruto',                                              v: fmtBRLpdf(d.gmvTotal),                                                   bold: false, sepBefore: false },
-      { l: '(-) Taxas Shopee',                                       v: fmtBRLpdf(-d.shopeeDeductions) + pctOf(d.shopeeDeductions, d.gmvTotal),   bold: false, sepBefore: false },
-      { l: '(-) Descontos do vendedor',                              v: fmtBRLpdf(-d.sellerDiscounts),                                            bold: false, sepBefore: false },
-      { l: '(=) Receita Liquida',                                    v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),                bold: true,  sepBefore: true  },
-      { l: `(-) Imposto provisionado (${taxRateStr(store.taxRate)}%)`, v: fmtBRLpdf(-d.taxAmount),                                               bold: false, sepBefore: false },
-      { l: '(-) Custo dos produtos',                                 v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                      bold: false, sepBefore: false },
-      { l: '(-) Embalagens',                                         v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
-    ];
-
-    for (const row of dreRows) {
-      if (row.sepBefore) {
-        sep(y - 3, 0.3);
-        y += 4;
+      if (!hasCosts) {
+        fc(140, 140, 140);
+        doc.font('Helvetica').fontSize(8);
+        ds(ML, y, '* Produtos sem custo cadastrado — lucro estimado sem deducao de CMV');
+        black();
+        y += 13;
       }
-      const fn = row.bold ? 'Helvetica-Bold' : 'Helvetica';
-      doc.font(fn).fontSize(9).fillColor('black');
-      ds(dreIndX, y, row.l);
-      drs(MR, y, row.v);
-      y += 14;
-      if (row.bold) {
-        sep(y - 3, 0.3);
-        y += 4;
+
+      // 5. BREAKDOWN POR LOJA
+      y += 8;
+      sep(y, 0.3);
+      y += 9;
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+      ds(ML, y, 'BREAKDOWN POR LOJA');
+      y += 12;
+      sep(y, 0.3);
+      y += 10;
+
+      // Table header
+      const bkL  = ML;       // Loja left
+      const bkG  = 255;      // GMV right
+      const bkR  = 348;      // Rec.Líq. right
+      const bkLu = 430;      // Lucro right
+      const bkM  = MR;       // Margem right
+
+      fc(100, 100, 100);
+      doc.font('Helvetica-Bold').fontSize(8.5);
+      ds(bkL, y, 'LOJA');
+      doc.text('GMV',       bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text('REC. LIQ.', bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text('LUCRO',     bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+      doc.text('MARGEM',    bkM  - 55, y, { width: 55, align: 'right', lineBreak: false });
+      black();
+      y += 10;
+      sep(y, 0.3);
+      y += 5;
+
+      doc.font('Helvetica').fontSize(9);
+      for (const { store: s, data: sd } of storeResults) {
+        black();
+        ds(bkL, y, trunc(s.name, 28));
+        doc.text(fmtBRLpdf(sd.gmvTotal),    bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(sd.netRevenue),  bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(sd.grossProfit), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+        doc.text(`${(sd.avgMargin ?? 0).toFixed(1)}%`, bkM - 55, y, { width: 55, align: 'right', lineBreak: false });
+        y += 13;
       }
-    }
 
-    sep(y, 0.8);
+      // TOTAL row
+      y += 2;
+      sep(y, 0.5);
+      y += 5;
+      doc.font('Helvetica-Bold').fontSize(9).fillColor('black');
+      ds(bkL, y, 'TOTAL');
+      doc.text(fmtBRLpdf(d.gmvTotal),    bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text(fmtBRLpdf(d.netRevenue),  bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text(fmtBRLpdf(d.grossProfit), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+      doc.text(`${margPct.toFixed(1)}%`, bkM  - 55, y, { width: 55, align: 'right', lineBreak: false });
+      y += 16;
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // 4. LUCRO BRUTO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 8;
-    doc.font('Helvetica-Bold').fontSize(12).fillColor('black');
-    ds(ML, y, 'LUCRO BRUTO:');
-    drs(MR, y, fmtBRLpdf(d.grossProfit));
+      // 6. TOP 10 PRODUTOS (consolidado)
+      sep(y, 0.3);
+      y += 9;
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+      ds(ML, y, 'TOP 10 PRODUTOS (CONSOLIDADO)');
+      y += 12;
+      sep(y, 0.3);
+      y += 12;
 
-    y += 20;
-    // Barra de margem: fundo cinza claro + fill cinza escuro proporcional
-    const barTotalW = 285;
-    const margPct   = Math.max(0, Math.min(100, d.avgMargin ?? 0));
-    const filledW   = (margPct / 100) * barTotalW;
-    doc.rect(ML, y, barTotalW, 9).fillColor([210, 210, 210]).fill();
-    if (filledW > 0) {
-      doc.rect(ML, y, filledW, 9).fillColor([130, 130, 130]).fill();
-    }
-    black();
-    doc.font('Helvetica').fontSize(9);
-    ds(ML + barTotalW + 10, y + 0.5, `Margem: ${margPct.toFixed(1)}%`);
+      const tNx = ML + 20, tPED = 342, tGMV = 418, tLUC = 492, tMAR = MR;
+      fc(100, 100, 100);
+      doc.font('Helvetica-Bold').fontSize(8.5);
+      ds(ML, y, '#');
+      ds(tNx, y, 'PRODUTO');
+      doc.text('PED.',  tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
+      doc.text('GMV',   tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
+      doc.text('LUCRO', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+      doc.text('MARG.', tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+      black();
+      y += 10;
+      sep(y, 0.3);
+      y += 5;
 
-    y += 16;
-    if (!hasCosts) {
+      const top10 = d.groups.slice(0, 10);
+      doc.font('Helvetica').fontSize(9);
+      for (let i = 0; i < top10.length; i++) {
+        if (y > H - 120) { doc.addPage(); y = 27; }
+        const g = top10[i];
+        black();
+        ds(ML, y, String(i + 1));
+        ds(tNx, y, trunc(g.productName, 46));
+        doc.text(String(g.orderCount), tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(g.gmv),    tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
+        if (g.hasCost) {
+          black();
+          doc.text(fmtBRLpdf(g.grossProfit), tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+          doc.text(`${g.margin.toFixed(1)}%`, tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+        } else {
+          fc(140, 140, 140);
+          doc.text('s/ custo', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
+          doc.text('—',        tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
+          black();
+        }
+        y += 13;
+      }
+
+      // 7. ALERTAS (Fix 3 — indicar lojas com margem negativa)
+      y += 10;
+      sep(y, 0.3);
+      y += 9;
+      doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
+      ds(ML, y, 'ALERTAS DO PERIODO');
+      y += 12;
+      sep(y, 0.3);
+      y += 12;
+
+      const alertTxtX = ML + 28;
+      const negMarginText = totalNegMargin > 0
+        ? `${totalNegMargin} produto(s) com margem negativa` +
+          (storesWithNegMargin.length > 0 ? ` — lojas: ${storesWithNegMargin.join(', ')}` : '')
+        : '0 produtos com margem negativa';
+
+      const alertas = [
+        { warn: totalNegMargin > 0,         prefix: '!',  text: negMarginText },
+        { warn: d.orphanCount > 0,          prefix: '!',  text: `${d.orphanCount} produto(s) sem custo cadastrado — lucro nao calculado` },
+        { warn: parseFloat(returnPct) > 2,  prefix: 'OK', text: `Taxa de devolucao: ${returnPct}% (normal < 2%)` },
+        { warn: parseFloat(cancelPct) > 15, prefix: 'OK', text: `Taxa de cancelamento: ${cancelPct}% (normal < 15%)` },
+      ];
+      for (const a of alertas) {
+        const fn  = a.warn ? 'Helvetica-Bold' : 'Helvetica';
+        const clr = a.warn ? [0, 0, 0] : [100, 100, 100];
+        doc.font(fn).fontSize(9).fillColor(clr);
+        ds(ML, y, a.prefix);
+        ds(alertTxtX, y, a.text);
+        y += 14;
+      }
+      black();
+
+      // FOOTER página 1
+      const footerLineY = H - 32;
+      sep(footerLineY, 0.3);
       fc(140, 140, 140);
       doc.font('Helvetica').fontSize(8);
-      ds(ML, y, '* Produtos sem custo cadastrado — lucro estimado sem deducao de CMV');
+      ds(ML, footerLineY + 6, '* Valores calculados em tempo real — sem fechamento consolidado');
+      drs(MR, footerLineY + 6, `EcomZero Hub  |  Gerado em ${fmtDateTime(new Date())}`);
       black();
-      y += 13;
-    }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // 5. PERDAS DO PERÍODO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 8;
-    sep(y, 0.3);
-    y += 9;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-    ds(ML, y, 'PERDAS DO PERIODO');
-
-    y += 12;
-    sep(y, 0.3);
-
-    y += 12;
-    const pdL2 = 280, pdV1 = 185;
-    doc.font('Helvetica').fontSize(9).fillColor('black');
-    ds(ML, y, 'Cancelamentos:');
-    doc.font('Helvetica-Bold'); drs(pdV1, y, `${d.cancelledOrders} pedidos`);
-    doc.font('Helvetica'); ds(pdL2, y, 'GMV perdido:');
-    doc.font('Helvetica-Bold'); drs(MR, y, fmtBRLpdf(d.cancelledGmv));
-
-    y += 14;
-    doc.font('Helvetica').fillColor('black');
-    ds(ML, y, 'Devolucoes:');
-    doc.font('Helvetica-Bold'); drs(pdV1, y, `${d.returnedOrders} pedidos`);
-    doc.font('Helvetica'); ds(pdL2, y, 'Valor devolvido:');
-    doc.font('Helvetica-Bold'); drs(MR, y, fmtBRLpdf(d.returnedValue));
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 6. TOP 10 PRODUTOS DO PERÍODO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 22;
-    sep(y, 0.3);
-    y += 9;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-    ds(ML, y, 'TOP 10 PRODUTOS DO PERIODO');
-
-    y += 12;
-    sep(y, 0.3);
-
-    y += 12;
-    // Colunas (x = posição direita para right-align; nome = left-start)
-    const tNx  = ML + 20;  // nome left-start
-    const tPED = 342;       // PED. right
-    const tGMV = 418;       // GMV right
-    const tLUC = 492;       // LUCRO right
-    const tMAR = MR;        // MARG. right
-
-    fc(100, 100, 100);
-    doc.font('Helvetica-Bold').fontSize(8.5);
-    ds(ML, y, '#');
-    ds(tNx, y, 'PRODUTO');
-    doc.text('PED.',  tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
-    doc.text('GMV',   tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
-    doc.text('LUCRO', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
-    doc.text('MARG.', tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
-    black();
-
-    y += 10;
-    sep(y, 0.3);
-    y += 5;
-
-    doc.font('Helvetica').fontSize(9);
-    for (let i = 0; i < top10.length; i++) {
-      const g = top10[i];
-      black();
-      ds(ML, y, String(i + 1));
-      ds(tNx, y, trunc(g.productName, 46));
-      doc.text(String(g.orderCount), tPED - 35, y, { width: 35, align: 'right', lineBreak: false });
-      doc.text(fmtBRLpdf(g.gmv),     tGMV - 68, y, { width: 68, align: 'right', lineBreak: false });
-      if (g.hasCost) {
-        black();
-        doc.text(fmtBRLpdf(g.grossProfit), tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
-        doc.text(`${g.margin.toFixed(1)}%`, tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
-      } else {
-        fc(140, 140, 140);
-        doc.text('s/ custo', tLUC - 65, y, { width: 65, align: 'right', lineBreak: false });
-        doc.text('—',        tMAR - 52, y, { width: 52, align: 'right', lineBreak: false });
-        black();
+      // ── PÁGINAS 2+: uma por loja ──────────────────────────────────────────
+      for (const { store: s, data: sd } of storeResults) {
+        doc.addPage();
+        renderStoreSection(doc, s, sd, month, { isClosed: false, closedAt: null });
       }
-      y += 13;
     }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 7. ALERTAS DO PERÍODO
-    // ══════════════════════════════════════════════════════════════════════════
-    y += 10;
-    sep(y, 0.3);
-    y += 9;
-    doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-    ds(ML, y, 'ALERTAS DO PERIODO');
-
-    y += 12;
-    sep(y, 0.3);
-
-    y += 12;
-    const alertTxtX = ML + 28;
-    const alertas = [
-      { warn: negMargin > 0,              prefix: '!',  text: `${negMargin} produto(s) com margem negativa` },
-      { warn: d.orphanCount > 0,          prefix: '!',  text: `${d.orphanCount} produto(s) sem custo cadastrado — lucro nao calculado` },
-      { warn: parseFloat(returnPct) > 2,  prefix: 'OK', text: `Taxa de devolucao: ${returnPct}% (normal < 2%)` },
-      { warn: parseFloat(cancelPct) > 15, prefix: 'OK', text: `Taxa de cancelamento: ${cancelPct}% (normal < 15%)` },
-    ];
-    for (const a of alertas) {
-      const fn  = a.warn ? 'Helvetica-Bold' : 'Helvetica';
-      const clr = a.warn ? [0, 0, 0] : [100, 100, 100];
-      doc.font(fn).fontSize(9).fillColor(clr);
-      ds(ML, y, a.prefix);
-      doc.font(fn).fontSize(9).fillColor(clr);
-      ds(alertTxtX, y, a.text);
-      y += 14;
-    }
-    black();
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // 8. FOOTER
-    // ══════════════════════════════════════════════════════════════════════════
-    const footerLineY = H - 32;
-    sep(footerLineY, 0.3);
-    fc(140, 140, 140);
-    doc.font('Helvetica').fontSize(8);
-    if (!isClosed) {
-      ds(ML, footerLineY + 6, '* Valores nao finalizados — fechamento ainda aberto');
-    }
-    drs(MR, footerLineY + 6, `EcomZero Hub  |  Gerado em ${fmtDateTime(new Date())}`);
-    black();
 
     doc.flushPages();
     doc.end();
