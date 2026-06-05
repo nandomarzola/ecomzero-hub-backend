@@ -1,16 +1,14 @@
 const { z } = require('zod');
 const prisma = require('../lib/prisma');
+const { recalculateStoreRates } = require('../services/storeRatesService');
 
 const storeSchema = z.object({
   name: z.string().min(1, 'Nome obrigatório'),
   marketplace: z.enum(['shopee', 'mercadolivre', 'tiktok', 'shein'], {
     errorMap: () => ({ message: 'Marketplace deve ser: shopee, mercadolivre, tiktok ou shein' }),
   }),
-  commission:      z.number().min(0).max(100).optional(),
-  serviceFee:      z.number().min(0).max(100).optional(),
-  taxType:         z.enum(['mei', 'simples', 'lucro_presumido']).optional(),
-  taxRate:         z.number().min(0).max(100).optional(),
-  fixedFeePerItem: z.number().min(0).optional(),
+  taxType: z.enum(['mei', 'simples', 'lucro_presumido']).optional(),
+  taxRate: z.number().min(0).max(100).optional(),
 });
 
 async function list(req, res) {
@@ -72,4 +70,18 @@ async function remove(req, res) {
   return res.json({ message: 'Loja removida' });
 }
 
-module.exports = { list, get, create, update, remove };
+async function getRates(req, res) {
+  const store = await prisma.store.findFirst({
+    where: { id: req.params.id, userId: req.userId },
+  });
+  if (!store) return res.status(404).json({ error: 'Loja não encontrada' });
+
+  const rates = await prisma.storeRate.findMany({
+    where:   { storeId: req.params.id },
+    orderBy: [{ year: 'desc' }, { month: 'desc' }],
+    take:    6,
+  });
+  return res.json({ rates });
+}
+
+module.exports = { list, get, create, update, remove, getRates };

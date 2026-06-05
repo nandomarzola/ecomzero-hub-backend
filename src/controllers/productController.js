@@ -2,6 +2,7 @@ const { z } = require('zod');
 const prisma = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 const { getShopeeRates, calcOrderProfit } = require('../services/calculatorService');
+const { recalculateStoreRates } = require('../services/storeRatesService');
 
 const productSchema = z.object({
   storeId:    z.string().uuid('storeId inválido'),
@@ -351,20 +352,39 @@ async function exportPdf(req, res) {
       orderBy: { name: 'asc' },
     });
 
+    // Pré-busca a última StoreRate de cada loja envolvida
+    const storeIds = [...new Set(products.map((p) => p.storeId))];
+    const latestRatesArr = await Promise.all(
+      storeIds.map((sid) =>
+        prisma.storeRate.findFirst({
+          where:   { storeId: sid },
+          orderBy: [{ year: 'desc' }, { month: 'desc' }],
+        }).then((r) => [sid, r])
+      )
+    );
+    const latestRateMap = new Map(latestRatesArr);
+
     // ── helpers ───────────────────────────────────────────────────────────────
     const brl = (n) => 'R$' + Math.abs(parseFloat(n)).toFixed(2).replace('.', ',');
     const neg = (v, label) => label; // negativo indicado apenas por negrito
 
     function calcDescontos(sp, product, store) {
       if (!sp || sp <= 0 || !product.costPrice || product.costPrice <= 0) return null;
-      const rates     = store.marketplace?.toLowerCase() === 'shopee'
-                      ? getShopeeRates(sp)
-                      : { commissionPct: store.commission ?? 0, fixedFee: parseFloat(store.fixedFeePerItem || 0) };
-      const comissao  = sp * (rates.commissionPct / 100);
-      const taxaFixa  = rates.fixedFee;
+      const mp    = (store.marketplace ?? '').toLowerCase();
+      let commissionPct, fixedFee;
+      if (mp === 'shopee') {
+        const r = getShopeeRates(sp);
+        commissionPct = r.commissionPct;
+        fixedFee      = r.fixedFee;
+      } else {
+        const latestRate = latestRateMap.get(store.id);
+        commissionPct = latestRate ? parseFloat(latestRate.avgCommissionRate) : 0;
+        fixedFee      = 0;
+      }
+      const comissao  = sp * (commissionPct / 100);
       const imposto   = sp * ((store.taxRate ?? 0) / 100);
       const embalagem = parseFloat(product.packaging || 0);
-      const totalDesc = comissao + taxaFixa + imposto + embalagem;
+      const totalDesc = comissao + fixedFee + imposto + embalagem;
       const lucro     = sp - parseFloat(product.costPrice) - totalDesc;
       const margem    = sp > 0 ? (lucro / sp) * 100 : 0;
       return { totalDesc, lucro, margem };

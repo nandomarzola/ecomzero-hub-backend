@@ -31,11 +31,8 @@ model Store {
   user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   name            String
   marketplace     String
-  commission      Float     @default(14.0)
-  serviceFee      Float     @default(2.0)
   taxType         String    @default("mei")
   taxRate         Float     @default(5.0)
-  fixedFeePerItem Float     @default(0)
   createdAt       DateTime  @default(now())
   mlAccessToken    String?
   mlRefreshToken   String?
@@ -53,6 +50,7 @@ model Store {
   bills            Bill[]
   shopeeSummaries  ShopeePeriodSummary[]
   monthlyClosings  MonthlyClosing[]
+  storeRates       StoreRate[]
 }
 
 model Product {
@@ -341,6 +339,25 @@ model MonthlyClosing {
   productsSnapshot Json
 
   @@unique([storeId, periodMonth])
+}
+
+model StoreRate {
+  id                Int      @id @default(autoincrement())
+  storeId           String
+  store             Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  month             Int
+  year              Int
+  totalOrders       Int      @default(0)
+  avgCommissionRate Decimal  @db.Decimal(8, 4)
+  avgServiceFeeRate Decimal  @db.Decimal(8, 4)
+  avgShippingFee    Decimal  @db.Decimal(10, 2)
+  effectiveRate     Decimal  @db.Decimal(8, 4)
+  totalGmv          Decimal  @db.Decimal(12, 2)
+  totalNetRevenue   Decimal  @db.Decimal(12, 2)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([storeId, month, year])
 }
 
 model ShopeePeriodSummary {

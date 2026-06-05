@@ -2,6 +2,7 @@ const XLSX           = require('xlsx');
 const { randomUUID } = require('crypto');
 const prisma         = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
+const { recalculateStoreRates } = require('./storeRatesService');
 
 function r2(n) { return Math.round(n * 100) / 100; }
 
@@ -319,6 +320,8 @@ async function importSheinOrderAll(filePath, storeId, userId, originalFilename, 
     create: { storeId, month: periodMonth, gmv: parseFloat(gmv.toFixed(2)), shopeeDeductions: parseFloat(deductions.toFixed(2)), netRevenue: parseFloat(netRevenue.toFixed(2)), tax: parseFloat(tax.toFixed(2)), grossProfit: parseFloat(grossProfit.toFixed(2)), margin, validCount, unitCount, cancelledCount, cancelledGmv: parseFloat(cancelledGmv.toFixed(2)) },
     update: { gmv: parseFloat(gmv.toFixed(2)), shopeeDeductions: parseFloat(deductions.toFixed(2)), netRevenue: parseFloat(netRevenue.toFixed(2)), tax: parseFloat(tax.toFixed(2)), grossProfit: parseFloat(grossProfit.toFixed(2)), margin, validCount, unitCount, cancelledCount, cancelledGmv: parseFloat(cancelledGmv.toFixed(2)) },
   });
+
+  await recalculateStoreRates(storeId, mon, year).catch(() => {});
 
   await onProgress?.({ pct: 100, message: 'Concluído!' });
 
