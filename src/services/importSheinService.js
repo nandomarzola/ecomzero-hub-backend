@@ -62,9 +62,16 @@ async function importSheinOrderAll(filePath, storeId, userId, originalFilename, 
 
   await onProgress?.({ pct: 8, message: 'Lendo arquivo...' });
 
-  const workbook = XLSX.readFile(filePath, { raw: false });
-  const rows     = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: '' });
-  if (rows.length === 0) throw new Error('Arquivo vazio ou sem dados');
+  const workbook  = XLSX.readFile(filePath, { raw: false });
+  // Shein exports have 2 header rows: row 1 = group labels, row 2 = real column names, row 3+ = data
+  const rawRows   = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1, defval: '' });
+  if (rawRows.length < 3) throw new Error('Arquivo vazio ou sem dados');
+  const headers = rawRows[1].map((h) => String(h || '').trim());
+  const rows    = rawRows.slice(2).map((rowArr) => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = rowArr[i] ?? ''; });
+    return obj;
+  });
 
   const periodMonth  = extractMonth(rows, originalFilename);
   const [year, mon]  = periodMonth.split('-').map(Number);
