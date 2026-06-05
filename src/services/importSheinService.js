@@ -13,17 +13,35 @@ function parseNum(v) {
 
 function parseDate(v) {
   if (!v) return null;
-  const s = String(v).trim();
+  let s = String(v).trim();
   if (!s) return null;
-  const d = new Date(s.replace(' ', 'T') + (s.includes(':') ? ':00.000Z' : 'T00:00:00.000Z'));
+  // DD/MM/YYYY → YYYY-MM-DD
+  s = s.replace(/^(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
+  s = s.replace(' ', 'T');
+  if (/T\d{2}:\d{2}$/.test(s))       s += ':00.000Z';
+  else if (/T\d{2}:\d{2}:\d{2}$/.test(s)) s += '.000Z';
+  else if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += 'T00:00:00.000Z';
+  const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
 
+const PT_MONTHS = { janeiro:1, fevereiro:2, marco:3, marco3:'março', abril:4, maio:5, junho:6, julho:7, agosto:8, setembro:9, outubro:10, novembro:11, dezembro:12 };
+
 function extractMonth(rows, fallbackFilename) {
-  const m = String(fallbackFilename || '').match(/(\d{4})(\d{2})\d{2}/);
+  // Tentar nome de mês em português no filename: "junho+2026", "junho 2026"
+  const fn = String(fallbackFilename || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[+_]/g, ' ');
+  const yearInFn = (fn.match(/\b(20\d{2})\b/) || [])[1];
+  if (yearInFn) {
+    for (const [name, num] of Object.entries({ janeiro:1, fevereiro:2, marco:3, abril:4, maio:5, junho:6, julho:7, agosto:8, setembro:9, outubro:10, novembro:11, dezembro:12 })) {
+      if (fn.includes(name)) return `${yearInFn}-${String(num).padStart(2, '0')}`;
+    }
+  }
+  // YYYYMMDD com ano e mês realistas (2020-2099, mês 01-12)
+  const m = String(fallbackFilename || '').match(/\b(20\d{2})(0[1-9]|1[0-2])\d{2}\b/);
   if (m) return `${m[1]}-${m[2]}`;
+  // Extrair de datas nas primeiras linhas
   for (const row of rows.slice(0, 20)) {
-    const d = parseDate(String(row['Data e hora de criação do pedido'] || '').trim());
+    const d = parseDate(String(row['Data e hora de criação do pedido'] || row['Data de criação do pedido'] || '').trim());
     if (d) return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   }
   const now = new Date();
@@ -31,9 +49,10 @@ function extractMonth(rows, fallbackFilename) {
 }
 
 function classifyStatus(raw) {
-  const s = (raw || '').toLowerCase();
-  if (s.includes('entregue'))                          return 'valid';
-  if (s.includes('cancelar') || s.includes('cancel'))  return 'cancelled_other';
+  // Normalizar removendo acentos para comparar "Concluído" → "concluido"
+  const s = (raw || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (s.includes('concluido') || s.includes('entregue'))  return 'valid';
+  if (s.includes('cancelar')  || s.includes('cancel'))    return 'cancelled_other';
   return 'pending';
 }
 
