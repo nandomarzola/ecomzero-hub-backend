@@ -84,9 +84,9 @@ async function doRecalculate(jobId, userId, all, months) {
       const taxRate  = order.store?.taxRate ?? 0;
 
       const marketplace = order.store?.marketplace ?? 'shopee';
-      // ML: usa a taxa real gravada pela API (shopeeCommission = sale_fee do ML)
+      // ML: usa a taxa real gravada pela API (platformCommission = sale_fee do ML)
       // Shopee: recalcula pelos tiers de preço
-      const precomputedFee = marketplace === 'mercadolivre' ? (order.shopeeCommission ?? null) : null;
+      const precomputedFee = marketplace === 'mercadolivre' ? (order.platformCommission ?? null) : null;
 
       const calc = calcOrderProfit({
         agreedPrice:   order.agreedPrice,

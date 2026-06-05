@@ -134,8 +134,8 @@ model Order {
   quantity      Int      @default(1)
 
   // ── Custos Shopee (do arquivo — para referência, NÃO usado no cálculo) ───
-  shopeeCommission Float  @default(0)
-  shopeeServiceFee Float  @default(0)
+  platformCommission Float  @default(0)
+  platformServiceFee Float  @default(0)
   sellerCoupon     Float  @default(0)
   sellerDiscount   Float  @default(0)
   lmmDiscount      Float  @default(0)

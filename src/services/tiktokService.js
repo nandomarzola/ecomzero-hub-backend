@@ -205,7 +205,7 @@ function convertTTOrder(ttOrder, detail, storeId, importId, store) {
     variationName: item.sku_name ?? null,
     productId:     null,
     originalPrice: agreedPrice, agreedPrice, quantity,
-    shopeeCommission: ttFee, shopeeServiceFee: 0,
+    platformCommission: ttFee, platformServiceFee: 0,
     sellerCoupon: r2(parseFloat(payment.seller_discount ?? 0)),
     sellerDiscount: 0, lmmDiscount: 0,
     globalTotal:  r2(parseFloat(payment.total_amount ?? gmv)),

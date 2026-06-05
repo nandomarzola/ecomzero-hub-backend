@@ -161,25 +161,30 @@ function categoryToStatus(cat) {
 // productId: já resolvido pelo controller via itemMap (externalId → product.id)
 // sellerShippingCost: frete que o VENDEDOR paga = ratio - gap_discount - buyer_shipping
 function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sellerShippingCost = 0) {
-  const item       = mlOrder.order_items?.[0];
-  const payment    = mlOrder.payments?.[0];
-  const shipping   = mlOrder.shipping;
+  const item     = mlOrder.order_items?.[0];
+  const payments = mlOrder.payments ?? [];
+  const shipping = mlOrder.shipping;
 
   const agreedPrice  = r2(item?.unit_price ?? 0);
   const quantity     = item?.quantity ?? 1;
   const gmv          = r2(agreedPrice * quantity);
 
   // ML fornece o valor real da taxa no campo sale_fee
-  const saleFee      = r2(item?.sale_fee ?? 0);
-  const freight      = r2(sellerShippingCost ?? 0); // frete que o VENDEDOR paga
+  const saleFee  = r2(item?.sale_fee ?? 0);
+  const freight  = r2(sellerShippingCost ?? 0); // frete que o VENDEDOR paga
 
-  // Taxa de parcelamento: cobrada pelo ML quando comprador paga parcelado
+  // Soma todos os payments para cobrir pedidos com múltiplos pagamentos (renegociações, split)
   // total_paid_amount = o que o comprador pagou (com acréscimo de parcelamento)
-  // paid_amount = o que o ML credita ao pedido (sem o acréscimo)
-  // diferença = taxa de parcelamento descontada do vendedor
-  const totalPaid    = r2(payment?.total_paid_amount ?? 0);
-  const paidAmount   = r2(mlOrder.paid_amount ?? 0);
-  const installmentFee = r2(Math.max(0, totalPaid - paidAmount));
+  // total_amount      = o que o ML credita ao vendedor por esse payment (sem acréscimo)
+  const totalPaid  = r2(payments.reduce((s, p) => s + (p.total_paid_amount ?? 0), 0));
+  const paidAmount = r2(payments.reduce((s, p) => s + (p.total_amount      ?? 0), 0));
+
+  // financing_fee = campo direto da taxa de parcelamento quando disponível na API ML
+  // Fallback: diferença entre o que o comprador pagou e o que o ML creditou ao vendedor
+  const hasFinancingFee = payments.length > 0 && payments.every((p) => p.financing_fee !== undefined);
+  const installmentFee  = r2(hasFinancingFee
+    ? payments.reduce((s, p) => s + (p.financing_fee ?? 0), 0)
+    : Math.max(0, totalPaid - paidAmount));
 
   // Total de deduções do marketplace
   const totalMarketplaceFee = r2(saleFee + freight + installmentFee);
@@ -197,9 +202,11 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
   const title       = item?.item?.title ?? '';
   const listingType = item?.listing_type_id ?? item?.item?.listing_type_id ?? null;
 
-  const createdAt   = mlOrder.date_created   ? new Date(mlOrder.date_created)   : null;
-  const paidAt      = payment?.date_approved  ? new Date(payment.date_approved)  : null;
-  const deliveredAt = mlOrder.date_last_updated ? new Date(mlOrder.date_last_updated) : null;
+  const createdAt   = mlOrder.date_created            ? new Date(mlOrder.date_created)              : null;
+  const paidAt      = payments[0]?.date_approved      ? new Date(payments[0].date_approved)          : null;
+  // date_closed = conclusão da transação (entrega, cancelamento, disputa encerrada)
+  // date_last_updated seria qualquer modificação, não a data de conclusão
+  const deliveredAt = mlOrder.date_closed ? new Date(mlOrder.date_closed) : null;
   const soldAt      = paidAt ?? createdAt ?? new Date();
 
   return {
@@ -208,7 +215,9 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
     orderId:       String(mlOrder.id),
     orderStatus:   mlOrder.status,
     orderCategory,
-    cancelReason:  null,
+    // cancel_detail é objeto { description, code } em pedidos cancelados por fluxo normal
+    // cancel_reason é string direta em alguns contextos da API ML
+    cancelReason:  mlOrder.cancel_detail?.description || mlOrder.cancel_reason || null,
     returnStatus:  null,
     skuPrincipal:  sku,
     skuVariacao:   sku,
@@ -218,8 +227,8 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
     originalPrice: agreedPrice,
     agreedPrice,
     quantity,
-    shopeeCommission: saleFee,
-    shopeeServiceFee: 0,
+    platformCommission: saleFee,
+    platformServiceFee: 0,
     sellerCoupon:     0,
     sellerDiscount:   0,
     lmmDiscount:      0,
@@ -299,7 +308,7 @@ async function fetchItemIds(accessToken, sellerId) {
 
 // ── Buscar detalhes de itens em lotes de 20 ────────────────────────────────────
 async function fetchItemDetails(accessToken, itemIds) {
-  const attrs = 'id,title,price,listing_type_id,seller_sku,seller_custom_field,available_quantity,thumbnail,permalink,variations,category_id,status,attributes';
+  const attrs = 'id,title,price,sale_fee,listing_type_id,seller_sku,seller_custom_field,available_quantity,thumbnail,permalink,variations,category_id,status,attributes';
   const items = [];
 
   for (let i = 0; i < itemIds.length; i += 20) {

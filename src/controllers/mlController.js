@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
-const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchItemFees, fetchShippingCosts } = require('../services/mlService');
+const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchShippingCosts, listingTypeLabel } = require('../services/mlService');
+const { recalculateOrdersForStore } = require('../services/recalculateService');
 
 const FRONTEND_URL = process.env.ML_FRONTEND_URL || 'http://localhost:5173';
 
@@ -221,6 +222,9 @@ async function syncOrders(req, res) {
       saved += result.count;
     }
 
+    // Aplica costPrice dos produtos vinculados nos pedidos recém-importados
+    await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
+
     // 7. Totais
     const valid     = ordersData.filter(o => o.orderCategory === 'valid').length;
     const pending   = ordersData.filter(o => o.orderCategory === 'pending').length;
@@ -266,11 +270,8 @@ async function syncItems(req, res) {
     const itemIds = await fetchItemIds(accessToken, store.mlSellerId);
     if (!itemIds.length) return res.json({ synced: 0, message: 'Nenhum anúncio ativo encontrado' });
 
-    // 2. Detalhes em lotes de 20
+    // 2. Detalhes em lotes de 20 (sale_fee já incluído nos attrs de fetchItemDetails)
     const items = await fetchItemDetails(accessToken, itemIds);
-
-    // 3. Taxas reais por item
-    const feesMap = await fetchItemFees(accessToken, itemIds);
 
     let synced = 0;
     let created = 0;
@@ -279,10 +280,20 @@ async function syncItems(req, res) {
     for (const item of items) {
       if (!item?.id) continue;
 
-      const fees        = feesMap[item.id] ?? {};
       const listingType = item.listing_type_id ?? null;
-      const feeRate     = fees.saleFeeRate ?? null;
       const mlStatus    = item.status ?? null;
+
+      // Derivar mlFeeRate: sale_fee do /items se disponível (já um percentual, ex: 11.0),
+      // senão usa a taxa hardcoded do tipo de anúncio como fallback
+      let feeRate = null;
+      const rawFee = item.sale_fee;
+      if (rawFee != null) {
+        const numFee = typeof rawFee === 'object' ? (rawFee.value ?? 0) : Number(rawFee);
+        feeRate = numFee > 0 && numFee <= 100 ? numFee : null;
+      }
+      if (feeRate == null) {
+        feeRate = listingTypeLabel(listingType).feeRate ?? null;
+      }
       const skuFromAttr = item.attributes?.find(a => a.id === 'SELLER_SKU')?.value_name ?? null;
       const sku = item.seller_sku ?? item.seller_custom_field ?? skuFromAttr ?? null;
 

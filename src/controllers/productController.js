@@ -793,7 +793,7 @@ async function saveAndRecalc(req, res) {
     // 2. Buscar todos os pedidos vinculados a este produto
     const orders = await prisma.order.findMany({
       where: { productId },
-      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, shopeeCommission: true, listingType: true, mlShippingCost: true, mlInstallmentFee: true },
+      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, platformCommission: true, listingType: true, mlShippingCost: true, mlInstallmentFee: true },
     });
 
     // 3. Recalcular cada pedido
@@ -805,7 +805,7 @@ async function saveAndRecalc(req, res) {
       const mlFrete        = o.mlShippingCost   ?? 0;
       const mlParcelamento = o.mlInstallmentFee ?? 0;
       const precomputedFee = marketplace === 'mercadolivre'
-        ? Math.round(((o.shopeeCommission ?? 0) + mlFrete + mlParcelamento) * 100) / 100
+        ? Math.round(((o.platformCommission ?? 0) + mlFrete + mlParcelamento) * 100) / 100
         : null;
       const calc = calcOrderProfit({
         agreedPrice:   o.agreedPrice,

@@ -17,7 +17,7 @@ async function recalculateStoreRates(storeId, month, year) {
       calcGmv:         true,
       calcNetRevenue:  true,
       calcShopeeFee:   true,
-      shopeeServiceFee: true,
+      platformServiceFee: true,
     },
   });
 
@@ -27,7 +27,7 @@ async function recalculateStoreRates(storeId, month, year) {
   const totalGmv        = orders.reduce((s, o) => s + (o.calcGmv        ?? 0), 0);
   const totalNetRevenue = orders.reduce((s, o) => s + (o.calcNetRevenue  ?? 0), 0);
   const totalFee        = orders.reduce((s, o) => s + (o.calcShopeeFee   ?? 0), 0);
-  const totalSvcFee     = orders.reduce((s, o) => s + (o.shopeeServiceFee ?? 0), 0);
+  const totalSvcFee     = orders.reduce((s, o) => s + (o.platformServiceFee ?? 0), 0);
 
   const avgCommissionRate = totalGmv > 0 ? r4((totalFee    / totalGmv) * 100) : 0;
   const avgServiceFeeRate = totalGmv > 0 ? r4((totalSvcFee / totalGmv) * 100) : 0;
