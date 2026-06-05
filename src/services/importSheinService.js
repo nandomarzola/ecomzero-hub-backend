@@ -11,29 +11,39 @@ function parseNum(v) {
   return parseFloat(String(v).trim().replace(',', '.')) || 0;
 }
 
+const PT_MONTH_NUM = { janeiro:'01',fevereiro:'02',marco:'03',abril:'04',maio:'05',junho:'06',julho:'07',agosto:'08',setembro:'09',outubro:'10',novembro:'11',dezembro:'12' };
+
+function stripAccents(s) { return s.normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+
 function parseDate(v) {
   if (!v) return null;
   let s = String(v).trim();
   if (!s) return null;
+  // "05 junho 2026 10:40" or "5 junho 2026"
+  const ptMatch = s.match(/^(\d{1,2})\s+([a-záéíóúâêîôûãõç]+)\s+(\d{4})(?:\s+(\d{2}:\d{2}(?::\d{2})?))?/i);
+  if (ptMatch) {
+    const mon = PT_MONTH_NUM[stripAccents(ptMatch[2].toLowerCase())];
+    if (mon) {
+      const time = ptMatch[4] ? (ptMatch[4].split(':').length === 2 ? ptMatch[4] + ':00' : ptMatch[4]) : '00:00:00';
+      return new Date(`${ptMatch[3]}-${mon}-${ptMatch[1].padStart(2,'0')}T${time}.000Z`);
+    }
+  }
   // DD/MM/YYYY → YYYY-MM-DD
   s = s.replace(/^(\d{2})\/(\d{2})\/(\d{4})/, '$3-$2-$1');
   s = s.replace(' ', 'T');
-  if (/T\d{2}:\d{2}$/.test(s))       s += ':00.000Z';
+  if (/T\d{2}:\d{2}$/.test(s))            s += ':00.000Z';
   else if (/T\d{2}:\d{2}:\d{2}$/.test(s)) s += '.000Z';
   else if (/^\d{4}-\d{2}-\d{2}$/.test(s)) s += 'T00:00:00.000Z';
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
 
-const PT_MONTHS = { janeiro:1, fevereiro:2, marco:3, marco3:'março', abril:4, maio:5, junho:6, julho:7, agosto:8, setembro:9, outubro:10, novembro:11, dezembro:12 };
-
 function extractMonth(rows, fallbackFilename) {
-  // Tentar nome de mês em português no filename: "junho+2026", "junho 2026"
-  const fn = String(fallbackFilename || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[+_]/g, ' ');
+  const fn = stripAccents(String(fallbackFilename || '').toLowerCase()).replace(/[+_]/g, ' ');
   const yearInFn = (fn.match(/\b(20\d{2})\b/) || [])[1];
   if (yearInFn) {
-    for (const [name, num] of Object.entries({ janeiro:1, fevereiro:2, marco:3, abril:4, maio:5, junho:6, julho:7, agosto:8, setembro:9, outubro:10, novembro:11, dezembro:12 })) {
-      if (fn.includes(name)) return `${yearInFn}-${String(num).padStart(2, '0')}`;
+    for (const [name, num] of Object.entries(PT_MONTH_NUM)) {
+      if (fn.includes(name)) return `${yearInFn}-${num}`;
     }
   }
   // YYYYMMDD com ano e mês realistas (2020-2099, mês 01-12)
@@ -49,8 +59,7 @@ function extractMonth(rows, fallbackFilename) {
 }
 
 function classifyStatus(raw) {
-  // Normalizar removendo acentos para comparar "Concluído" → "concluido"
-  const s = (raw || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  const s = stripAccents((raw || '').toLowerCase());
   if (s.includes('concluido') || s.includes('entregue'))  return 'valid';
   if (s.includes('cancelar')  || s.includes('cancel'))    return 'cancelled_other';
   return 'pending';
