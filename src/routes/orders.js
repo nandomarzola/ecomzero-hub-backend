@@ -2,7 +2,7 @@ const express  = require('express');
 const multer   = require('multer');
 const router   = express.Router();
 const { authMiddleware } = require('../middleware/auth');
-const { importOrders, importStatus, importSheinOrders, getClosing, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport } = require('../controllers/orderController');
+const { importOrders, importStatus, importSheinOrders, importTiktokOrders, getClosing, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport } = require('../controllers/orderController');
 
 const upload = multer({
   dest: process.env.UPLOAD_DIR || './uploads/',
@@ -15,8 +15,18 @@ const upload = multer({
   },
 });
 
-router.post('/import',            authMiddleware, upload.single('file'), importOrders);
-router.post('/import-shein',      authMiddleware, upload.single('file'), importSheinOrders);
+const uploadCsv = multer({
+  dest: process.env.UPLOAD_DIR || './uploads/',
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.csv$/i.test(file.originalname) || file.mimetype.includes('csv') || file.mimetype.includes('text');
+    ok ? cb(null, true) : cb(new Error('Apenas arquivos .csv são aceitos'));
+  },
+});
+
+router.post('/import',            authMiddleware, upload.single('file'),    importOrders);
+router.post('/import-shein',      authMiddleware, upload.single('file'),    importSheinOrders);
+router.post('/import-tiktok',     authMiddleware, uploadCsv.single('file'), importTiktokOrders);
 router.get('/import/:jobId',      authMiddleware, importStatus);
 router.post('/recalculate',          authMiddleware, recalculateOrders);
 router.get('/recalculate/:jobId',    authMiddleware, recalculateStatus);

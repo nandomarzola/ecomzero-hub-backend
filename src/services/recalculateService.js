@@ -44,6 +44,14 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       platformNetRevenue = r2((order.globalTotal ?? 0) - (order.platformCommission ?? 0) - (order.platformServiceFee ?? 0));
     } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {
       platformNetRevenue = r2(order.orderTotal);
+    } else if (marketplace === 'tiktok' && (order.orderTotal ?? 0) > 0) {
+      // orderTotal = subtotalAfterDiscount; platformCommission = commission+paymentFee; mlShippingCost = shippingSellerCost
+      platformNetRevenue = r2(
+        (order.orderTotal ?? 0)
+        - (order.platformCommission ?? 0)
+        - mlFrete
+        - (order.sellerDiscount ?? 0)
+      );
     }
 
     const calc = calcOrderProfit({

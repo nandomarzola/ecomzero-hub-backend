@@ -4,6 +4,7 @@ const { recalculateQueue, recalcProgress } = require('../services/recalculateQue
 const { recalculateOrdersForStore }       = require('../services/recalculateService');
 const { importShopeeOrderAll } = require('../services/importOrderAll');
 const { importSheinOrderAll }  = require('../services/importSheinService');
+const { importTiktokOrderAll } = require('../services/importTiktokService');
 
 function r2(n) { return Math.round(n * 100) / 100; }
 
@@ -604,8 +605,47 @@ async function importSheinOrders(req, res) {
   return res.status(202).json({ jobId: imp.id });
 }
 
+async function importTiktokOrders(req, res) {
+  if (!req.file) return res.status(400).json({ error: 'Arquivo .csv obrigatório' });
+  const { storeId } = req.body;
+  if (!storeId) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(400).json({ error: 'storeId obrigatório' });
+  }
+
+  const imp = await prisma.import.create({
+    data: { storeId, filename: req.file.originalname, periodMonth: '0000-00', totalRows: 0, status: 'processing' },
+  });
+
+  importProgress.set(imp.id, { pct: 2, message: 'Iniciando...' });
+
+  setImmediate(async () => {
+    try {
+      await importTiktokOrderAll(
+        req.file.path,
+        storeId,
+        req.userId,
+        req.file.originalname,
+        (progress) => importProgress.set(imp.id, progress),
+        imp.id,
+      );
+    } catch (err) {
+      console.error('[import-tiktok] erro:', err.message);
+      await prisma.import.update({
+        where: { id: imp.id },
+        data:  { status: 'error', errorMessage: err.message },
+      }).catch(() => {});
+    } finally {
+      importProgress.delete(imp.id);
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+  });
+
+  return res.status(202).json({ jobId: imp.id });
+}
+
 module.exports = {
-  importOrders, importStatus, importSheinOrders,
+  importOrders, importStatus, importSheinOrders, importTiktokOrders,
   getClosing, listOrders, getOrder, deleteOrder,
   recalculateOrders, recalculateStatus, exportOrders, skuReport,
 };
