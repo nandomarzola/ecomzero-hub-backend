@@ -41,7 +41,8 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
 
     let platformNetRevenue = null;
     if (marketplace === 'shopee' && (order.globalTotal ?? 0) > 0) {
-      platformNetRevenue = r2((order.globalTotal ?? 0) - (order.platformCommission ?? 0) - (order.platformServiceFee ?? 0));
+      const cappedGlobal = Math.min(order.globalTotal, (order.agreedPrice ?? 0) * (order.quantity ?? 1));
+      platformNetRevenue = r2(cappedGlobal - (order.platformCommission ?? 0) - (order.platformServiceFee ?? 0));
     } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {
       platformNetRevenue = r2(order.orderTotal);
     } else if (marketplace === 'tiktok' && (order.orderTotal ?? 0) > 0) {

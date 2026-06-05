@@ -250,8 +250,9 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
         bySkuMap.set(skuVar.toLowerCase(), product);
       }
 
-      const platformNetRevenue = globalTotal > 0
-        ? r2(globalTotal - shopeeComm - shopeeFee)
+      const cappedGlobal = globalTotal > 0 ? Math.min(globalTotal, salePrice * quantity) : 0;
+      const platformNetRevenue = cappedGlobal > 0
+        ? r2(cappedGlobal - shopeeComm - shopeeFee)
         : null;
 
       const calc = calcOrderProfit({
