@@ -39,26 +39,34 @@ function getMarketplaceRates(marketplace, unitPrice, listingType) {
 function getShopeeRates(unitPrice) { return getMarketplaceRates('shopee', unitPrice); }
 
 // ── Fonte única de verdade para cálculo de lucro por pedido ──────────────────
-// marketplace: identifica a plataforma — determina como calcular a taxa
-// precomputedFee: quando fornecido (ex: sale_fee da API ML), usa direto sem recalcular
+// platformNetRevenue: receita líquida já calculada pela plataforma (Shopee/Shein)
+//   → quando fornecida, ignora fee calculation e usa diretamente
+// precomputedFee: taxa real da API ML (frete + comissão + parcelamento)
+//   → usado apenas quando platformNetRevenue é null
 function calcOrderProfit({
   agreedPrice,
   quantity,
-  sellerCoupon   = 0,
-  lmmDiscount    = 0,
-  costPrice      = 0,
-  packagingCost  = 0,
-  taxRate        = 0,
-  marketplace    = 'shopee',
-  precomputedFee = null,   // taxa já calculada pela API (pedidos ML via sync)
-  listingType    = null,
+  sellerCoupon      = 0,
+  lmmDiscount       = 0,
+  costPrice         = 0,
+  packagingCost     = 0,
+  taxRate           = 0,
+  marketplace       = 'shopee',
+  precomputedFee    = null,
+  platformNetRevenue = null,
+  listingType       = null,
 }) {
   const gmv = r2(agreedPrice * quantity);
 
-  // Taxa: se veio da API (ML sync) usa diretamente; senão calcula pelo marketplace
   let marketplaceFee;
-  if (precomputedFee !== null && precomputedFee >= 0) {
+  let netRevenue;
+
+  if (platformNetRevenue !== null) {
+    netRevenue     = r2(platformNetRevenue);
+    marketplaceFee = r2(gmv - netRevenue);
+  } else if (precomputedFee !== null && precomputedFee >= 0) {
     marketplaceFee = r2(precomputedFee);
+    netRevenue     = r2(gmv - marketplaceFee - r2(sellerCoupon + lmmDiscount));
   } else {
     const mp = (marketplace ?? 'shopee').toLowerCase();
     if (mp === 'shopee') {
@@ -68,10 +76,9 @@ function calcOrderProfit({
     } else {
       marketplaceFee = 0;
     }
+    netRevenue = r2(gmv - marketplaceFee - r2(sellerCoupon + lmmDiscount));
   }
 
-  const extraFees   = r2(sellerCoupon + lmmDiscount);
-  const netRevenue  = r2(gmv - marketplaceFee - extraFees);
   const taxAmount   = r2(gmv * (taxRate / 100));
   const productCost = r2(costPrice * quantity);
   const packaging   = r2(packagingCost * quantity);
@@ -80,7 +87,7 @@ function calcOrderProfit({
   const hasCost     = costPrice > 0;
 
   return {
-    gmv, shopeeFee: marketplaceFee, marketplaceFee, extraFees,
+    gmv, shopeeFee: marketplaceFee, marketplaceFee,
     netRevenue, taxAmount, productCost, packaging, grossProfit, margin, hasCost,
   };
 }

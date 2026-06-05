@@ -2,7 +2,7 @@ const express  = require('express');
 const multer   = require('multer');
 const router   = express.Router();
 const { authMiddleware } = require('../middleware/auth');
-const { importOrders, importStatus, getClosing, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport } = require('../controllers/orderController');
+const { importOrders, importStatus, importSheinOrders, getClosing, listOrders, getOrder, deleteOrder, recalculateOrders, recalculateStatus, exportOrders, skuReport } = require('../controllers/orderController');
 
 const upload = multer({
   dest: process.env.UPLOAD_DIR || './uploads/',
@@ -16,6 +16,7 @@ const upload = multer({
 });
 
 router.post('/import',            authMiddleware, upload.single('file'), importOrders);
+router.post('/import-shein',      authMiddleware, upload.single('file'), importSheinOrders);
 router.get('/import/:jobId',      authMiddleware, importStatus);
 router.post('/recalculate',          authMiddleware, recalculateOrders);
 router.get('/recalculate/:jobId',    authMiddleware, recalculateStatus);

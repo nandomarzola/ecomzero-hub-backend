@@ -80,6 +80,8 @@ function categoryToStatus(cat) {
   return 'paid';
 }
 
+function r2(n) { return Math.round(n * 100) / 100; }
+
 function chunkArr(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -247,15 +249,19 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
         bySkuMap.set(skuVar.toLowerCase(), product);
       }
 
-      // Calcular lucro
+      const platformNetRevenue = globalTotal > 0
+        ? r2(globalTotal - shopeeComm - shopeeFee)
+        : null;
+
       const calc = calcOrderProfit({
-        agreedPrice:   salePrice,
+        agreedPrice:       salePrice,
         quantity,
         sellerCoupon,
         lmmDiscount,
-        costPrice:     product?.costPrice ?? 0,
-        packagingCost: product?.packaging ?? 0,
-        taxRate:       store.taxRate ?? 0,
+        costPrice:         product?.costPrice ?? 0,
+        packagingCost:     product?.packaging ?? 0,
+        taxRate:           store.taxRate ?? 0,
+        platformNetRevenue,
       });
 
       ordersData.push({

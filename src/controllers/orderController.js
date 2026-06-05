@@ -2,6 +2,7 @@ const fs    = require('fs');
 const prisma = require('../lib/prisma');
 const { recalculateQueue, recalcProgress } = require('../services/recalculateQueue');
 const { importShopeeOrderAll } = require('../services/importOrderAll');
+const { importSheinOrderAll }  = require('../services/importSheinService');
 
 function r2(n) { return Math.round(n * 100) / 100; }
 
@@ -376,26 +377,36 @@ async function recalculateOrders(req, res) {
   const updates = [];
 
   for (const order of orders) {
-    const marketplace    = order.store?.marketplace ?? 'shopee';
+    const marketplace    = (order.store?.marketplace ?? 'shopee').toLowerCase();
     const taxRate        = order.store?.taxRate ?? 0;
-    const mlFrete        = order.mlShippingCost     ?? 0;
-    const mlParcelamento = order.mlInstallmentFee   ?? 0;
-    // Para ML: precomputedFee = comissão + frete vendedor + taxa de parcelamento
+    const mlFrete        = order.mlShippingCost   ?? 0;
+    const mlParcelamento = order.mlInstallmentFee ?? 0;
+
     const precomputedFee = marketplace === 'mercadolivre'
       ? r2((order.shopeeCommission ?? 0) + mlFrete + mlParcelamento)
       : null;
 
+    // Shopee: platformNetRevenue = globalTotal − commission − serviceFee (valores reais do arquivo)
+    // Shein:  orderTotal guarda a receita líquida da plataforma diretamente
+    let platformNetRevenue = null;
+    if (marketplace === 'shopee' && (order.globalTotal ?? 0) > 0) {
+      platformNetRevenue = r2((order.globalTotal ?? 0) - (order.shopeeCommission ?? 0) - (order.shopeeServiceFee ?? 0));
+    } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {
+      platformNetRevenue = r2(order.orderTotal);
+    }
+
     const calc = calcOrderProfit({
-      agreedPrice:   order.agreedPrice,
-      quantity:      order.quantity,
-      sellerCoupon:  order.sellerCoupon,
-      lmmDiscount:   order.lmmDiscount,
-      costPrice:     order.product?.costPrice ?? 0,
-      packagingCost: order.product?.packaging ?? 0,
+      agreedPrice:       order.agreedPrice,
+      quantity:          order.quantity,
+      sellerCoupon:      order.sellerCoupon,
+      lmmDiscount:       order.lmmDiscount,
+      costPrice:         order.product?.costPrice ?? 0,
+      packagingCost:     order.product?.packaging ?? 0,
       taxRate,
       marketplace,
       precomputedFee,
-      listingType:   order.listingType,
+      platformNetRevenue,
+      listingType:       order.listingType,
     });
 
     const isRevenue   = ['valid', 'pending', 'returned_partial'].includes(order.orderCategory);
@@ -616,7 +627,47 @@ async function skuReport(req, res) {
   return res.json({ products, totals });
 }
 
+async function importSheinOrders(req, res) {
+  if (!req.file) return res.status(400).json({ error: 'Arquivo .xlsx obrigatório' });
+  const { storeId } = req.body;
+  if (!storeId) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(400).json({ error: 'storeId obrigatório' });
+  }
+
+  const imp = await prisma.import.create({
+    data: { storeId, filename: req.file.originalname, periodMonth: '0000-00', totalRows: 0, status: 'processing' },
+  });
+
+  importProgress.set(imp.id, { pct: 2, message: 'Iniciando...' });
+
+  setImmediate(async () => {
+    try {
+      await importSheinOrderAll(
+        req.file.path,
+        storeId,
+        req.userId,
+        req.file.originalname,
+        (progress) => importProgress.set(imp.id, progress),
+        imp.id,
+      );
+    } catch (err) {
+      console.error('[import-shein] erro:', err.message);
+      await prisma.import.update({
+        where: { id: imp.id },
+        data:  { status: 'error', errorMessage: err.message },
+      }).catch(() => {});
+    } finally {
+      importProgress.delete(imp.id);
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+  });
+
+  return res.status(202).json({ jobId: imp.id });
+}
+
 module.exports = {
-  importOrders, importStatus, getClosing, listOrders, getOrder, deleteOrder,
+  importOrders, importStatus, importSheinOrders,
+  getClosing, listOrders, getOrder, deleteOrder,
   recalculateOrders, recalculateStatus, exportOrders, skuReport,
 };
