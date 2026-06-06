@@ -44,6 +44,12 @@ model Store {
   ttShopId         String?   // TikTok Shop ID
   ttTokenExpiresAt DateTime?
 
+  spAccessToken    String?   // Shopee access token (OAuth v2)
+  spRefreshToken   String?
+  spShopId         String?   // Shopee shop_id
+  spShopName       String?
+  spTokenExpiresAt DateTime?
+
   products         Product[]
   orders           Order[]
   imports          Import[]
