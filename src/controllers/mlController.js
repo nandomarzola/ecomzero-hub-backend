@@ -27,10 +27,10 @@ async function handleCallback(req, res) {
   const { code, state: storeId, error } = req.query;
 
   if (error) {
-    return res.redirect(`${FRONTEND_URL}/settings?ml_error=${encodeURIComponent(error)}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?ml_error=${encodeURIComponent(error)}`);
   }
   if (!code || !storeId) {
-    return res.redirect(`${FRONTEND_URL}/settings?ml_error=missing_params`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?ml_error=missing_params`);
   }
 
   try {
@@ -50,10 +50,10 @@ async function handleCallback(req, res) {
     });
 
     console.log(`[ML] Loja ${storeId} conectada — seller ${seller.nickname} (${seller.id})`);
-    return res.redirect(`${FRONTEND_URL}/settings?ml_connected=1&store=${storeId}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?ml_connected=1&store=${storeId}`);
   } catch (err) {
     console.error('[ML] callback erro:', err.message);
-    return res.redirect(`${FRONTEND_URL}/settings?ml_error=${encodeURIComponent(err.message)}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?ml_error=${encodeURIComponent(err.message)}`);
   }
 }
 

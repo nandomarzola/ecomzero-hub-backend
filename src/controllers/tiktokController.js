@@ -24,8 +24,8 @@ async function getAuth(req, res) {
 // GET /api/tiktok/callback?code=xxx&state=storeId
 async function handleCallback(req, res) {
   const { code, state: storeId, errcode, errmsg } = req.query;
-  if (errcode) return res.redirect(`${FRONTEND_URL}/settings?tt_error=${encodeURIComponent(errmsg ?? errcode)}`);
-  if (!code || !storeId) return res.redirect(`${FRONTEND_URL}/settings?tt_error=missing_params`);
+  if (errcode) return res.redirect(`${FRONTEND_URL}/integracoes?tt_error=${encodeURIComponent(errmsg ?? errcode)}`);
+  if (!code || !storeId) return res.redirect(`${FRONTEND_URL}/integracoes?tt_error=missing_params`);
 
   try {
     const tokens = await exchangeCode(code);
@@ -43,10 +43,10 @@ async function handleCallback(req, res) {
     });
 
     console.log(`[TikTok] Loja ${storeId} conectada — shop ${shopInfo?.shop_name ?? tokens.open_id}`);
-    return res.redirect(`${FRONTEND_URL}/settings?tt_connected=1&store=${storeId}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?tt_connected=1&store=${storeId}`);
   } catch (err) {
     console.error('[TikTok] callback erro:', err.message);
-    return res.redirect(`${FRONTEND_URL}/settings?tt_error=${encodeURIComponent(err.message)}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?tt_error=${encodeURIComponent(err.message)}`);
   }
 }
 
