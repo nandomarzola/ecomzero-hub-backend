@@ -1,7 +1,7 @@
 const crypto = require('crypto');
-const axios  = require('axios');
+const https  = require('https');
 
-const BASE_URL    = 'https://partner.shopeemobile.com';
+const BASE_HOST   = 'partner.shopeemobile.com';
 const PARTNER_ID  = parseInt(process.env.SHOPEE_PARTNER_ID  ?? '0', 10);
 const PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY ?? '';
 
@@ -22,7 +22,7 @@ function getAuthUrl(storeId) {
   const cbUrl     = `${redirect}?storeId=${encodeURIComponent(storeId)}`;
 
   return (
-    `${BASE_URL}${path}` +
+    `https://${BASE_HOST}${path}` +
     `?partner_id=${PARTNER_ID}` +
     `&redirect=${encodeURIComponent(cbUrl)}` +
     `&timestamp=${timestamp}` +
@@ -30,15 +30,70 @@ function getAuthUrl(storeId) {
   );
 }
 
+// Utilitário: POST JSON via https nativo
+function httpsPost(path, queryParams, body) {
+  return new Promise((resolve, reject) => {
+    const qs   = new URLSearchParams(queryParams).toString();
+    const data = JSON.stringify(body);
+
+    const options = {
+      hostname: BASE_HOST,
+      path:     `${path}?${qs}`,
+      method:   'POST',
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    };
+
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => { raw += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); }
+        catch { reject(new Error('Resposta inválida da API Shopee')); }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout na API Shopee')); });
+    req.write(data);
+    req.end();
+  });
+}
+
+// Utilitário: GET via https nativo
+function httpsGet(path, queryParams) {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams(queryParams).toString();
+
+    const options = {
+      hostname: BASE_HOST,
+      path:     `${path}?${qs}`,
+      method:   'GET',
+    };
+
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => { raw += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); }
+        catch { reject(new Error('Resposta inválida da API Shopee')); }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout na API Shopee')); });
+    req.end();
+  });
+}
+
 async function exchangeToken(code, shopId) {
   const path      = '/api/v2/auth/token/get';
   const timestamp = Math.floor(Date.now() / 1000);
   const sig       = makeSign(path, timestamp);
 
-  const { data } = await axios.post(
-    `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sig}`,
+  const data = await httpsPost(
+    path,
+    { partner_id: PARTNER_ID, timestamp, sign: sig },
     { code, shop_id: parseInt(shopId, 10), partner_id: PARTNER_ID },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
   );
 
   if (data.error && data.error !== '') throw new Error(data.message || data.error);
@@ -50,31 +105,27 @@ async function refreshShopeeToken(refreshToken, shopId) {
   const timestamp = Math.floor(Date.now() / 1000);
   const sig       = makeSign(path, timestamp);
 
-  const { data } = await axios.post(
-    `${BASE_URL}${path}?partner_id=${PARTNER_ID}&timestamp=${timestamp}&sign=${sig}`,
+  const data = await httpsPost(
+    path,
+    { partner_id: PARTNER_ID, timestamp, sign: sig },
     { refresh_token: refreshToken, shop_id: parseInt(shopId, 10), partner_id: PARTNER_ID },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
   );
 
   if (data.error && data.error !== '') throw new Error(data.message || data.error);
   return data;
 }
 
-// Busca nome/info da loja autenticada
 async function getShopInfo(accessToken, shopId) {
   const path      = '/api/v2/shop/get_shop_info';
   const timestamp = Math.floor(Date.now() / 1000);
   const sig       = makeSign(path, timestamp);
 
-  const { data } = await axios.get(`${BASE_URL}${path}`, {
-    params: {
-      partner_id:   PARTNER_ID,
-      timestamp,
-      sign:         sig,
-      access_token: accessToken,
-      shop_id:      parseInt(shopId, 10),
-    },
-    timeout: 10000,
+  const data = await httpsGet(path, {
+    partner_id:   PARTNER_ID,
+    timestamp,
+    sign:         sig,
+    access_token: accessToken,
+    shop_id:      parseInt(shopId, 10),
   });
 
   return data?.response ?? data;
