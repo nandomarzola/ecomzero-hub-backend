@@ -1,9 +1,14 @@
 const crypto = require('crypto');
 const https  = require('https');
 
-// sandbox: partner.test-stable.shopeemobile.com  |  prod: partner.shopeemobile.com
-const BASE_HOST   = process.env.SHOPEE_ENV === 'sandbox'
+// Auth redirect URL host (onde o usuário faz login)
+const AUTH_HOST = process.env.SHOPEE_ENV === 'sandbox'
   ? 'partner.test-stable.shopeemobile.com'
+  : 'partner.shopeemobile.com';
+
+// API calls host (chamadas backend: token, refresh, shop info)
+const API_HOST = process.env.SHOPEE_ENV === 'sandbox'
+  ? 'openplatform.sandbox.test-stable.shopee.sg'
   : 'partner.shopeemobile.com';
 const PARTNER_ID  = parseInt(process.env.SHOPEE_PARTNER_ID  ?? '0', 10);
 const PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY ?? '';
@@ -32,7 +37,7 @@ function getAuthUrl(storeId) {
   );
 
   return (
-    `https://${BASE_HOST}${path}` +
+    `https://${AUTH_HOST}${path}` +
     `?partner_id=${PARTNER_ID}` +
     `&redirect=${encodeURIComponent(cbUrl)}` +
     `&timestamp=${timestamp}` +
@@ -47,7 +52,7 @@ function httpsPost(path, queryParams, body) {
     const data = JSON.stringify(body);
 
     const options = {
-      hostname: BASE_HOST,
+      hostname: API_HOST,
       path:     `${path}?${qs}`,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
@@ -75,7 +80,7 @@ function httpsGet(path, queryParams) {
     const qs = new URLSearchParams(queryParams).toString();
 
     const options = {
-      hostname: BASE_HOST,
+      hostname: API_HOST,
       path:     `${path}?${qs}`,
       method:   'GET',
     };
