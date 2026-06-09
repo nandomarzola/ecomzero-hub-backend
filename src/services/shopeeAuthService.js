@@ -23,18 +23,24 @@ function makeSign(path, timestamp) {
 }
 
 function getAuthUrl(storeId) {
+  const redirect = process.env.SHOPEE_REDIRECT_URI ?? '';
+  const cbUrl    = `${redirect}?storeId=${encodeURIComponent(storeId)}`;
+
+  if (process.env.SHOPEE_ENV === 'sandbox') {
+    // Sandbox usa OAuth padrão — sem sign, sem timestamp
+    return (
+      `https://open.sandbox.test-stable.shopee.com/auth` +
+      `?auth_type=seller` +
+      `&partner_id=${PARTNER_ID}` +
+      `&redirect_uri=${encodeURIComponent(cbUrl)}` +
+      `&response_type=code`
+    );
+  }
+
+  // Produção — URL assinada
   const path      = '/api/v2/shop/auth_partner';
   const timestamp = Math.floor(Date.now() / 1000);
   const sig       = makeSign(path, timestamp);
-  const redirect  = process.env.SHOPEE_REDIRECT_URI ?? '';
-  const cbUrl     = `${redirect}?storeId=${encodeURIComponent(storeId)}`;
-
-  console.log('[Shopee DEBUG] key_len=%d key_prefix=%s base=%s sign=%s',
-    PARTNER_KEY.length,
-    PARTNER_KEY.slice(0, 12),
-    `${PARTNER_ID}${path}${timestamp}`,
-    sig
-  );
 
   return (
     `https://${AUTH_HOST}${path}` +
