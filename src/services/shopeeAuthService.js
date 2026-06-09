@@ -24,6 +24,13 @@ function getAuthUrl(storeId) {
   const redirect  = process.env.SHOPEE_REDIRECT_URI ?? '';
   const cbUrl     = `${redirect}?storeId=${encodeURIComponent(storeId)}`;
 
+  console.log('[Shopee DEBUG] key_len=%d key_prefix=%s base=%s sign=%s',
+    PARTNER_KEY.length,
+    PARTNER_KEY.slice(0, 12),
+    `${PARTNER_ID}${path}${timestamp}`,
+    sig
+  );
+
   return (
     `https://${BASE_HOST}${path}` +
     `?partner_id=${PARTNER_ID}` +
