@@ -31,10 +31,10 @@ async function handleCallback(req, res) {
   const { code, shop_id, storeId, error: spError } = req.query;
 
   if (spError) {
-    return res.redirect(`${FRONTEND_URL}/settings?sp_error=${encodeURIComponent(spError)}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?sp_error=${encodeURIComponent(spError)}`);
   }
   if (!code || !shop_id) {
-    return res.redirect(`${FRONTEND_URL}/settings?sp_error=missing_params`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?sp_error=missing_params`);
   }
 
   try {
@@ -71,7 +71,7 @@ async function handleCallback(req, res) {
         },
       });
       console.log(`[Shopee] Loja ${targetStoreId} conectada — shop_id ${shop_id} (${shopName ?? 'sem nome'})`);
-      return res.redirect(`${FRONTEND_URL}/settings?sp_connected=1&store=${targetStoreId}`);
+      return res.redirect(`${FRONTEND_URL}/integracoes?sp_connected=1&store=${targetStoreId}`);
     }
 
     // Sem storeId: loja não identificada — salva shop_id em qualquer loja Shopee sem conexão
@@ -90,13 +90,13 @@ async function handleCallback(req, res) {
           spTokenExpiresAt: expiresAt,
         },
       });
-      return res.redirect(`${FRONTEND_URL}/settings?sp_connected=1&store=${unlinked.id}`);
+      return res.redirect(`${FRONTEND_URL}/integracoes?sp_connected=1&store=${unlinked.id}`);
     }
 
-    return res.redirect(`${FRONTEND_URL}/settings?sp_error=loja_nao_encontrada`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?sp_error=loja_nao_encontrada`);
   } catch (err) {
     console.error('[Shopee] callback erro:', err.message);
-    return res.redirect(`${FRONTEND_URL}/settings?sp_error=${encodeURIComponent(err.message)}`);
+    return res.redirect(`${FRONTEND_URL}/integracoes?sp_error=${encodeURIComponent(err.message)}`);
   }
 }
 
