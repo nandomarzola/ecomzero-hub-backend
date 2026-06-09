@@ -1,7 +1,10 @@
 const crypto = require('crypto');
 const https  = require('https');
 
-const BASE_HOST   = 'partner.shopeemobile.com';
+// sandbox: partner.test-stable.shopeemobile.com  |  prod: partner.shopeemobile.com
+const BASE_HOST   = process.env.SHOPEE_ENV === 'sandbox'
+  ? 'partner.test-stable.shopeemobile.com'
+  : 'partner.shopeemobile.com';
 const PARTNER_ID  = parseInt(process.env.SHOPEE_PARTNER_ID  ?? '0', 10);
 const PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY ?? '';
 
