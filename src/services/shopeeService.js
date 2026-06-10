@@ -112,13 +112,21 @@ function categoryToStatus(cat) {
 // ── Converter pedido Shopee → nosso formato ────────────────────────────────────
 // escrow: order_income (get_escrow_detail) — null se ainda não disponível
 // productId: já resolvido pelo controller via itemMap (item_id/model_id → product.id)
-function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null) {
-  const item = detail.item_list?.[0] ?? {};
+function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null, items = null) {
+  const allItems = (items && items.length) ? items : (detail.item_list?.slice(0, 1) ?? []);
+  const item = allItems[0] ?? {};
 
-  const quantity     = item.model_quantity_purchased ?? 1;
-  const agreedPrice  = r2(item.model_discounted_price ?? item.model_original_price ?? 0);
-  const originalPrice = r2(item.model_original_price ?? agreedPrice);
-  const gmv          = r2(agreedPrice * quantity);
+  // Soma quantidade/GMV de todos os itens do pedido que pertencem ao mesmo anúncio
+  // (variações diferentes do mesmo item_id viram 1 só Order — ver syncOrders)
+  const quantity = allItems.reduce((s, it) => s + (it.model_quantity_purchased ?? 1), 0);
+  const gmv = r2(allItems.reduce((s, it) => {
+    const price = r2(it.model_discounted_price ?? it.model_original_price ?? 0);
+    return s + price * (it.model_quantity_purchased ?? 1);
+  }, 0));
+  const agreedPrice   = quantity > 0 ? r2(gmv / quantity) : 0;
+  const originalPrice = quantity > 0
+    ? r2(allItems.reduce((s, it) => s + r2(it.model_original_price ?? 0) * (it.model_quantity_purchased ?? 1), 0) / quantity)
+    : agreedPrice;
 
   const orderCategory = classifyShopeeOrder(detail.order_status);
   const isRevenue     = ['valid', 'pending', 'returned_partial'].includes(orderCategory);

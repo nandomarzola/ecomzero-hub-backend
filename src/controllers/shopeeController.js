@@ -297,10 +297,19 @@ async function syncOrders(req, res) {
 
     // 5. Converter pedidos
     const ordersData = details.map(detail => {
-      const item     = detail.item_list?.[0];
+      const items     = detail.item_list ?? [];
+      const item      = items[0];
       const key       = item ? `${item.item_id}_${item.model_id ?? 0}` : null;
       const productId = key ? (itemMap[key] ?? null) : null;
-      return convertShopeeOrder(detail, escrowMap[detail.order_sn], storeId, imp.id, store, productId);
+
+      // Pedidos com múltiplas variações do MESMO anúncio (mesmo productId) são
+      // somados em 1 Order — evita perder unidades/GMV e inflar a taxa marketplace
+      // por unidade (escrow cobre o pedido inteiro).
+      const sameProductItems = productId
+        ? items.filter(it => itemMap[`${it.item_id}_${it.model_id ?? 0}`] === productId)
+        : (item ? [item] : []);
+
+      return convertShopeeOrder(detail, escrowMap[detail.order_sn], storeId, imp.id, store, productId, sameProductItems);
     });
 
     // 6. Salvar pedidos
