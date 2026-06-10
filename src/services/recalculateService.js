@@ -21,6 +21,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
     include: {
       store:   { select: { taxRate: true, marketplace: true } },
       product: { select: { costPrice: true, packaging: true } },
+      variant: { select: { costPrice: true } },
     },
   });
 
@@ -60,7 +61,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       quantity:          order.quantity,
       sellerCoupon:      order.sellerCoupon,
       lmmDiscount:       order.lmmDiscount,
-      costPrice:         order.product?.costPrice ?? 0,
+      costPrice:         order.variant?.costPrice ?? order.product?.costPrice ?? 0,
       packagingCost:     order.product?.packaging ?? 0,
       taxRate,
       marketplace,

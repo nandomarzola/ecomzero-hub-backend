@@ -232,9 +232,10 @@ async function syncOrders(req, res) {
 
     // 4. Upsert produtos a partir dos itens dos pedidos
     // Cada anúncio (item_id) vira 1 único Product, com variações guardadas em `variations`
-    const itemMap = {}; // `${item_id}_${model_id}` → productId
+    const itemMap    = {}; // `${item_id}_${model_id}` → productId
+    const variantMap = {}; // `${item_id}_${model_id}` → ProductVariant.id
 
-    // Carrega 1x produtos com variations para fallback de matching por model_sku
+    // Carrega 1x produtos com variations para fallback de matching legado (exibição)
     let withVariations = await prisma.product.findMany({
       where: { storeId, variations: { not: null } },
       select: { id: true, variations: true },
@@ -256,10 +257,14 @@ async function syncOrders(req, res) {
           product = await prisma.product.findFirst({ where: { storeId, sku: rootSku } });
         }
         if (!product && modelSku) {
-          const match = withVariations.find(p =>
-            Array.isArray(p.variations) && p.variations.some(v => v.sku === modelSku)
-          );
-          if (match) product = await prisma.product.findUnique({ where: { id: match.id } });
+          const variant = await prisma.productVariant.findFirst({
+            where: { sku: modelSku, product: { storeId } },
+            include: { product: true },
+          });
+          if (variant) {
+            product = variant.product;
+            variantMap[key] = variant.id;
+          }
         }
 
         const newVariation = {
@@ -291,6 +296,14 @@ async function syncOrders(req, res) {
           }
         }
         itemMap[key] = product.id;
+
+        // Resolve ProductVariant pelo model_id (se ainda não resolvido pelo fallback de SKU acima)
+        if (!variantMap[key]) {
+          const variant = await prisma.productVariant.findFirst({
+            where: { productId: product.id, marketplaceVariantId: modelId },
+          });
+          if (variant) variantMap[key] = variant.id;
+        }
       }
     }
     console.log(`[Shopee] ${Object.keys(itemMap).length} produtos vinculados/criados`);
@@ -301,6 +314,7 @@ async function syncOrders(req, res) {
       const item      = items[0];
       const key       = item ? `${item.item_id}_${item.model_id ?? 0}` : null;
       const productId = key ? (itemMap[key] ?? null) : null;
+      const variantId = key ? (variantMap[key] ?? null) : null;
 
       // Pedidos com múltiplas variações do MESMO anúncio (mesmo productId) são
       // somados em 1 Order — evita perder unidades/GMV e inflar a taxa marketplace
@@ -309,7 +323,7 @@ async function syncOrders(req, res) {
         ? items.filter(it => itemMap[`${it.item_id}_${it.model_id ?? 0}`] === productId)
         : (item ? [item] : []);
 
-      return convertShopeeOrder(detail, escrowMap[detail.order_sn], storeId, imp.id, store, productId, sameProductItems);
+      return convertShopeeOrder(detail, escrowMap[detail.order_sn], storeId, imp.id, store, productId, sameProductItems, variantId);
     });
 
     // 6. Salvar pedidos
@@ -408,6 +422,19 @@ async function syncItems(req, res) {
         created++;
       }
       synced++;
+
+      // Upsert ProductVariant para anúncios com variações reais (custo independente por variação)
+      // Nunca sobrescreve costPrice — preserva o que o usuário cadastrou na tela.
+      const hasRealVariations = variations.length >= 2 || (variations.length === 1 && variations[0].modelId !== '0');
+      if (hasRealVariations) {
+        for (const v of variations) {
+          await prisma.productVariant.upsert({
+            where: { productId_marketplaceVariantId: { productId: parent.id, marketplaceVariantId: v.modelId } },
+            create: { productId: parent.id, marketplaceVariantId: v.modelId, name: v.name, sku: v.sku, price: v.price, stock: v.stock },
+            update: { name: v.name, sku: v.sku, price: v.price, stock: v.stock },
+          });
+        }
+      }
 
       // Migração de órfãos da versão antiga (1 produto por model_id)
       for (const model of models) {

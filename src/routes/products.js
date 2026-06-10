@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc } = require('../controllers/productController');
+const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost } = require('../controllers/productController');
 const { authMiddleware } = require('../middleware/auth');
 
 router.use(authMiddleware);
@@ -19,5 +19,6 @@ router.delete('/:id', remove);
 router.patch('/:id/stock', adjustStock);
 router.post('/:id/variants', addVariant);
 router.delete('/:id/variants/:variantId', removeVariant);
+router.patch('/:id/variants/:variantId/cost', updateVariantCost);
 
 module.exports = router;

@@ -112,7 +112,7 @@ function categoryToStatus(cat) {
 // ── Converter pedido Shopee → nosso formato ────────────────────────────────────
 // escrow: order_income (get_escrow_detail) — null se ainda não disponível
 // productId: já resolvido pelo controller via itemMap (item_id/model_id → product.id)
-function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null, items = null) {
+function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null, items = null, variantId = null) {
   const allItems = (items && items.length) ? items : (detail.item_list?.slice(0, 1) ?? []);
   const item = allItems[0] ?? {};
 
@@ -177,6 +177,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     productName:   item.item_name || '',
     variationName: item.model_name || null,
     productId,
+    variantId,
     originalPrice,
     agreedPrice,
     quantity,

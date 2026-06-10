@@ -77,13 +77,32 @@ model Product {
   supplies   Float       @default(0)
   stock      Int         @default(0)
   minStock   Int         @default(5)
-  variations Json?       // Shopee: [{ modelId, sku, name, price, stock }] — variações do anúncio (matching/exibição)
+  variations Json?       // Shopee: [{ modelId, sku, name, price, stock }] — legado, mantido para fallback/histórico
   parentId   String?
   parent     Product?    @relation("Variants", fields: [parentId], references: [id], onDelete: SetNull)
   variants   Product[]   @relation("Variants")
+  productVariants ProductVariant[]
   createdAt  DateTime    @default(now())
   orders             Order[]
   purchaseOrderItems PurchaseOrderItem[]
+}
+
+// ── Variações de anúncio (Shopee model_id) com custo independente ───────────
+model ProductVariant {
+  id                   String   @id @default(uuid())
+  productId            String
+  product              Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  marketplaceVariantId String?  // Shopee model_id
+  name                 String?  // ex: "KIT 1 APARELHO + 3 REFIS"
+  sku                  String?  // ex: EZ0318-2
+  price                Float    @default(0)
+  costPrice            Float?   // null = sem custo próprio, usa Product.costPrice
+  stock                Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  orders               Order[]
+
+  @@unique([productId, marketplaceVariantId])
 }
 
 // ── Controle de importações ──────────────────────────────────────────────────
@@ -135,6 +154,8 @@ model Order {
   variationName String?
   productId     String?
   product       Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  variantId     String?
+  variant       ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
 
   // ── Preços (do arquivo) ───────────────────────────────────────────────────
   originalPrice Float    @default(0)

@@ -49,17 +49,31 @@ function withAlerts(p) {
 async function list(req, res) {
   const { storeId, search, page = 1, limit = 20, source, mlStatus, noCost } = req.query;
 
+  const andConditions = [];
+  if (search) {
+    andConditions.push({ OR: [
+      { name: { contains: search } },
+      { sku:  { contains: search } },
+      { productVariants: { some: { OR: [
+        { name: { contains: search } },
+        { sku:  { contains: search } },
+      ] } } },
+    ]});
+  }
+  if (noCost === '1') {
+    andConditions.push({ OR: [
+      { productVariants: { none: {} }, costPrice: 0 },
+      { productVariants: { some: { costPrice: null } } },
+    ]});
+  }
+
   const where = {
     parentId: null,
     ...(storeId ? { storeId, store: { userId: req.userId } } : { store: { userId: req.userId } }),
-    ...(search ? { OR: [
-      { name: { contains: search } },
-      { sku:  { contains: search } },
-    ]} : {}),
     ...(source === 'ml'      ? { externalId: { not: null } } : {}),
     ...(source === 'catalog' ? { externalId: null } : {}),
     ...(mlStatus ? { mlStatus } : {}),
-    ...(noCost === '1' ? { costPrice: 0, variants: { none: {} } } : {}),
+    ...(andConditions.length ? { AND: andConditions } : {}),
   };
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -71,6 +85,7 @@ async function list(req, res) {
       include: {
         store:    { select: { name: true, marketplace: true } },
         variants: { orderBy: { name: 'asc' } },
+        productVariants: { orderBy: { name: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -115,6 +130,7 @@ async function get(req, res) {
     include: {
       store:    { select: { name: true, marketplace: true } },
       variants: { orderBy: { name: 'asc' } },
+      productVariants: { orderBy: { name: 'asc' } },
     },
   });
   if (!product) return res.status(404).json({ error: 'Produto não encontrado' });
@@ -688,15 +704,16 @@ async function setCostBySku(req, res) {
     });
 
     // Fallback: SKU pode ser de uma variação (anúncio Shopee agrupado pelo SKU raiz)
+    let matchedVariantId = null;
     if (!product) {
-      const candidates = await prisma.product.findMany({
-        where: { storeId: { in: storeIds }, variations: { not: null } },
-        select: { id: true, variations: true },
+      const variant = await prisma.productVariant.findFirst({
+        where: { sku, product: { storeId: { in: storeIds } } },
+        include: { product: true },
       });
-      const match = candidates.find(p =>
-        Array.isArray(p.variations) && p.variations.some(v => v.sku === sku)
-      );
-      if (match) product = await prisma.product.findUnique({ where: { id: match.id } });
+      if (variant) {
+        product = variant.product;
+        matchedVariantId = variant.id;
+      }
     }
 
     if (product) {
@@ -738,7 +755,7 @@ async function setCostBySku(req, res) {
         productId: null,
         OR: [{ skuVariacao: sku }, { skuPrincipal: sku }],
       },
-      data: { productId: product.id },
+      data: { productId: product.id, ...(matchedVariantId ? { variantId: matchedVariantId } : {}) },
     });
 
     return res.json({ success: true, productId: product.id, linkedOrders: linked.count });
@@ -861,4 +878,92 @@ async function saveAndRecalc(req, res) {
   }
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc };
+// PATCH /api/products/:id/variants/:variantId/cost — salva custo de 1 variação (ou de todas) e recalcula pedidos vinculados
+async function updateVariantCost(req, res) {
+  try {
+    const { id: productId, variantId } = req.params;
+    const { costPrice, applyToAll } = req.body;
+
+    const product = await prisma.product.findFirst({
+      where: { id: productId, store: { userId: req.userId } },
+      include: {
+        store: { select: { taxRate: true, marketplace: true } },
+        productVariants: true,
+      },
+    });
+    if (!product) return res.status(404).json({ error: 'Produto não encontrado' });
+
+    const variant = product.productVariants.find(v => v.id === variantId);
+    if (!variant) return res.status(404).json({ error: 'Variação não encontrada' });
+
+    const cost = (costPrice === '' || costPrice === null || costPrice === undefined) ? null : parseFloat(costPrice);
+
+    const targetIds = applyToAll ? product.productVariants.map(v => v.id) : [variantId];
+    await prisma.productVariant.updateMany({ where: { id: { in: targetIds } }, data: { costPrice: cost } });
+
+    // Recalcular pedidos vinculados às variações alteradas
+    const orders = await prisma.order.findMany({
+      where: { variantId: { in: targetIds } },
+      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, platformCommission: true, listingType: true, mlShippingCost: true, mlInstallmentFee: true },
+    });
+
+    const marketplace   = product.store?.marketplace ?? 'shopee';
+    const taxRate       = product.store?.taxRate ?? 0;
+    const effectiveCost = cost ?? product.costPrice ?? 0;
+    const pkg           = product.packaging ?? 0;
+
+    const updates = orders.map(o => {
+      const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+      const mlFrete        = o.mlShippingCost   ?? 0;
+      const mlParcelamento = o.mlInstallmentFee ?? 0;
+      const precomputedFee = marketplace === 'mercadolivre'
+        ? Math.round(((o.platformCommission ?? 0) + mlFrete + mlParcelamento) * 100) / 100
+        : null;
+      const calc = calcOrderProfit({
+        agreedPrice:   o.agreedPrice,
+        quantity:      o.quantity,
+        sellerCoupon:  o.sellerCoupon,
+        lmmDiscount:   o.lmmDiscount,
+        costPrice:     effectiveCost,
+        packagingCost: pkg,
+        taxRate,
+        marketplace,
+        precomputedFee,
+        listingType:   o.listingType,
+      });
+      const finalProfit = isRevenue ? calc.grossProfit : 0;
+      const finalMargin = isRevenue ? calc.margin      : 0;
+      return prisma.order.update({
+        where: { id: o.id },
+        data: {
+          calcGmv:         calc.gmv,
+          calcShopeeFee:   calc.marketplaceFee,
+          calcNetRevenue:  calc.netRevenue,
+          calcTax:         calc.taxAmount,
+          calcProductCost: calc.productCost,
+          calcPackaging:   calc.packaging,
+          calcGrossProfit: finalProfit,
+          calcMargin:      finalMargin,
+          hasCost:         calc.hasCost,
+          profit:          finalProfit,
+          margin:          finalMargin,
+        },
+      });
+    });
+
+    await Promise.all(updates);
+
+    return res.json({
+      success: true,
+      updated: updates.length,
+      variantsUpdated: targetIds.length,
+      appliedToAll: !!applyToAll,
+      costPrice: cost,
+    });
+  } catch (err) {
+    console.error('updateVariantCost error:', err);
+    return res.status(500).json({ error: 'Erro ao salvar custo da variação: ' + err.message });
+  }
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost };
