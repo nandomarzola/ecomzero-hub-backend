@@ -22,6 +22,12 @@ function makeSign(path, timestamp) {
   return crypto.createHmac('sha256', PARTNER_KEY).update(base).digest('hex');
 }
 
+// Assinatura para endpoints de loja (shop_id + access_token no base string)
+function makeShopSign(path, timestamp, accessToken, shopId) {
+  const base = `${PARTNER_ID}${path}${timestamp}${accessToken}${shopId}`;
+  return crypto.createHmac('sha256', PARTNER_KEY).update(base).digest('hex');
+}
+
 function getAuthUrl(storeId) {
   const redirect = process.env.SHOPEE_REDIRECT_URI ?? '';
   const cbUrl    = `${redirect}?storeId=${encodeURIComponent(storeId)}`;
@@ -137,19 +143,26 @@ async function refreshShopeeToken(refreshToken, shopId) {
 }
 
 async function getShopInfo(accessToken, shopId) {
-  const path      = '/api/v2/shop/get_shop_info';
+  const data = await shopApiGet('/api/v2/shop/get_shop_info', accessToken, shopId);
+  return data?.response ?? data;
+}
+
+// ── Helper genérico para chamadas autenticadas de loja (GET) ──────────────────
+async function shopApiGet(path, accessToken, shopId, extraParams = {}) {
   const timestamp = Math.floor(Date.now() / 1000);
-  const sig       = makeSign(path, timestamp);
+  const sid       = parseInt(shopId, 10);
+  const sig       = makeShopSign(path, timestamp, accessToken, sid);
 
   const data = await httpsGet(path, {
     partner_id:   PARTNER_ID,
     timestamp,
     sign:         sig,
     access_token: accessToken,
-    shop_id:      parseInt(shopId, 10),
+    shop_id:      sid,
+    ...extraParams,
   });
 
-  return data?.response ?? data;
+  return data;
 }
 
-module.exports = { isConfigured, getAuthUrl, exchangeToken, refreshShopeeToken, getShopInfo };
+module.exports = { isConfigured, getAuthUrl, exchangeToken, refreshShopeeToken, getShopInfo, shopApiGet };
