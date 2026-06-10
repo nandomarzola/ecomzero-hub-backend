@@ -47,7 +47,7 @@ function withAlerts(p) {
 // source=ml  → só anúncios ML (externalId não nulo)
 // source=catalog → só produtos do catálogo (externalId nulo)
 async function list(req, res) {
-  const { storeId, search, page = 1, limit = 20, source, mlStatus } = req.query;
+  const { storeId, search, page = 1, limit = 20, source, mlStatus, noCost } = req.query;
 
   const where = {
     parentId: null,
@@ -59,6 +59,7 @@ async function list(req, res) {
     ...(source === 'ml'      ? { externalId: { not: null } } : {}),
     ...(source === 'catalog' ? { externalId: null } : {}),
     ...(mlStatus ? { mlStatus } : {}),
+    ...(noCost === '1' ? { costPrice: 0, variants: { none: {} } } : {}),
   };
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -78,14 +79,14 @@ async function list(req, res) {
     prisma.product.count({ where }),
   ]);
 
-  // Agrega effectiveRate por produto (últimos 90 dias) quando uma loja está selecionada
+  // Agrega effectiveRate por produto (últimos 30 dias) quando uma loja está selecionada
   if (storeId && products.length > 0) {
     const allIds = [];
     for (const p of products) {
       allIds.push(p.id);
       for (const v of p.variants) allIds.push(v.id);
     }
-    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const rows = await prisma.$queryRaw`
       SELECT productId,
              AVG((calcGmv - calcNetRevenue) / calcGmv * 100) AS productEffectiveRate
