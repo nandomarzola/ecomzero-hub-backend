@@ -92,7 +92,7 @@ async function buildClosingData(storeIds, month) {
   const groupMap = new Map();
 
   for (const o of allOrders) {
-    const isRevenue  = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+    const isRevenue  = ['valid', 'pending'].includes(o.orderCategory);
     const isCancelled = o.orderCategory.startsWith('cancelled');
     const isReturned  = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
 
@@ -111,12 +111,11 @@ async function buildClosingData(storeIds, month) {
       packagingCost    += o.calcPackaging;
       grossProfit      += o.calcGrossProfit;
       unitCount        += o.quantity;
-      if (o.orderCategory === 'valid')            gmvConfirmed += o.calcGmv;
-      if (o.orderCategory === 'pending')          gmvPending   += o.calcGmv;
-      if (o.orderCategory === 'returned_partial') returnedValue += o.calcGmv;
+      if (o.orderCategory === 'valid')   gmvConfirmed += o.calcGmv;
+      if (o.orderCategory === 'pending') gmvPending   += o.calcGmv;
     }
-    if (isCancelled)                        cancelledGmv  += o.calcGmv;
-    if (o.orderCategory === 'returned_full') returnedValue += o.calcGmv;
+    if (isCancelled) cancelledGmv += o.calcGmv;
+    if (o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial') returnedValue += o.calcGmv;
 
     if (isRevenue) {
       const key = o.productId

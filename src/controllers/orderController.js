@@ -279,9 +279,9 @@ async function listOrders(req, res) {
       where: baseWhere,
       _count: { _all: true },
     }),
-    // Totais financeiros de pedidos com receita (valid + pending + returned_partial)
+    // Totais financeiros de pedidos com receita (valid + pending) — consistente com Fechamento Mensal
     prisma.order.aggregate({
-      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending'] } },
       _sum:  { calcGmv: true, calcShopeeFee: true, calcNetRevenue: true, calcGrossProfit: true, calcTax: true, quantity: true },
       _count: { _all: true },
     }),

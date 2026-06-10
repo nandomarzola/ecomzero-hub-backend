@@ -17,7 +17,16 @@ async function list(req, res) {
     where: { userId: req.userId },
     orderBy: { createdAt: 'desc' },
   });
-  return res.json({ stores });
+
+  const lastImports = await prisma.import.groupBy({
+    by: ['storeId'],
+    where: { storeId: { in: stores.map((s) => s.id) } },
+    _max: { importedAt: true },
+  });
+  const lastSyncMap = new Map(lastImports.map((i) => [i.storeId, i._max.importedAt]));
+
+  const result = stores.map((s) => ({ ...s, lastSyncAt: lastSyncMap.get(s.id) ?? null }));
+  return res.json({ stores: result });
 }
 
 async function get(req, res) {
