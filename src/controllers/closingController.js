@@ -96,6 +96,13 @@ async function buildClosingData(storeIds, month) {
     const isCancelled = o.orderCategory.startsWith('cancelled');
     const isReturned  = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
 
+    // Taxa real = comissão + taxa de serviço (escrow), não a estimativa em calcShopeeFee
+    // (que pode estar divergente por causa de um recálculo antigo)
+    const orderFee    = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+    const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+    const orderNet    = r2(o.calcGmv - orderFee - orderDisc);
+    const orderProfit = r2(orderNet - o.calcTax - o.calcProductCost - o.calcPackaging);
+
     if (o.orderCategory === 'valid')        confirmedCount++;
     else if (o.orderCategory === 'pending') pendingCount++;
     else if (isCancelled)                   cancelledCount++;
@@ -103,13 +110,13 @@ async function buildClosingData(storeIds, month) {
 
     if (isRevenue) {
       gmvTotal         += o.calcGmv;
-      shopeeDeductions += o.calcShopeeFee;
-      sellerDiscounts  += (o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0);
-      netRevenue       += o.calcNetRevenue;
+      shopeeDeductions += orderFee;
+      sellerDiscounts  += orderDisc;
+      netRevenue       += orderNet;
       taxAmount        += o.calcTax;
       productCost      += o.calcProductCost;
       packagingCost    += o.calcPackaging;
-      grossProfit      += o.calcGrossProfit;
+      grossProfit      += orderProfit;
       unitCount        += o.quantity;
       if (o.orderCategory === 'valid')   gmvConfirmed += o.calcGmv;
       if (o.orderCategory === 'pending') gmvPending   += o.calcGmv;
@@ -138,11 +145,11 @@ async function buildClosingData(storeIds, month) {
       g.orderCount  += 1;
       g.qty         += o.quantity;
       g.gmv         += o.calcGmv;
-      g.shopeeFee   += o.calcShopeeFee;
-      g.netRevenue  += o.calcNetRevenue;
+      g.shopeeFee   += orderFee;
+      g.netRevenue  += orderNet;
       g.productCost += o.calcProductCost;
       g.packaging   += o.calcPackaging;
-      g.grossProfit += o.calcGrossProfit;
+      g.grossProfit += orderProfit;
       if (!o.hasCost)                    g.hasCost   = false;
       if (o.orderCategory === 'pending') g.hasPending = true;
     }
