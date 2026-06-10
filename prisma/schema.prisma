@@ -32,7 +32,8 @@ model Store {
   name            String
   marketplace     String
   taxType         String    @default("mei")
-  taxRate         Float     @default(5.0)
+  taxRate         Float     @default(0)
+  fixedMonthlyTax Float     @default(0) // DAS mensal (MEI) — valor fixo, não percentual
   createdAt       DateTime  @default(now())
   mlAccessToken    String?
   mlRefreshToken   String?
@@ -334,6 +335,7 @@ model MonthlyClosing {
   sellerDiscounts  Float   @default(0)
   netRevenue       Float   @default(0)
   taxAmount        Float   @default(0)
+  fixedTaxAmount   Float   @default(0) // DAS mensal (MEI)
   productCost      Float   @default(0)
   packagingCost    Float   @default(0)
   grossProfit      Float   @default(0)

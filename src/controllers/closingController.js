@@ -69,6 +69,14 @@ async function buildClosingData(storeIds, month) {
   const start = new Date(Date.UTC(y, mo - 1, 1));
   const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
 
+  const stores = await prisma.store.findMany({
+    where:  { id: { in: storeIds } },
+    select: { id: true, taxType: true, fixedMonthlyTax: true },
+  });
+  const fixedTaxAmount = r2(stores
+    .filter(s => s.taxType === 'mei')
+    .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
+
   const allOrders = await prisma.order.findMany({
     where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
     include: { product: { select: { id: true, name: true, sku: true } } },
@@ -141,6 +149,8 @@ async function buildClosingData(storeIds, month) {
     }
   }
 
+  // DAS mensal (MEI) é um custo fixo do período, não por pedido — descontado uma vez do lucro do mês
+  grossProfit -= fixedTaxAmount;
   const avgMargin = gmvTotal > 0 ? (grossProfit / gmvTotal) * 100 : 0;
 
   const groups = [...groupMap.values()]
@@ -177,6 +187,7 @@ async function buildClosingData(storeIds, month) {
     sellerDiscounts:  r2(sellerDiscounts),
     netRevenue:       r2(netRevenue),
     taxAmount:        r2(taxAmount),
+    fixedTaxAmount,
     productCost:      r2(productCost),
     packagingCost:    r2(packagingCost),
     grossProfit:      r2(grossProfit),
@@ -245,6 +256,7 @@ async function getClosing(req, res) {
           sellerDiscounts:  closing.sellerDiscounts,
           netRevenue:       closing.netRevenue,
           taxAmount:        closing.taxAmount,
+          fixedTaxAmount:   closing.fixedTaxAmount,
           productCost:      closing.productCost,
           packagingCost:    closing.packagingCost,
           grossProfit:      closing.grossProfit,
@@ -299,7 +311,7 @@ async function closeMonth(req, res) {
         returnedOrders: d.returnedOrders, unitCount: d.unitCount,
         gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
         shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
-        netRevenue: d.netRevenue, taxAmount: d.taxAmount,
+        netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
         productCost: d.productCost, packagingCost: d.packagingCost,
         grossProfit: d.grossProfit, avgMargin: d.avgMargin,
         cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
@@ -312,7 +324,7 @@ async function closeMonth(req, res) {
         returnedOrders: d.returnedOrders, unitCount: d.unitCount,
         gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
         shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
-        netRevenue: d.netRevenue, taxAmount: d.taxAmount,
+        netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
         productCost: d.productCost, packagingCost: d.packagingCost,
         grossProfit: d.grossProfit, avgMargin: d.avgMargin,
         cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
@@ -435,6 +447,9 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
     { l: '(-) Descontos do vendedor',                                v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
     { l: '(=) Receita Liquida',                                      v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
     { l: `(-) Imposto provisionado (${taxRateStr(store.taxRate)}%)`, v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+    ...(d.fixedTaxAmount > 0 ? [
+      { l: '(-) DAS mensal (MEI)',                                   v: fmtBRLpdf(-d.fixedTaxAmount),                                           bold: false, sepBefore: false },
+    ] : []),
     { l: '(-) Custo dos produtos',                                   v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
     { l: '(-) Embalagens',                                           v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
   ];
@@ -622,7 +637,8 @@ async function getPdf(req, res) {
           gmvTotal:         closing.gmvTotal,          gmvConfirmed:     closing.gmvConfirmed,
           gmvPending:       closing.gmvPending,        shopeeDeductions: closing.shopeeDeductions,
           sellerDiscounts:  closing.sellerDiscounts,   netRevenue:       closing.netRevenue,
-          taxAmount:        closing.taxAmount,         productCost:      closing.productCost,
+          taxAmount:        closing.taxAmount,         fixedTaxAmount:   closing.fixedTaxAmount,
+          productCost:      closing.productCost,
           packagingCost:    closing.packagingCost,     grossProfit:      closing.grossProfit,
           avgMargin:        closing.avgMargin,         cancelledGmv:     closing.cancelledGmv,
           returnedValue:    closing.returnedValue,
@@ -726,6 +742,9 @@ async function getPdf(req, res) {
         { l: '(-) Descontos do vendedor',    v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
         { l: '(=) Receita Liquida',          v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
         { l: '(-) Imposto provisionado',     v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+        ...(d.fixedTaxAmount > 0 ? [
+          { l: '(-) DAS mensal (MEI)',       v: fmtBRLpdf(-d.fixedTaxAmount),                                           bold: false, sepBefore: false },
+        ] : []),
         { l: '(-) Custo dos produtos',       v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
         { l: '(-) Embalagens',              v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
       ];

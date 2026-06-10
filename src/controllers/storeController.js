@@ -9,6 +9,7 @@ const storeSchema = z.object({
   }),
   taxType: z.enum(['mei', 'simples', 'lucro_presumido']).optional(),
   taxRate: z.number().min(0).max(100).optional(),
+  fixedMonthlyTax: z.number().min(0).optional(),
 });
 
 async function list(req, res) {
