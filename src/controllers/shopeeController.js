@@ -231,29 +231,64 @@ async function syncOrders(req, res) {
     const escrowMap = await fetchEscrowDetails(accessToken, store.spShopId, escrowEligible);
 
     // 4. Upsert produtos a partir dos itens dos pedidos
+    // Cada anúncio (item_id) vira 1 único Product, com variações guardadas em `variations`
     const itemMap = {}; // `${item_id}_${model_id}` → productId
+
+    // Carrega 1x produtos com variations para fallback de matching por model_sku
+    let withVariations = await prisma.product.findMany({
+      where: { storeId, variations: { not: null } },
+      select: { id: true, variations: true },
+    });
+
     for (const detail of details) {
       for (const item of detail.item_list ?? []) {
         const key = `${item.item_id}_${item.model_id ?? 0}`;
         if (itemMap[key]) continue;
 
-        const externalId = String(item.model_id || item.item_id);
-        const sku        = item.model_sku || item.item_sku || null;
+        const externalId = String(item.item_id); // sempre o anúncio pai
+        const rootSku    = item.item_sku || null;
+        const modelId    = String(item.model_id ?? 0);
+        const modelSku   = item.model_sku || null;
 
         let product = await prisma.product.findFirst({ where: { storeId, externalId } });
-        if (!product && sku) product = await prisma.product.findFirst({ where: { storeId, sku } });
+
+        if (!product && rootSku) {
+          product = await prisma.product.findFirst({ where: { storeId, sku: rootSku } });
+        }
+        if (!product && modelSku) {
+          const match = withVariations.find(p =>
+            Array.isArray(p.variations) && p.variations.some(v => v.sku === modelSku)
+          );
+          if (match) product = await prisma.product.findUnique({ where: { id: match.id } });
+        }
+
+        const newVariation = {
+          modelId, sku: modelSku, name: item.model_name || null,
+          price: r2(item.model_discounted_price ?? item.model_original_price ?? 0),
+          stock: 0,
+        };
 
         if (!product) {
           product = await prisma.product.create({
             data: {
               storeId,
               externalId,
-              name:      item.model_name ? `${item.item_name} — ${item.model_name}` : (item.item_name || 'Produto Shopee'),
-              sku,
-              listPrice: r2(item.model_discounted_price ?? item.model_original_price ?? 0),
+              name:      item.item_name || 'Produto Shopee',
+              sku:       rootSku,
+              listPrice: newVariation.price,
+              variations: [newVariation],
               costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5,
             },
           });
+          withVariations.push({ id: product.id, variations: product.variations });
+        } else {
+          const existingVariations = Array.isArray(product.variations) ? product.variations : [];
+          if (!existingVariations.some(v => v.modelId === modelId)) {
+            const merged = [...existingVariations, newVariation];
+            await prisma.product.update({ where: { id: product.id }, data: { variations: merged } });
+            const cached = withVariations.find(p => p.id === product.id);
+            if (cached) cached.variations = merged; else withVariations.push({ id: product.id, variations: merged });
+          }
         }
         itemMap[key] = product.id;
       }
@@ -323,39 +358,78 @@ async function syncItems(req, res) {
     const itemIds = items.map(i => i.item_id);
     const details = await fetchItemBaseInfo(accessToken, store.spShopId, itemIds);
 
-    let synced = 0, created = 0, updated = 0;
+    let synced = 0, created = 0, updated = 0, migratedOrphans = 0;
+    let needsRecalc = false;
 
     for (const item of details) {
       const models = item.model_list?.length
         ? item.model_list
         : [{ model_id: 0, model_sku: null, model_name: null, price_info: item.price_info, stock_info_v2: item.stock_info_v2 }];
 
-      for (const model of models) {
-        const externalId = String(model.model_id || item.item_id);
-        const sku        = model.model_sku || item.item_sku || null;
-        const name       = model.model_name ? `${item.item_name} — ${model.model_name}` : (item.item_name || 'Produto Shopee');
-        const price      = r2(model.price_info?.[0]?.current_price ?? item.price_info?.[0]?.current_price ?? 0);
-        const stock      = model.stock_info_v2?.summary_info?.total_available_stock
-                          ?? item.stock_info_v2?.summary_info?.total_available_stock ?? 0;
+      // Variações do anúncio, guardadas como metadado para matching/exibição
+      const variations = models.map(model => ({
+        modelId: String(model.model_id ?? 0),
+        sku:     model.model_sku || null,
+        name:    model.model_name || null,
+        price:   r2(model.price_info?.[0]?.current_price ?? item.price_info?.[0]?.current_price ?? 0),
+        stock:   model.stock_info_v2?.summary_info?.total_available_stock
+                 ?? item.stock_info_v2?.summary_info?.total_available_stock ?? 0,
+      }));
 
-        const existing = await prisma.product.findFirst({ where: { storeId, externalId } });
-        if (existing) {
-          await prisma.product.update({
-            where: { id: existing.id },
-            data: { name, sku: sku ?? existing.sku, listPrice: price, stock, mlStatus: item.item_status ?? null },
+      const externalId = String(item.item_id);
+      const sku        = item.item_sku || null;
+      const name       = item.item_name || 'Produto Shopee';
+      const prices     = variations.map(v => v.price).filter(p => p > 0);
+      const listPrice  = prices.length ? Math.min(...prices) : 0;
+      const stock      = variations.reduce((s, v) => s + (v.stock || 0), 0);
+
+      const existing = await prisma.product.findFirst({ where: { storeId, externalId } });
+      let parent;
+      if (existing) {
+        parent = await prisma.product.update({
+          where: { id: existing.id },
+          data: { name, sku: sku ?? existing.sku, listPrice, stock, variations, mlStatus: item.item_status ?? null },
+        });
+        updated++;
+      } else {
+        parent = await prisma.product.create({
+          data: { storeId, externalId, name, sku, listPrice, stock, variations,
+                  costPrice: 0, packaging: 0, supplies: 0, minStock: 5, mlStatus: item.item_status ?? null },
+        });
+        created++;
+      }
+      synced++;
+
+      // Migração de órfãos da versão antiga (1 produto por model_id)
+      for (const model of models) {
+        const orphanExternalId = String(model.model_id || item.item_id);
+        if (orphanExternalId === externalId) continue;
+
+        const orphan = await prisma.product.findFirst({ where: { storeId, externalId: orphanExternalId } });
+        if (!orphan || orphan.id === parent.id) continue;
+
+        const moved = await prisma.order.updateMany({ where: { productId: orphan.id }, data: { productId: parent.id } });
+        await prisma.purchaseOrderItem.updateMany({ where: { productId: orphan.id }, data: { productId: parent.id } });
+
+        if ((orphan.costPrice ?? 0) > 0 && (parent.costPrice ?? 0) === 0) {
+          parent = await prisma.product.update({
+            where: { id: parent.id },
+            data: { costPrice: orphan.costPrice, packaging: orphan.packaging ?? 0, supplies: orphan.supplies ?? 0 },
           });
-          updated++;
-        } else {
-          await prisma.product.create({
-            data: { storeId, externalId, name, sku, listPrice: price, stock, costPrice: 0, packaging: 0, supplies: 0, minStock: 5, mlStatus: item.item_status ?? null },
-          });
-          created++;
         }
-        synced++;
+
+        console.log(`[Shopee] Migrando órfão ${orphan.id} (${orphan.name}, sku=${orphan.sku}, cost=${orphan.costPrice}) → pai ${parent.id}`);
+        await prisma.product.delete({ where: { id: orphan.id } });
+        migratedOrphans++;
+        if (moved.count > 0) needsRecalc = true;
       }
     }
 
-    return res.json({ synced, created, updated, total: itemIds.length });
+    if (needsRecalc) {
+      await recalculateOrdersForStore(storeId).catch(err => console.error('[Shopee] recalc pós-migração erro:', err.message));
+    }
+
+    return res.json({ synced, created, updated, total: itemIds.length, migratedOrphans });
   } catch (err) {
     console.error('[Shopee] sync-items erro:', err.message);
     return res.status(500).json({ error: 'Erro ao sincronizar produtos: ' + err.message });

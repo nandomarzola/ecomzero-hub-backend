@@ -687,6 +687,18 @@ async function setCostBySku(req, res) {
       where: { storeId: { in: storeIds }, sku },
     });
 
+    // Fallback: SKU pode ser de uma variação (anúncio Shopee agrupado pelo SKU raiz)
+    if (!product) {
+      const candidates = await prisma.product.findMany({
+        where: { storeId: { in: storeIds }, variations: { not: null } },
+        select: { id: true, variations: true },
+      });
+      const match = candidates.find(p =>
+        Array.isArray(p.variations) && p.variations.some(v => v.sku === sku)
+      );
+      if (match) product = await prisma.product.findUnique({ where: { id: match.id } });
+    }
+
     if (product) {
       // Atualizar custo no produto existente
       product = await prisma.product.update({
