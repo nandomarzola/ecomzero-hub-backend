@@ -303,7 +303,7 @@ async function buildClosingData(storeIds, month, userId = null) {
       productCost:  r2(g.productCost),
       packaging:    r2(g.packaging),
       grossProfit:  r2(g.grossProfit),
-      margin:       g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
+      margin:       (g.repasseConfirmado + g.repasseEstimado) > 0 ? r2((g.grossProfit / (g.repasseConfirmado + g.repasseEstimado)) * 100) : 0,
       repasseConfirmado: r2(g.repasseConfirmado),
       repasseEstimado:   r2(g.repasseEstimado),
       impostoTotal:      r2(g.impostoTotal),
@@ -322,7 +322,7 @@ async function buildClosingData(storeIds, month, userId = null) {
           productCost:  r2(v.productCost),
           packaging:    r2(v.packaging),
           grossProfit:  r2(v.grossProfit),
-          margin:       v.gmv > 0 ? r2((v.grossProfit / v.gmv) * 100) : 0,
+          margin:       (v.repasseConfirmado + v.repasseEstimado) > 0 ? r2((v.grossProfit / (v.repasseConfirmado + v.repasseEstimado)) * 100) : 0,
           repasseConfirmado: r2(v.repasseConfirmado),
           repasseEstimado:   r2(v.repasseEstimado),
           impostoTotal:      r2(v.impostoTotal),
@@ -371,6 +371,65 @@ async function buildClosingData(storeIds, month, userId = null) {
 
     groups,
   };
+}
+
+// ── GET /api/closing/:month/orders ────────────────────────────────────────────
+// Lista os pedidos individuais de um produto/variação no mês, para o drawer de detalhe
+async function getProductOrders(req, res) {
+  try {
+    const { month } = req.params;
+    const { storeId, productId, variantId } = req.query;
+    if (!productId) return res.status(400).json({ error: 'productId obrigatório' });
+
+    const storeWhere = { userId: req.userId };
+    if (storeId) storeWhere.id = storeId;
+    const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+    const storeIds = stores.map(s => s.id);
+    if (!storeIds.length) return res.json({ orders: [] });
+
+    const [y, mo] = month.split('-').map(Number);
+    const start = new Date(Date.UTC(y, mo - 1, 1));
+    const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
+
+    const where = {
+      storeId: { in: storeIds },
+      soldAt: { gte: start, lte: end },
+      productId,
+      orderCategory: { in: ['valid', 'pending'] },
+    };
+    if (variantId) where.variantId = variantId;
+
+    const orders = await prisma.order.findMany({
+      where,
+      orderBy: { soldAt: 'asc' },
+      select: {
+        orderId: true, orderCategory: true, soldAt: true, calcGmv: true,
+        escrowAmount: true, platformCommission: true, platformServiceFee: true,
+        sellerCoupon: true, lmmDiscount: true,
+      },
+    });
+
+    const list = orders.map(o => {
+      const isConfirmed = o.orderCategory === 'valid';
+      const orderFee  = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+      const orderDisc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+      const orderNet  = r2(o.calcGmv - orderFee - orderDisc);
+      const repasse   = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+
+      return {
+        orderSn: o.orderId,
+        soldAt:  o.soldAt,
+        valor:   r2(o.calcGmv),
+        status:  isConfirmed ? 'Liquidado' : 'Pendente',
+        repasse,
+      };
+    });
+
+    return res.json({ orders: list });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Erro ao buscar pedidos do produto' });
+  }
 }
 
 // ── GET /api/closing/history ──────────────────────────────────────────────────
@@ -1099,4 +1158,4 @@ async function getPdf(req, res) {
   }
 }
 
-module.exports = { getHistory, getClosing, closeMonth, reopenMonth, getPdf };
+module.exports = { getHistory, getClosing, closeMonth, reopenMonth, getPdf, getProductOrders };
