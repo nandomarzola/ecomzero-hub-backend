@@ -13,6 +13,7 @@ const {
   convertShopeeOrder,
   fetchItemList,
   fetchItemBaseInfo,
+  fetchModelList,
 } = require('../services/shopeeService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
 
@@ -304,6 +305,30 @@ async function syncOrders(req, res) {
           });
           if (variant) variantMap[key] = variant.id;
         }
+
+        // Pedido referencia uma variação real (modelId != '0') mas ainda não
+        // sincronizamos o catálogo de variações deste produto — busca agora
+        // via get_model_list e cria os ProductVariant, para já habilitar
+        // custo por variação a partir deste pedido.
+        if (!variantMap[key] && modelId !== '0') {
+          const existingCount = await prisma.productVariant.count({ where: { productId: product.id } });
+          if (existingCount === 0) {
+            const models = await fetchModelList(accessToken, store.spShopId, item.item_id);
+            for (const model of models) {
+              const variant = await prisma.productVariant.create({
+                data: {
+                  productId: product.id,
+                  marketplaceVariantId: String(model.model_id),
+                  name: model.model_name,
+                  sku: model.model_sku,
+                  price: r2(model.price_info?.[0]?.current_price ?? 0),
+                  stock: model.stock_info_v2?.summary_info?.total_available_stock ?? 0,
+                },
+              });
+              if (String(model.model_id) === modelId) variantMap[key] = variant.id;
+            }
+          }
+        }
       }
     }
     console.log(`[Shopee] ${Object.keys(itemMap).length} produtos vinculados/criados`);
@@ -381,13 +406,27 @@ async function syncItems(req, res) {
     const itemIds = items.map(i => i.item_id);
     const details = await fetchItemBaseInfo(accessToken, store.spShopId, itemIds);
 
+    // Pré-busca model_list real (get_item_base_info não retorna) em lotes de 10,
+    // respeitando rate limit da Shopee
+    const modelListMap = new Map(); // item_id → models[]
+    for (let i = 0; i < details.length; i += 10) {
+      const batch = details.slice(i, i + 10);
+      const results = await Promise.all(batch.map(item =>
+        item.has_model
+          ? fetchModelList(accessToken, store.spShopId, item.item_id)
+          : Promise.resolve([])
+      ));
+      batch.forEach((item, idx) => modelListMap.set(item.item_id, results[idx]));
+    }
+
     let synced = 0, created = 0, updated = 0, migratedOrphans = 0;
     let needsRecalc = false;
 
     for (const item of details) {
-      const models = item.model_list?.length
-        ? item.model_list
-        : [{ model_id: 0, model_sku: null, model_name: null, price_info: item.price_info, stock_info_v2: item.stock_info_v2 }];
+      let models = modelListMap.get(item.item_id) ?? [];
+      if (!models.length) {
+        models = [{ model_id: 0, model_sku: null, model_name: null, price_info: item.price_info, stock_info_v2: item.stock_info_v2 }];
+      }
 
       // Variações do anúncio, guardadas como metadado para matching/exibição
       const variations = models.map(model => ({

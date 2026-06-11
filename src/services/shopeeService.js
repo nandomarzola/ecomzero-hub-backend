@@ -257,6 +257,37 @@ async function fetchItemBaseInfo(accessToken, shopId, itemIds) {
   return items;
 }
 
+// ── Variações (models) reais de um item — get_item_base_info não retorna model_list ──
+// Retorna [{ model_id, model_sku, model_name, price_info, stock_info_v2 }]
+async function fetchModelList(accessToken, shopId, itemId) {
+  const res = await shopApiGet('/api/v2/product/get_model_list', accessToken, shopId, {
+    item_id: itemId,
+  });
+
+  if (res.error) {
+    console.error('[Shopee] get_model_list erro:', res.error, res.message, 'item_id=', itemId);
+    return [];
+  }
+
+  const tierVariation = res.response?.tier_variation ?? [];
+  const models        = res.response?.model ?? [];
+
+  return models.map((model) => {
+    const name = (model.tier_index ?? [])
+      .map((optIdx, tierIdx) => tierVariation[tierIdx]?.option_list?.[optIdx]?.option)
+      .filter(Boolean)
+      .join(', ');
+
+    return {
+      model_id:      model.model_id,
+      model_sku:     model.model_sku || null,
+      model_name:    name || null,
+      price_info:    model.price_info,
+      stock_info_v2: model.stock_info_v2,
+    };
+  });
+}
+
 module.exports = {
   fetchOrderList,
   fetchOrderDetails,
@@ -265,4 +296,5 @@ module.exports = {
   convertShopeeOrder,
   fetchItemList,
   fetchItemBaseInfo,
+  fetchModelList,
 };
