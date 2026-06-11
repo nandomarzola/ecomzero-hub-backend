@@ -49,7 +49,10 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       : null;
 
     let platformNetRevenue = null;
-    if (marketplace === 'shopee' && (order.globalTotal ?? 0) > 0) {
+    if (marketplace === 'shopee' && order.escrowAmount != null) {
+      // Repasse real informado pela Shopee (get_escrow_detail) — já líquido de comissão/taxas
+      platformNetRevenue = order.escrowAmount;
+    } else if (marketplace === 'shopee' && (order.globalTotal ?? 0) > 0) {
       const cappedGlobal = Math.min(order.globalTotal, (order.agreedPrice ?? 0) * (order.quantity ?? 1));
       platformNetRevenue = r2(cappedGlobal - (order.platformCommission ?? 0) - (order.platformServiceFee ?? 0));
     } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {

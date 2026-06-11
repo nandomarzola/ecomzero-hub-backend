@@ -173,6 +173,9 @@ model Order {
   globalTotal Float  @default(0)
   orderTotal  Float  @default(0)
 
+  // ── Repasse real informado pela Shopee (get_escrow_detail) ────────────────
+  escrowAmount Float?  // null = escrow ainda não disponível (pedido recente/pendente)
+
   // ── Logística ─────────────────────────────────────────────────────────────
   listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
   mlShippingCost   Float    @default(0)  // Frete pago pelo VENDEDOR (Mercado Envios)

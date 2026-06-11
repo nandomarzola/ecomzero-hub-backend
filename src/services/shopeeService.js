@@ -186,6 +186,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     sellerCoupon,
     sellerDiscount,
     lmmDiscount:   0,
+    escrowAmount:  (escrow && escrow.escrow_amount != null) ? r2(escrow.escrow_amount) : null,
     globalTotal:   r2(detail.total_amount ?? gmv),
     orderTotal:    r2(detail.total_amount ?? gmv),
     listingType:   null,
