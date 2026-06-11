@@ -15,6 +15,20 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
 }
 
+// Resolve fonte/alíquota/DAS para exibição no fechamento
+function computeTaxInfo(monthlyTax, taxAmount, gmvTotal) {
+  const fonte = monthlyTax?.effectiveRate != null ? 'das_real' : 'estimada';
+  const aliquota = fonte === 'das_real'
+    ? monthlyTax.effectiveRate
+    : (gmvTotal > 0 ? r2((taxAmount / gmvTotal) * 100) : 0);
+  return {
+    fonte,
+    aliquota,
+    dasAmount: monthlyTax?.dasAmount ?? null,
+    totalRevenue: monthlyTax?.totalRevenue ?? null,
+  };
+}
+
 function fmtDateTime(d) {
   if (!d) return '';
   const dt = new Date(d);
@@ -64,18 +78,25 @@ function makeH(doc, ML = 42, MR = 553) {
 }
 
 // ── Core: compute monthly data ─────────────────────────────────────────────────
-async function buildClosingData(storeIds, month) {
+async function buildClosingData(storeIds, month, userId = null) {
   const [y, mo] = month.split('-').map(Number);
   const start = new Date(Date.UTC(y, mo - 1, 1));
   const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
 
   const stores = await prisma.store.findMany({
     where:  { id: { in: storeIds } },
-    select: { id: true, taxType: true, fixedMonthlyTax: true },
+    select: { id: true, taxType: true, taxRate: true, fixedMonthlyTax: true },
   });
   const fixedTaxAmount = r2(stores
     .filter(s => s.taxType === 'mei')
     .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
+  const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
+
+  // DAS mensal informada pelo usuário (alíquota efetiva real) — fallback p/ taxRate da loja
+  const monthlyTax = userId
+    ? await prisma.monthlyTax.findUnique({ where: { userId_month: { userId, month } } })
+    : null;
+  const taxFonte = monthlyTax?.effectiveRate != null ? 'das_real' : 'estimada';
 
   const allOrders = await prisma.order.findMany({
     where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
@@ -104,7 +125,13 @@ async function buildClosingData(storeIds, month) {
     const orderFee    = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
     const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
     const orderNet    = r2(o.calcGmv - orderFee - orderDisc);
-    const orderProfit = r2(orderNet - o.calcTax - o.calcProductCost - o.calcPackaging);
+
+    // baseFiscal exclui voucher pago pela Shopee (não é receita do vendedor p/ fins fiscais)
+    const baseFiscal    = r2((o.calcGmv ?? 0) - (o.shopeeVoucher ?? 0));
+    const aliquotaOrder = taxFonte === 'das_real' ? monthlyTax.effectiveRate : (storeTaxRateMap.get(o.storeId) ?? 0);
+    const calcTax       = r2(baseFiscal * aliquotaOrder / 100);
+
+    const orderProfit = r2(orderNet - calcTax - o.calcProductCost - o.calcPackaging);
 
     if (o.orderCategory === 'valid')        confirmedCount++;
     else if (o.orderCategory === 'pending') pendingCount++;
@@ -116,7 +143,7 @@ async function buildClosingData(storeIds, month) {
       shopeeDeductions += orderFee;
       sellerDiscounts  += orderDisc;
       netRevenue       += orderNet;
-      taxAmount        += o.calcTax;
+      taxAmount        += calcTax;
       productCost      += o.calcProductCost;
       packagingCost    += o.calcPackaging;
       grossProfit      += orderProfit;
@@ -249,6 +276,7 @@ async function buildClosingData(storeIds, month) {
     cancelledGmv:     r2(cancelledGmv),
     returnedValue:    r2(returnedValue),
     orphanCount:      groups.filter(g => !g.hasCost).length,
+    taxInfo:          computeTaxInfo(monthlyTax, taxAmount, gmvTotal),
     groups,
   };
 }
@@ -292,6 +320,7 @@ async function getClosing(req, res) {
 
     if (closing) {
       const snap = closing.productsSnapshot ?? [];
+      const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
       return res.json({
         status:   'closed',
         closedAt: closing.closedAt,
@@ -318,12 +347,13 @@ async function getClosing(req, res) {
           cancelledGmv:     closing.cancelledGmv,
           returnedValue:    closing.returnedValue,
           orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+          taxInfo:          computeTaxInfo(monthlyTax, closing.taxAmount, closing.gmvTotal),
         },
         groups: Array.isArray(snap) ? snap : [],
       });
     }
 
-    const computed = await buildClosingData(storeIds, month);
+    const computed = await buildClosingData(storeIds, month, req.userId);
     return res.json({ status: 'open', data: computed, groups: computed.groups });
   } catch (err) {
     console.error(err);
@@ -353,7 +383,7 @@ async function closeMonth(req, res) {
       });
     }
 
-    const d = await buildClosingData([sid], month);
+    const d = await buildClosingData([sid], month, req.userId);
 
     const closing = await prisma.monthlyClosing.upsert({
       where:  { storeId_periodMonth: { storeId: sid, periodMonth: month } },
@@ -700,7 +730,7 @@ async function getPdf(req, res) {
           groups:           Array.isArray(snap) ? snap : [],
         };
       } else {
-        d = await buildClosingData([store.id], month);
+        d = await buildClosingData([store.id], month, req.userId);
       }
 
       renderStoreSection(doc, store, d, month, { isClosed, closedAt });
@@ -711,8 +741,8 @@ async function getPdf(req, res) {
 
       // Parallel: consolidated total + per-store breakdown
       const [consolidatedData, ...storeDataArr] = await Promise.all([
-        buildClosingData(allStoreIds, month),
-        ...stores.map(s => buildClosingData([s.id], month)),
+        buildClosingData(allStoreIds, month, req.userId),
+        ...stores.map(s => buildClosingData([s.id], month, req.userId)),
       ]);
       const storeResults = stores.map((s, i) => ({ store: s, data: storeDataArr[i] }));
 

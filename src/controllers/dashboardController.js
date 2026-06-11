@@ -42,6 +42,7 @@ async function getSummary(req, res) {
       totalRevenue: 0, totalProfit: 0, avgMargin: 0, totalOrders: 0, avgTicket: 0,
       negativeMargin: 0, topProducts: [], worstProducts: [], monthlyChart: [],
       costsBreakdown: {}, prevKPIs: null, sparkline: [], channelBreakdown: [], dailyHeatmap: [],
+      closedRevenue: { total: 0, months: [] },
     });
   }
 
@@ -62,7 +63,7 @@ async function getSummary(req, res) {
   sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
   // Busca paralela: todos os dados de uma vez
-  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore] = await Promise.all([
+  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
       select: { salePrice: true, profit: true, margin: true, soldAt: true, storeId: true },
@@ -94,6 +95,10 @@ async function getSummary(req, res) {
     storeIds.length === 1
       ? prisma.store.findUnique({ where: { id: storeIds[0] } })
       : Promise.resolve(null),
+    prisma.monthlyClosing.findMany({
+      where:  { storeId: { in: storeIds }, status: 'closed' },
+      select: { periodMonth: true, gmvTotal: true },
+    }),
   ]);
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
@@ -103,6 +108,18 @@ async function getSummary(req, res) {
   const avgMargin     = totalOrders ? orders.reduce((s, o) => s + (o.margin ?? 0), 0) / totalOrders : 0;
   const avgTicket     = totalOrders ? totalRevenue / totalOrders : 0;
   const negativeMargin = orders.filter((o) => (o.profit ?? 0) < 0).length;
+
+  // ── Faturamento consolidado (apenas meses fechados) ────────────────────────
+  const closedByMonth = {};
+  for (const c of closedClosingsRaw) {
+    closedByMonth[c.periodMonth] = (closedByMonth[c.periodMonth] ?? 0) + c.gmvTotal;
+  }
+  const closedRevenue = {
+    total: parseFloat(Object.values(closedByMonth).reduce((s, v) => s + v, 0).toFixed(2)),
+    months: Object.entries(closedByMonth)
+      .map(([month, revenue]) => ({ month, revenue: parseFloat(revenue.toFixed(2)) }))
+      .sort((a, b) => b.month.localeCompare(a.month)),
+  };
 
   // ── KPIs do período anterior ───────────────────────────────────────────────
   let prevKPIs = null;
@@ -267,6 +284,7 @@ async function getSummary(req, res) {
     channelBreakdown,
     dailyHeatmap,
     heatmapByStore,
+    closedRevenue,
   });
 }
 

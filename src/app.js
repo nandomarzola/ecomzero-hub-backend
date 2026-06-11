@@ -21,6 +21,7 @@ const closingRoutes       = require('./routes/closing');
 const mlRoutes            = require('./routes/ml');
 const tiktokRoutes        = require('./routes/tiktok');
 const shopeeRoutes        = require('./routes/shopee');
+const monthlyTaxRoutes    = require('./routes/monthlyTax');
 
 const { startRecalculateWorker }  = require('./services/recalculateQueue');
 
@@ -86,6 +87,7 @@ app.use('/api/closing',         closingRoutes);
 app.use('/api/ml',              mlRoutes);
 app.use('/api/tiktok',          tiktokRoutes);
 app.use('/api/shopee',          shopeeRoutes);
+app.use('/api/monthly-tax',     monthlyTaxRoutes);
 
 // Tratamento de erros global
 app.use((err, req, res, next) => {

@@ -23,6 +23,7 @@ model User {
   purchaseOrders PurchaseOrder[]
   newsReads      NewsRead[]
   goals          Goal[]
+  monthlyTaxes   MonthlyTax[]
 }
 
 model Store {
@@ -175,6 +176,9 @@ model Order {
 
   // ── Repasse real informado pela Shopee (get_escrow_detail) ────────────────
   escrowAmount Float?  // null = escrow ainda não disponível (pedido recente/pendente)
+
+  // ── Voucher custeado pela Shopee (não reduz repasse, mas reduz base fiscal) ─
+  shopeeVoucher Float?  // null = escrow ainda não disponível
 
   // ── Logística ─────────────────────────────────────────────────────────────
   listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
@@ -372,6 +376,21 @@ model MonthlyClosing {
   productsSnapshot Json
 
   @@unique([storeId, periodMonth])
+}
+
+model MonthlyTax {
+  id             String   @id @default(uuid())
+  userId         String
+  month          String   // formato "2026-05"
+  revenueByStore Json     // { storeId: { storeName, marketplace, revenue } }
+  totalRevenue   Float    // soma automática do revenueByStore
+  dasAmount      Float?   // valor DAS pago pelo cliente (null = não informado)
+  effectiveRate  Float?   // calculado: dasAmount / totalRevenue * 100
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([userId, month])
 }
 
 model StoreRate {
