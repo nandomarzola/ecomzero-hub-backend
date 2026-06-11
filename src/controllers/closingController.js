@@ -79,7 +79,10 @@ async function buildClosingData(storeIds, month) {
 
   const allOrders = await prisma.order.findMany({
     where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
-    include: { product: { select: { id: true, name: true, sku: true } } },
+    include: {
+      product: { select: { id: true, name: true, sku: true } },
+      variant: { select: { id: true, name: true, sku: true } },
+    },
   });
 
   let gmvTotal = 0, gmvConfirmed = 0, gmvPending = 0;
@@ -139,6 +142,7 @@ async function buildClosingData(storeIds, month) {
           orderCount: 0, qty: 0,
           gmv: 0, shopeeFee: 0, netRevenue: 0,
           productCost: 0, packaging: 0, grossProfit: 0,
+          variantMap: new Map(),
         });
       }
       const g = groupMap.get(key);
@@ -152,6 +156,32 @@ async function buildClosingData(storeIds, month) {
       g.grossProfit += orderProfit;
       if (!o.hasCost)                    g.hasCost   = false;
       if (o.orderCategory === 'pending') g.hasPending = true;
+
+      // Quebra adicional por variação real (ProductVariant)
+      if (o.variantId) {
+        if (!g.variantMap.has(o.variantId)) {
+          g.variantMap.set(o.variantId, {
+            variantId: o.variantId,
+            name: o.variant?.name ?? o.variationName ?? null,
+            sku:  o.variant?.sku  ?? o.skuVariacao ?? null,
+            hasCost: true, hasPending: false,
+            orderCount: 0, qty: 0,
+            gmv: 0, shopeeFee: 0, netRevenue: 0,
+            productCost: 0, packaging: 0, grossProfit: 0,
+          });
+        }
+        const v = g.variantMap.get(o.variantId);
+        v.orderCount  += 1;
+        v.qty         += o.quantity;
+        v.gmv         += o.calcGmv;
+        v.shopeeFee   += orderFee;
+        v.netRevenue  += orderNet;
+        v.productCost += o.calcProductCost;
+        v.packaging   += o.calcPackaging;
+        v.grossProfit += orderProfit;
+        if (!o.hasCost)                    v.hasCost   = false;
+        if (o.orderCategory === 'pending') v.hasPending = true;
+      }
     }
   }
 
@@ -176,6 +206,24 @@ async function buildClosingData(storeIds, month) {
       packaging:    r2(g.packaging),
       grossProfit:  r2(g.grossProfit),
       margin:       g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
+      variants: [...g.variantMap.values()]
+        .map(v => ({
+          variantId:    v.variantId,
+          name:         v.name,
+          sku:          v.sku,
+          hasCost:      v.hasCost,
+          hasPending:   v.hasPending,
+          orderCount:   v.orderCount,
+          qty:          v.qty,
+          gmv:          r2(v.gmv),
+          shopeeFee:    r2(v.shopeeFee),
+          netRevenue:   r2(v.netRevenue),
+          productCost:  r2(v.productCost),
+          packaging:    r2(v.packaging),
+          grossProfit:  r2(v.grossProfit),
+          margin:       v.gmv > 0 ? r2((v.grossProfit / v.gmv) * 100) : 0,
+        }))
+        .sort((a, b) => b.gmv - a.gmv),
     }))
     .sort((a, b) => b.gmv - a.gmv);
 
