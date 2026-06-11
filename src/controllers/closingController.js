@@ -29,6 +29,12 @@ function computeTaxInfo(monthlyTax, taxAmount, gmvTotal) {
   };
 }
 
+// Soma um campo numérico através dos grupos de produto de um snapshot salvo
+function sumGroupField(snap, field) {
+  if (!Array.isArray(snap)) return 0;
+  return r2(snap.reduce((sum, g) => sum + (g[field] ?? 0), 0));
+}
+
 function fmtDateTime(d) {
   if (!d) return '';
   const dt = new Date(d);
@@ -361,6 +367,20 @@ async function getClosing(req, res) {
     if (closing) {
       const snap = closing.productsSnapshot ?? [];
       const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
+
+      // Snapshots gerados antes da refatoração do fechamento não têm os campos de repasse/imposto por grupo
+      const hasNewFields = Array.isArray(snap) && snap.some(g => g.impostoTotal != null);
+
+      const repasseConfirmado = hasNewFields ? sumGroupField(snap, 'repasseConfirmado') : closing.netRevenue;
+      const repasseEstimado   = hasNewFields ? sumGroupField(snap, 'repasseEstimado')   : 0;
+      const repasseTotal      = r2(repasseConfirmado + repasseEstimado);
+      const impostoTotal      = hasNewFields ? sumGroupField(snap, 'impostoTotal') : closing.taxAmount;
+      const custoTotal        = r2(closing.productCost + closing.packagingCost);
+      const resultadoLiquido  = hasNewFields
+        ? r2(repasseTotal - impostoTotal - custoTotal - closing.fixedTaxAmount)
+        : closing.grossProfit;
+      const margem = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : closing.avgMargin;
+
       return res.json({
         status:   'closed',
         closedAt: closing.closedAt,
@@ -387,7 +407,22 @@ async function getClosing(req, res) {
           cancelledGmv:     closing.cancelledGmv,
           returnedValue:    closing.returnedValue,
           orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
-          taxInfo:          computeTaxInfo(monthlyTax, closing.taxAmount, closing.gmvTotal),
+          // taxInfo é recalculado ao vivo: a DAS pode ter sido informada depois do fechamento
+          taxInfo:          computeTaxInfo(monthlyTax, impostoTotal, closing.gmvTotal),
+
+          // ── Novo modelo: repasse / imposto / resultado líquido ──────────────
+          repasseConfirmado,
+          repasseEstimado,
+          repasseTotal,
+          impostoTotal,
+          custoTotal,
+          resultadoLiquido,
+          margem,
+          pendentes: {
+            count: closing.pendingOrders,
+            gmv: closing.gmvPending,
+            estimatedRepasse: repasseEstimado,
+          },
         },
         groups: Array.isArray(snap) ? snap : [],
       });
