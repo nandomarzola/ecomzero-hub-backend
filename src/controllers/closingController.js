@@ -109,6 +109,7 @@ async function buildClosingData(storeIds, month, userId = null) {
   let gmvTotal = 0, gmvConfirmed = 0, gmvPending = 0;
   let shopeeDeductions = 0, sellerDiscounts = 0, netRevenue = 0;
   let taxAmount = 0, productCost = 0, packagingCost = 0, grossProfit = 0;
+  let repasseConfirmado = 0, repasseEstimado = 0;
   let cancelledGmv = 0, returnedValue = 0;
   let unitCount = 0;
   let confirmedCount = 0, pendingCount = 0, cancelledCount = 0, returnedCount = 0;
@@ -116,7 +117,9 @@ async function buildClosingData(storeIds, month, userId = null) {
   const groupMap = new Map();
 
   for (const o of allOrders) {
-    const isRevenue  = ['valid', 'pending'].includes(o.orderCategory);
+    const isConfirmed = o.orderCategory === 'valid';
+    const isPending   = o.orderCategory === 'pending';
+    const isRevenue   = isConfirmed || isPending;
     const isCancelled = o.orderCategory.startsWith('cancelled');
     const isReturned  = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
 
@@ -126,33 +129,35 @@ async function buildClosingData(storeIds, month, userId = null) {
     const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
     const orderNet    = r2(o.calcGmv - orderFee - orderDisc);
 
-    // baseFiscal exclui voucher pago pela Shopee (não é receita do vendedor p/ fins fiscais)
-    const baseFiscal    = r2((o.calcGmv ?? 0) - (o.shopeeVoucher ?? 0));
+    // Repasse: confirmado usa escrowAmount real (Shopee); pending usa estimativa (gmv - taxas - descontos)
+    const orderRepasse = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+
+    // Imposto: sobre o faturamento bruto (calcGmv) — não desconta voucher Shopee da base
     const aliquotaOrder = taxFonte === 'das_real' ? monthlyTax.effectiveRate : (storeTaxRateMap.get(o.storeId) ?? 0);
-    const calcTax       = r2(baseFiscal * aliquotaOrder / 100);
+    const orderTax      = r2((o.calcGmv ?? 0) * aliquotaOrder / 100);
 
-    const orderProfit = r2(orderNet - calcTax - o.calcProductCost - o.calcPackaging);
+    const orderProfit = r2(orderRepasse - orderTax - o.calcProductCost - o.calcPackaging);
 
-    if (o.orderCategory === 'valid')        confirmedCount++;
-    else if (o.orderCategory === 'pending') pendingCount++;
-    else if (isCancelled)                   cancelledCount++;
-    if (isReturned)                         returnedCount++;
+    if (isConfirmed)      confirmedCount++;
+    else if (isPending)   pendingCount++;
+    else if (isCancelled) cancelledCount++;
+    if (isReturned)       returnedCount++;
 
     if (isRevenue) {
       gmvTotal         += o.calcGmv;
       shopeeDeductions += orderFee;
       sellerDiscounts  += orderDisc;
       netRevenue       += orderNet;
-      taxAmount        += calcTax;
+      taxAmount        += orderTax;
       productCost      += o.calcProductCost;
       packagingCost    += o.calcPackaging;
       grossProfit      += orderProfit;
       unitCount        += o.quantity;
-      if (o.orderCategory === 'valid')   gmvConfirmed += o.calcGmv;
-      if (o.orderCategory === 'pending') gmvPending   += o.calcGmv;
+      if (isConfirmed) { gmvConfirmed += o.calcGmv; repasseConfirmado += orderRepasse; }
+      if (isPending)   { gmvPending   += o.calcGmv; repasseEstimado   += orderRepasse; }
     }
     if (isCancelled) cancelledGmv += o.calcGmv;
-    if (o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial') returnedValue += o.calcGmv;
+    if (isReturned)  returnedValue += o.calcGmv;
 
     if (isRevenue) {
       const key = o.productId
@@ -169,6 +174,7 @@ async function buildClosingData(storeIds, month, userId = null) {
           orderCount: 0, qty: 0,
           gmv: 0, shopeeFee: 0, netRevenue: 0,
           productCost: 0, packaging: 0, grossProfit: 0,
+          repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
           variantMap: new Map(),
         });
       }
@@ -181,6 +187,9 @@ async function buildClosingData(storeIds, month, userId = null) {
       g.productCost += o.calcProductCost;
       g.packaging   += o.calcPackaging;
       g.grossProfit += orderProfit;
+      g.impostoTotal += orderTax;
+      if (isConfirmed) g.repasseConfirmado += orderRepasse;
+      if (isPending)   g.repasseEstimado   += orderRepasse;
       if (!o.hasCost)                    g.hasCost   = false;
       if (o.orderCategory === 'pending') g.hasPending = true;
 
@@ -195,6 +204,7 @@ async function buildClosingData(storeIds, month, userId = null) {
             orderCount: 0, qty: 0,
             gmv: 0, shopeeFee: 0, netRevenue: 0,
             productCost: 0, packaging: 0, grossProfit: 0,
+            repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
           });
         }
         const v = g.variantMap.get(o.variantId);
@@ -206,6 +216,9 @@ async function buildClosingData(storeIds, month, userId = null) {
         v.productCost += o.calcProductCost;
         v.packaging   += o.calcPackaging;
         v.grossProfit += orderProfit;
+        v.impostoTotal += orderTax;
+        if (isConfirmed) v.repasseConfirmado += orderRepasse;
+        if (isPending)   v.repasseEstimado   += orderRepasse;
         if (!o.hasCost)                    v.hasCost   = false;
         if (o.orderCategory === 'pending') v.hasPending = true;
       }
@@ -215,6 +228,12 @@ async function buildClosingData(storeIds, month, userId = null) {
   // DAS mensal (MEI) é um custo fixo do período, não por pedido — descontado uma vez do lucro do mês
   grossProfit -= fixedTaxAmount;
   const avgMargin = gmvTotal > 0 ? (grossProfit / gmvTotal) * 100 : 0;
+
+  const repasseTotal     = r2(repasseConfirmado + repasseEstimado);
+  const impostoTotal     = r2(taxAmount);
+  const custoTotal       = r2(productCost + packagingCost);
+  const resultadoLiquido = r2(repasseTotal - impostoTotal - custoTotal - fixedTaxAmount);
+  const margem           = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : 0;
 
   const groups = [...groupMap.values()]
     .map(g => ({
@@ -233,6 +252,9 @@ async function buildClosingData(storeIds, month, userId = null) {
       packaging:    r2(g.packaging),
       grossProfit:  r2(g.grossProfit),
       margin:       g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
+      repasseConfirmado: r2(g.repasseConfirmado),
+      repasseEstimado:   r2(g.repasseEstimado),
+      impostoTotal:      r2(g.impostoTotal),
       variants: [...g.variantMap.values()]
         .map(v => ({
           variantId:    v.variantId,
@@ -249,6 +271,9 @@ async function buildClosingData(storeIds, month, userId = null) {
           packaging:    r2(v.packaging),
           grossProfit:  r2(v.grossProfit),
           margin:       v.gmv > 0 ? r2((v.grossProfit / v.gmv) * 100) : 0,
+          repasseConfirmado: r2(v.repasseConfirmado),
+          repasseEstimado:   r2(v.repasseEstimado),
+          impostoTotal:      r2(v.impostoTotal),
         }))
         .sort((a, b) => b.gmv - a.gmv),
     }))
@@ -277,6 +302,21 @@ async function buildClosingData(storeIds, month, userId = null) {
     returnedValue:    r2(returnedValue),
     orphanCount:      groups.filter(g => !g.hasCost).length,
     taxInfo:          computeTaxInfo(monthlyTax, taxAmount, gmvTotal),
+
+    // ── Novo modelo: repasse / imposto / resultado líquido ──────────────────
+    repasseConfirmado: r2(repasseConfirmado),
+    repasseEstimado:   r2(repasseEstimado),
+    repasseTotal,
+    impostoTotal,
+    custoTotal,
+    resultadoLiquido,
+    margem,
+    pendentes: {
+      count: pendingCount,
+      gmv: r2(gmvPending),
+      estimatedRepasse: r2(repasseEstimado),
+    },
+
     groups,
   };
 }
