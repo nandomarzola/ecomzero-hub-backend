@@ -3,29 +3,42 @@ const prisma = require('../lib/prisma');
 function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
 
 // Soma o GMV (valid+pending) de cada loja do usuário no mês,
-// usando apenas meses já fechados (MonthlyClosing.status === 'closed')
+// direto dos pedidos (Order), independente do mês estar fechado
 async function computeRevenueByStore(userId, month) {
   const stores = await prisma.store.findMany({
     where: { userId },
     select: { id: true, name: true, marketplace: true },
   });
+  if (!stores.length) return { revenueByStore: {}, totalRevenue: 0 };
+
+  const [y, mo] = month.split('-').map(Number);
+  const start = new Date(Date.UTC(y, mo - 1, 1));
+  const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
+
+  const grouped = await prisma.order.groupBy({
+    by: ['storeId'],
+    where: {
+      storeId: { in: stores.map((s) => s.id) },
+      soldAt: { gte: start, lte: end },
+      orderCategory: { in: ['valid', 'pending'] },
+    },
+    _sum: { calcGmv: true },
+  });
+  const revenueByStoreId = new Map(grouped.map((g) => [g.storeId, r2(g._sum.calcGmv)]));
 
   const revenueByStore = {};
   let totalRevenue = 0;
 
   for (const store of stores) {
-    const closing = await prisma.monthlyClosing.findFirst({
-      where: { storeId: store.id, periodMonth: month, status: 'closed' },
-      select: { gmvTotal: true },
-    });
-    if (!closing) continue;
+    const revenue = revenueByStoreId.get(store.id);
+    if (!revenue) continue;
 
     revenueByStore[store.id] = {
       storeName: store.name,
       marketplace: store.marketplace,
-      revenue: closing.gmvTotal,
+      revenue,
     };
-    totalRevenue += closing.gmvTotal;
+    totalRevenue += revenue;
   }
 
   return { revenueByStore, totalRevenue: r2(totalRevenue) };
