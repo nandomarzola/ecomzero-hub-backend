@@ -27,6 +27,14 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
 
   if (!orders.length) return 0;
 
+  // Pré-carrega ProductVariant da store p/ fallback de custo por SKU da variação
+  // (cobre pedidos cujo variantId não foi resolvido no momento da importação)
+  const variants = await prisma.productVariant.findMany({
+    where: { product: { storeId } },
+    select: { productId: true, sku: true, costPrice: true },
+  });
+  const variantBySku = new Map(variants.map(v => [`${v.productId}|${v.sku}`, v]));
+
   const BATCH = 200;
   const updates = [];
 
@@ -56,12 +64,16 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       );
     }
 
+    const skuMatch = order.skuVariacao
+      ? variantBySku.get(`${order.productId}|${order.skuVariacao}`)
+      : null;
+
     const calc = calcOrderProfit({
       agreedPrice:       order.agreedPrice,
       quantity:          order.quantity,
       sellerCoupon:      order.sellerCoupon,
       lmmDiscount:       order.lmmDiscount,
-      costPrice:         order.variant?.costPrice ?? order.product?.costPrice ?? 0,
+      costPrice:         order.variant?.costPrice ?? skuMatch?.costPrice ?? order.product?.costPrice ?? 0,
       packagingCost:     order.product?.packaging ?? 0,
       taxRate,
       marketplace,
