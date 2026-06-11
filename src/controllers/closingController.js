@@ -35,6 +35,66 @@ function sumGroupField(snap, field) {
   return r2(snap.reduce((sum, g) => sum + (g[field] ?? 0), 0));
 }
 
+// Reconstrói o objeto de dados completo (incl. campos do novo modelo de repasse/imposto)
+// a partir de um MonthlyClosing salvo + DAS atual. taxInfo é sempre recalculado ao vivo,
+// pois a DAS pode ter sido informada depois do fechamento.
+function snapshotToClosingData(closing, monthlyTax) {
+  const snap = closing.productsSnapshot ?? [];
+
+  // Snapshots gerados antes da refatoração do fechamento não têm os campos de repasse/imposto por grupo
+  const hasNewFields = Array.isArray(snap) && snap.some(g => g.impostoTotal != null);
+
+  const repasseConfirmado = hasNewFields ? sumGroupField(snap, 'repasseConfirmado') : closing.netRevenue;
+  const repasseEstimado   = hasNewFields ? sumGroupField(snap, 'repasseEstimado')   : 0;
+  const repasseTotal      = r2(repasseConfirmado + repasseEstimado);
+  const impostoTotal      = hasNewFields ? sumGroupField(snap, 'impostoTotal') : closing.taxAmount;
+  const custoTotal        = r2(closing.productCost + closing.packagingCost);
+  const resultadoLiquido  = hasNewFields
+    ? r2(repasseTotal - impostoTotal - custoTotal - closing.fixedTaxAmount)
+    : closing.grossProfit;
+  const margem = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : closing.avgMargin;
+
+  return {
+    totalOrders:      closing.totalOrders,
+    confirmedOrders:  closing.confirmedOrders,
+    pendingOrders:    closing.pendingOrders,
+    cancelledOrders:  closing.cancelledOrders,
+    returnedOrders:   closing.returnedOrders,
+    unitCount:        closing.unitCount,
+    gmvTotal:         closing.gmvTotal,
+    gmvConfirmed:     closing.gmvConfirmed,
+    gmvPending:       closing.gmvPending,
+    shopeeDeductions: closing.shopeeDeductions,
+    sellerDiscounts:  closing.sellerDiscounts,
+    netRevenue:       closing.netRevenue,
+    taxAmount:        closing.taxAmount,
+    fixedTaxAmount:   closing.fixedTaxAmount,
+    productCost:      closing.productCost,
+    packagingCost:    closing.packagingCost,
+    grossProfit:      closing.grossProfit,
+    avgMargin:        closing.avgMargin,
+    cancelledGmv:     closing.cancelledGmv,
+    returnedValue:    closing.returnedValue,
+    orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+    taxInfo:          computeTaxInfo(monthlyTax, impostoTotal, closing.gmvTotal),
+
+    repasseConfirmado,
+    repasseEstimado,
+    repasseTotal,
+    impostoTotal,
+    custoTotal,
+    resultadoLiquido,
+    margem,
+    pendentes: {
+      count: closing.pendingOrders,
+      gmv: closing.gmvPending,
+      estimatedRepasse: repasseEstimado,
+    },
+
+    groups: Array.isArray(snap) ? snap : [],
+  };
+}
+
 function fmtDateTime(d) {
   if (!d) return '';
   const dt = new Date(d);
@@ -46,16 +106,6 @@ function monthLabel(month) {
   return new Date(y, m - 1, 1).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
 }
 
-// Fix 1 — dynamic marketplace fee label
-function marketplaceFeeLabel(marketplace) {
-  const m = (marketplace || '').toLowerCase();
-  if (m === 'mercadolivre') return 'Taxas Mercado Livre';
-  if (m === 'shein')        return 'Taxas Shein';
-  if (m === 'tiktok')       return 'Taxas TikTok Shop';
-  if (m === 'shopee')       return 'Taxas Shopee';
-  return 'Taxas Marketplace';
-}
-
 // PDF pure helpers (no doc dependency)
 function fmtBRLpdf(v) {
   if (v === null || v === undefined) return '—';
@@ -63,14 +113,10 @@ function fmtBRLpdf(v) {
   const str = abs.toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
   return v < 0 ? `-R$ ${str}` : `R$ ${str}`;
 }
-function pctOf(v, total) {
-  return total > 0 ? ` (${(Math.abs(v) / total * 100).toFixed(1)}%)` : '';
-}
 function trunc(str, max = 46) {
   const s = String(str || '');
   return s.length > max ? s.substring(0, max) + '...' : s;
 }
-function taxRateStr(r) { return String(r ?? 0).replace('.', ','); }
 
 // Shared doc-bound helpers factory
 function makeH(doc, ML = 42, MR = 553) {
@@ -365,66 +411,14 @@ async function getClosing(req, res) {
     });
 
     if (closing) {
-      const snap = closing.productsSnapshot ?? [];
       const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
-
-      // Snapshots gerados antes da refatoração do fechamento não têm os campos de repasse/imposto por grupo
-      const hasNewFields = Array.isArray(snap) && snap.some(g => g.impostoTotal != null);
-
-      const repasseConfirmado = hasNewFields ? sumGroupField(snap, 'repasseConfirmado') : closing.netRevenue;
-      const repasseEstimado   = hasNewFields ? sumGroupField(snap, 'repasseEstimado')   : 0;
-      const repasseTotal      = r2(repasseConfirmado + repasseEstimado);
-      const impostoTotal      = hasNewFields ? sumGroupField(snap, 'impostoTotal') : closing.taxAmount;
-      const custoTotal        = r2(closing.productCost + closing.packagingCost);
-      const resultadoLiquido  = hasNewFields
-        ? r2(repasseTotal - impostoTotal - custoTotal - closing.fixedTaxAmount)
-        : closing.grossProfit;
-      const margem = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : closing.avgMargin;
-
+      const data = snapshotToClosingData(closing, monthlyTax);
       return res.json({
         status:   'closed',
         closedAt: closing.closedAt,
         closedBy: closing.closedBy,
-        data: {
-          totalOrders:      closing.totalOrders,
-          confirmedOrders:  closing.confirmedOrders,
-          pendingOrders:    closing.pendingOrders,
-          cancelledOrders:  closing.cancelledOrders,
-          returnedOrders:   closing.returnedOrders,
-          unitCount:        closing.unitCount,
-          gmvTotal:         closing.gmvTotal,
-          gmvConfirmed:     closing.gmvConfirmed,
-          gmvPending:       closing.gmvPending,
-          shopeeDeductions: closing.shopeeDeductions,
-          sellerDiscounts:  closing.sellerDiscounts,
-          netRevenue:       closing.netRevenue,
-          taxAmount:        closing.taxAmount,
-          fixedTaxAmount:   closing.fixedTaxAmount,
-          productCost:      closing.productCost,
-          packagingCost:    closing.packagingCost,
-          grossProfit:      closing.grossProfit,
-          avgMargin:        closing.avgMargin,
-          cancelledGmv:     closing.cancelledGmv,
-          returnedValue:    closing.returnedValue,
-          orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
-          // taxInfo é recalculado ao vivo: a DAS pode ter sido informada depois do fechamento
-          taxInfo:          computeTaxInfo(monthlyTax, impostoTotal, closing.gmvTotal),
-
-          // ── Novo modelo: repasse / imposto / resultado líquido ──────────────
-          repasseConfirmado,
-          repasseEstimado,
-          repasseTotal,
-          impostoTotal,
-          custoTotal,
-          resultadoLiquido,
-          margem,
-          pendentes: {
-            count: closing.pendingOrders,
-            gmv: closing.gmvPending,
-            estimatedRepasse: repasseEstimado,
-          },
-        },
-        groups: Array.isArray(snap) ? snap : [],
+        data,
+        groups: data.groups,
       });
     }
 
@@ -590,27 +584,30 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
   y += 4;
   sep(y, 0.3);
 
-  // ── 3. DEMONSTRATIVO FINANCEIRO ──────────────────────────────────────────
+  // ── 3. REPASSE E RESULTADO ────────────────────────────────────────────────
   y += 9;
   doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-  ds(ML, y, 'DEMONSTRATIVO FINANCEIRO');
+  ds(ML, y, 'REPASSE E RESULTADO');
   y += 12;
   sep(y, 0.3);
   y += 14;
 
-  const dreIndX  = ML + 12;
-  const feeLabel = marketplaceFeeLabel(store.marketplace);
+  const dreIndX   = ML + 12;
+  const aliquota  = d.taxInfo?.aliquota ?? 0;
+  const aliqStr   = String(aliquota).replace('.', ',');
+  const taxLabel  = d.taxInfo?.fonte === 'das_real'
+    ? `(-) Imposto (DAS — aliquota efetiva ${aliqStr}%)`
+    : `(-) Imposto estimado (${aliqStr}% s/ faturamento)`;
+
   const dreRows  = [
-    { l: 'GMV Bruto',                                                v: fmtBRLpdf(d.gmvTotal),                                                 bold: false, sepBefore: false },
-    { l: `(-) ${feeLabel}`,                                          v: fmtBRLpdf(-d.shopeeDeductions) + pctOf(d.shopeeDeductions, d.gmvTotal), bold: false, sepBefore: false },
-    { l: '(-) Descontos do vendedor',                                v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
-    { l: '(=) Receita Liquida',                                      v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
-    { l: `(-) Imposto provisionado (${taxRateStr(store.taxRate)}%)`, v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+    { l: 'Repasse confirmado',                        v: fmtBRLpdf(d.repasseConfirmado) + ` (${d.confirmedOrders} liquidados)`, bold: false, sepBefore: false },
+    { l: '(+) Repasse estimado',                      v: fmtBRLpdf(d.repasseEstimado)   + ` (${d.pendingOrders} pendentes)`,    bold: false, sepBefore: false },
+    { l: '(=) Repasse total previsto',                v: fmtBRLpdf(d.repasseTotal),                                            bold: true,  sepBefore: true  },
+    { l: taxLabel,                                    v: fmtBRLpdf(-d.impostoTotal),                                           bold: false, sepBefore: false },
     ...(d.fixedTaxAmount > 0 ? [
-      { l: '(-) DAS mensal (MEI)',                                   v: fmtBRLpdf(-d.fixedTaxAmount),                                           bold: false, sepBefore: false },
+      { l: '(-) DAS mensal (MEI)',                    v: fmtBRLpdf(-d.fixedTaxAmount),                                         bold: false, sepBefore: false },
     ] : []),
-    { l: '(-) Custo dos produtos',                                   v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
-    { l: '(-) Embalagens',                                           v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
+    { l: '(-) Custo dos produtos (CMV + embalagens)', v: fmtBRLpdf(-d.custoTotal) + (!hasCosts ? ' *' : ''),                   bold: false, sepBefore: false },
   ];
 
   for (const row of dreRows) {
@@ -623,15 +620,15 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
   }
   sep(y, 0.8);
 
-  // ── 4. LUCRO BRUTO ───────────────────────────────────────────────────────
+  // ── 4. RESULTADO LÍQUIDO ─────────────────────────────────────────────────
   y += 8;
   doc.font('Helvetica-Bold').fontSize(12).fillColor('black');
-  ds(ML, y, 'LUCRO BRUTO:');
-  drs(MR, y, fmtBRLpdf(d.grossProfit));
+  ds(ML, y, 'RESULTADO LIQUIDO:');
+  drs(MR, y, fmtBRLpdf(d.resultadoLiquido));
 
   y += 20;
   const barTotalW = 285;
-  const margPct   = Math.max(0, Math.min(100, d.avgMargin ?? 0));
+  const margPct   = Math.max(0, Math.min(100, d.margem ?? 0));
   const filledW   = (margPct / 100) * barTotalW;
   doc.rect(ML, y, barTotalW, 9).fillColor([210, 210, 210]).fill();
   if (filledW > 0) doc.rect(ML, y, filledW, 9).fillColor([130, 130, 130]).fill();
@@ -644,6 +641,14 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
     fc(140, 140, 140);
     doc.font('Helvetica').fontSize(8);
     ds(ML, y, '* Produtos sem custo cadastrado — lucro estimado sem deducao de CMV');
+    black();
+    y += 13;
+  }
+
+  if (d.pendentes?.count > 0) {
+    fc(180, 120, 0);
+    doc.font('Helvetica-Bold').fontSize(8.5);
+    ds(ML, y, `! ${d.pendentes.count} pedido(s) pendente(s) (${fmtBRLpdf(d.pendentes.estimatedRepasse)} estimado) — risco de devolucoes futuras`);
     black();
     y += 13;
   }
@@ -788,22 +793,8 @@ async function getPdf(req, res) {
       if (closing) {
         isClosed = true;
         closedAt = closing.closedAt;
-        const snap = closing.productsSnapshot ?? [];
-        d = {
-          totalOrders:      closing.totalOrders,      confirmedOrders:  closing.confirmedOrders,
-          pendingOrders:    closing.pendingOrders,     cancelledOrders:  closing.cancelledOrders,
-          returnedOrders:   closing.returnedOrders,    unitCount:        closing.unitCount,
-          gmvTotal:         closing.gmvTotal,          gmvConfirmed:     closing.gmvConfirmed,
-          gmvPending:       closing.gmvPending,        shopeeDeductions: closing.shopeeDeductions,
-          sellerDiscounts:  closing.sellerDiscounts,   netRevenue:       closing.netRevenue,
-          taxAmount:        closing.taxAmount,         fixedTaxAmount:   closing.fixedTaxAmount,
-          productCost:      closing.productCost,
-          packagingCost:    closing.packagingCost,     grossProfit:      closing.grossProfit,
-          avgMargin:        closing.avgMargin,         cancelledGmv:     closing.cancelledGmv,
-          returnedValue:    closing.returnedValue,
-          orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
-          groups:           Array.isArray(snap) ? snap : [],
-        };
+        const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
+        d = snapshotToClosingData(closing, monthlyTax);
       } else {
         d = await buildClosingData([store.id], month, req.userId);
       }
@@ -889,23 +880,27 @@ async function getPdf(req, res) {
       // 3. DEMONSTRATIVO FINANCEIRO (consolidado)
       y += 9;
       doc.font('Helvetica-Bold').fontSize(11).fillColor('black');
-      ds(ML, y, 'DEMONSTRATIVO FINANCEIRO');
+      ds(ML, y, 'REPASSE E RESULTADO');
       y += 12;
       sep(y, 0.3);
       y += 14;
 
-      const dreIndX = ML + 12;
+      const dreIndX  = ML + 12;
+      const aliquota = d.taxInfo?.aliquota ?? 0;
+      const aliqStr  = String(aliquota).replace('.', ',');
+      const taxLabel = d.taxInfo?.fonte === 'das_real'
+        ? `(-) Imposto (DAS — aliquota efetiva ${aliqStr}%)`
+        : `(-) Imposto estimado (${aliqStr}% s/ faturamento)`;
+
       const dreRows = [
-        { l: 'GMV Bruto',                    v: fmtBRLpdf(d.gmvTotal),                                                 bold: false, sepBefore: false },
-        { l: '(-) Taxas Marketplace',        v: fmtBRLpdf(-d.shopeeDeductions) + pctOf(d.shopeeDeductions, d.gmvTotal), bold: false, sepBefore: false },
-        { l: '(-) Descontos do vendedor',    v: fmtBRLpdf(-d.sellerDiscounts),                                          bold: false, sepBefore: false },
-        { l: '(=) Receita Liquida',          v: fmtBRLpdf(d.netRevenue) + pctOf(d.netRevenue, d.gmvTotal),              bold: true,  sepBefore: true  },
-        { l: '(-) Imposto provisionado',     v: fmtBRLpdf(-d.taxAmount),                                                bold: false, sepBefore: false },
+        { l: 'Repasse confirmado',                        v: fmtBRLpdf(d.repasseConfirmado) + ` (${d.confirmedOrders} liquidados)`, bold: false, sepBefore: false },
+        { l: '(+) Repasse estimado',                      v: fmtBRLpdf(d.repasseEstimado)   + ` (${d.pendingOrders} pendentes)`,    bold: false, sepBefore: false },
+        { l: '(=) Repasse total previsto',                v: fmtBRLpdf(d.repasseTotal),                                            bold: true,  sepBefore: true  },
+        { l: taxLabel,                                    v: fmtBRLpdf(-d.impostoTotal),                                           bold: false, sepBefore: false },
         ...(d.fixedTaxAmount > 0 ? [
-          { l: '(-) DAS mensal (MEI)',       v: fmtBRLpdf(-d.fixedTaxAmount),                                           bold: false, sepBefore: false },
+          { l: '(-) DAS mensal (MEI)',                    v: fmtBRLpdf(-d.fixedTaxAmount),                                         bold: false, sepBefore: false },
         ] : []),
-        { l: '(-) Custo dos produtos',       v: fmtBRLpdf(-d.productCost) + (!hasCosts ? ' *' : ''),                    bold: false, sepBefore: false },
-        { l: '(-) Embalagens',              v: fmtBRLpdf(-d.packagingCost) + (!hasCosts ? ' *' : ''),                  bold: false, sepBefore: false },
+        { l: '(-) Custo dos produtos (CMV + embalagens)', v: fmtBRLpdf(-d.custoTotal) + (!hasCosts ? ' *' : ''),                   bold: false, sepBefore: false },
       ];
       for (const row of dreRows) {
         if (row.sepBefore) { sep(y - 3, 0.3); y += 4; }
@@ -917,15 +912,15 @@ async function getPdf(req, res) {
       }
       sep(y, 0.8);
 
-      // 4. LUCRO BRUTO
+      // 4. RESULTADO LÍQUIDO TOTAL
       y += 8;
       doc.font('Helvetica-Bold').fontSize(12).fillColor('black');
-      ds(ML, y, 'LUCRO BRUTO TOTAL:');
-      drs(MR, y, fmtBRLpdf(d.grossProfit));
+      ds(ML, y, 'RESULTADO LIQUIDO TOTAL:');
+      drs(MR, y, fmtBRLpdf(d.resultadoLiquido));
 
       y += 20;
       const barTotalW = 285;
-      const margPct   = Math.max(0, Math.min(100, d.avgMargin ?? 0));
+      const margPct   = Math.max(0, Math.min(100, d.margem ?? 0));
       const filledW   = (margPct / 100) * barTotalW;
       doc.rect(ML, y, barTotalW, 9).fillColor([210, 210, 210]).fill();
       if (filledW > 0) doc.rect(ML, y, filledW, 9).fillColor([130, 130, 130]).fill();
@@ -942,6 +937,14 @@ async function getPdf(req, res) {
         y += 13;
       }
 
+      if (d.pendentes?.count > 0) {
+        fc(180, 120, 0);
+        doc.font('Helvetica-Bold').fontSize(8.5);
+        ds(ML, y, `! ${d.pendentes.count} pedido(s) pendente(s) (${fmtBRLpdf(d.pendentes.estimatedRepasse)} estimado) — risco de devolucoes futuras`);
+        black();
+        y += 13;
+      }
+
       // 5. BREAKDOWN POR LOJA
       y += 8;
       sep(y, 0.3);
@@ -954,17 +957,17 @@ async function getPdf(req, res) {
 
       // Table header
       const bkL  = ML;       // Loja left
-      const bkG  = 255;      // GMV right
-      const bkR  = 348;      // Rec.Líq. right
-      const bkLu = 430;      // Lucro right
+      const bkG  = 255;      // Repasse right
+      const bkR  = 348;      // Imposto right
+      const bkLu = 430;      // Resultado right
       const bkM  = MR;       // Margem right
 
       fc(100, 100, 100);
       doc.font('Helvetica-Bold').fontSize(8.5);
       ds(bkL, y, 'LOJA');
-      doc.text('GMV',       bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
-      doc.text('REC. LIQ.', bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
-      doc.text('LUCRO',     bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+      doc.text('REPASSE',   bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text('IMPOSTO',   bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text('RESULTADO', bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
       doc.text('MARGEM',    bkM  - 55, y, { width: 55, align: 'right', lineBreak: false });
       black();
       y += 10;
@@ -975,10 +978,10 @@ async function getPdf(req, res) {
       for (const { store: s, data: sd } of storeResults) {
         black();
         ds(bkL, y, trunc(s.name, 28));
-        doc.text(fmtBRLpdf(sd.gmvTotal),    bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
-        doc.text(fmtBRLpdf(sd.netRevenue),  bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
-        doc.text(fmtBRLpdf(sd.grossProfit), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
-        doc.text(`${(sd.avgMargin ?? 0).toFixed(1)}%`, bkM - 55, y, { width: 55, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(sd.repasseTotal),     bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(-sd.impostoTotal),    bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+        doc.text(fmtBRLpdf(sd.resultadoLiquido), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+        doc.text(`${(sd.margem ?? 0).toFixed(1)}%`, bkM - 55, y, { width: 55, align: 'right', lineBreak: false });
         y += 13;
       }
 
@@ -988,9 +991,9 @@ async function getPdf(req, res) {
       y += 5;
       doc.font('Helvetica-Bold').fontSize(9).fillColor('black');
       ds(bkL, y, 'TOTAL');
-      doc.text(fmtBRLpdf(d.gmvTotal),    bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
-      doc.text(fmtBRLpdf(d.netRevenue),  bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
-      doc.text(fmtBRLpdf(d.grossProfit), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
+      doc.text(fmtBRLpdf(d.repasseTotal),     bkG  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text(fmtBRLpdf(-d.impostoTotal),    bkR  - 80, y, { width: 80, align: 'right', lineBreak: false });
+      doc.text(fmtBRLpdf(d.resultadoLiquido), bkLu - 70, y, { width: 70, align: 'right', lineBreak: false });
       doc.text(`${margPct.toFixed(1)}%`, bkM  - 55, y, { width: 55, align: 'right', lineBreak: false });
       y += 16;
 
