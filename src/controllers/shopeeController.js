@@ -344,10 +344,11 @@ async function syncOrders(req, res) {
     }
     console.log(`[Shopee] ${Object.keys(itemMap).length} produtos vinculados/criados`);
 
-    // 5. Converter pedidos — agrupa item_list por anúncio (productId resolvido).
+    // 5. Converter pedidos — agrupa item_list por variação (variantId resolvido,
+    //    com fallback para productId+model_id).
     //    1 grupo → 1 Order (lineItemKey="0", comportamento atual preservado).
-    //    >1 grupo (pedido multi-anúncio) → 1 Order por grupo, com taxas/escrow
-    //    rateados proporcionalmente ao GMV de cada grupo.
+    //    >1 grupo (pedido multi-anúncio ou multi-variação) → 1 Order por grupo,
+    //    com taxas/escrow rateados proporcionalmente ao GMV de cada grupo.
     importProgress.set(imp.id, { pct: 80, message: 'Convertendo pedidos...' });
     const ordersData = details.flatMap(detail => {
       const items = detail.item_list ?? [];
@@ -357,9 +358,13 @@ async function syncOrders(req, res) {
       for (const it of items) {
         const key       = `${it.item_id}_${it.model_id ?? 0}`;
         const productId = itemMap[key] ?? null;
-        const groupKey  = productId ?? `__noproduct_${key}`;
+        const variantId = variantMap[key] ?? null;
+        const modelId   = it.model_id ?? 0;
+        const groupKey  = variantId
+          ? `variant_${variantId}`
+          : (productId ? `product_${productId}_${modelId}` : `__noproduct_${key}`);
         if (!groups.has(groupKey)) {
-          groups.set(groupKey, { items: [], productId, variantId: variantMap[key] ?? null, firstItemId: it.item_id });
+          groups.set(groupKey, { items: [], productId, variantId, modelId, firstItemId: it.item_id });
         }
         groups.get(groupKey).items.push(it);
       }

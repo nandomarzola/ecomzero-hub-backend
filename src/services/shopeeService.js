@@ -220,9 +220,10 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
   };
 }
 
-// ── Pedido multi-anúncio: 1 Order por grupo (item_id), taxas/escrow rateados
-// proporcionalmente ao GMV de cada grupo. seller_discount e voucher_from_shopee
-// usam escrow.items[] quando disponível (valor exato por item).
+// ── Pedido multi-anúncio/multi-variação: 1 Order por grupo (variantId ou
+// item_id+model_id), taxas/escrow rateados proporcionalmente ao GMV de cada
+// grupo. seller_discount e voucher_from_shopee usam escrow.items[] quando
+// disponível (valor exato por item).
 function convertMultiItemShopeeOrder(detail, escrow, storeId, importId, store, groupList) {
   const allItems = detail.item_list ?? [];
   const orderGmv = r2(allItems.reduce((s, it) => {
@@ -260,7 +261,12 @@ function convertMultiItemShopeeOrder(detail, escrow, storeId, importId, store, g
       voucher_from_seller:    r2(totalSellerVoucher * proportion),
     } : null;
 
-    return convertShopeeOrder(detail, groupEscrow, storeId, importId, store, g.productId, g.items, g.variantId, String(g.firstItemId));
+    // lineItemKey por model_id (variação) — exceto quando model_id=0 (anúncio
+    // sem variação), onde usamos item_id para evitar colisão entre grupos
+    // distintos que também teriam model_id=0.
+    const lineItemKey = g.modelId ? String(g.modelId) : String(g.firstItemId);
+
+    return convertShopeeOrder(detail, groupEscrow, storeId, importId, store, g.productId, g.items, g.variantId, lineItemKey);
   });
 }
 
