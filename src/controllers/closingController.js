@@ -15,20 +15,6 @@ function fmtDate(d) {
   return new Date(d).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
 }
 
-// Resolve fonte/alíquota/DAS para exibição no fechamento
-function computeTaxInfo(monthlyTax, taxAmount, gmvTotal) {
-  const fonte = monthlyTax?.effectiveRate != null ? 'das_real' : 'estimada';
-  const aliquota = fonte === 'das_real'
-    ? monthlyTax.effectiveRate
-    : (gmvTotal > 0 ? r2((taxAmount / gmvTotal) * 100) : 0);
-  return {
-    fonte,
-    aliquota,
-    dasAmount: monthlyTax?.dasAmount ?? null,
-    totalRevenue: monthlyTax?.totalRevenue ?? null,
-  };
-}
-
 // Soma um campo numérico através dos grupos de produto de um snapshot salvo
 function sumGroupField(snap, field) {
   if (!Array.isArray(snap)) return 0;
@@ -36,9 +22,8 @@ function sumGroupField(snap, field) {
 }
 
 // Reconstrói o objeto de dados completo (incl. campos do novo modelo de repasse/imposto)
-// a partir de um MonthlyClosing salvo + DAS atual. taxInfo é sempre recalculado ao vivo,
-// pois a DAS pode ter sido informada depois do fechamento.
-function snapshotToClosingData(closing, monthlyTax) {
+// a partir de um MonthlyClosing salvo.
+function snapshotToClosingData(closing) {
   const snap = closing.productsSnapshot ?? [];
 
   // Snapshots gerados antes da refatoração do fechamento não têm os campos de repasse/imposto por grupo
@@ -49,9 +34,7 @@ function snapshotToClosingData(closing, monthlyTax) {
   const repasseTotal      = r2(repasseConfirmado + repasseEstimado);
   const impostoTotal      = hasNewFields ? sumGroupField(snap, 'impostoTotal') : closing.taxAmount;
   const custoTotal        = r2(closing.productCost + closing.packagingCost);
-  const resultadoLiquido  = hasNewFields
-    ? r2(repasseTotal - impostoTotal - custoTotal - closing.fixedTaxAmount)
-    : closing.grossProfit;
+  const resultadoLiquido  = closing.grossProfit;
   const margem = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : closing.avgMargin;
 
   return {
@@ -76,7 +59,6 @@ function snapshotToClosingData(closing, monthlyTax) {
     cancelledGmv:     closing.cancelledGmv,
     returnedValue:    closing.returnedValue,
     orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
-    taxInfo:          computeTaxInfo(monthlyTax, impostoTotal, closing.gmvTotal),
 
     repasseConfirmado,
     repasseEstimado,
@@ -136,7 +118,7 @@ function makeH(doc, ML = 42, MR = 553) {
 }
 
 // ── Core: compute monthly data ─────────────────────────────────────────────────
-async function buildClosingData(storeIds, month, userId = null) {
+async function buildClosingData(storeIds, month) {
   const [y, mo] = month.split('-').map(Number);
   const start = new Date(Date.UTC(y, mo - 1, 1));
   const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
@@ -149,12 +131,6 @@ async function buildClosingData(storeIds, month, userId = null) {
     .filter(s => s.taxType === 'mei')
     .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
   const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
-
-  // DAS mensal informada pelo usuário (alíquota efetiva real) — fallback p/ taxRate da loja
-  const monthlyTax = userId
-    ? await prisma.monthlyTax.findUnique({ where: { userId_month: { userId, month } } })
-    : null;
-  const taxFonte = monthlyTax?.effectiveRate != null ? 'das_real' : 'estimada';
 
   const allOrders = await prisma.order.findMany({
     where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
@@ -196,10 +172,10 @@ async function buildClosingData(storeIds, month, userId = null) {
     const orderRepasse = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
 
     // Imposto: sobre o faturamento bruto (calcGmv) — não desconta voucher Shopee da base
-    const aliquotaOrder = taxFonte === 'das_real' ? monthlyTax.effectiveRate : (storeTaxRateMap.get(o.storeId) ?? 0);
+    const aliquotaOrder = storeTaxRateMap.get(o.storeId) ?? 0;
     const orderTax      = r2((o.calcGmv ?? 0) * aliquotaOrder / 100);
 
-    const orderProfit = r2(orderRepasse - orderTax - o.calcProductCost - o.calcPackaging);
+    const orderProfit = r2(orderNet - orderTax - o.calcProductCost - o.calcPackaging);
 
     if (isConfirmed)      confirmedCount++;
     else if (isPending)   pendingCount++;
@@ -353,7 +329,7 @@ async function buildClosingData(storeIds, month, userId = null) {
   const repasseTotal     = r2(repasseConfirmado + repasseEstimado);
   const impostoTotal     = r2(taxAmount);
   const custoTotal       = r2(productCost + packagingCost);
-  const resultadoLiquido = r2(repasseTotal - impostoTotal - custoTotal - fixedTaxAmount);
+  const resultadoLiquido = r2(grossProfit);
   const margem           = repasseTotal > 0 ? r2((resultadoLiquido / repasseTotal) * 100) : 0;
 
   const groups = [...groupMap.values()]
@@ -424,7 +400,6 @@ async function buildClosingData(storeIds, month, userId = null) {
     cancelledGmv:     r2(cancelledGmv),
     returnedValue:    r2(returnedValue),
     orphanCount:      groups.filter(g => !g.hasCost).length,
-    taxInfo:          computeTaxInfo(monthlyTax, taxAmount, gmvTotal),
 
     // ── Novo modelo: repasse / imposto / resultado líquido ──────────────────
     repasseConfirmado: r2(repasseConfirmado),
@@ -546,8 +521,7 @@ async function getClosing(req, res) {
     });
 
     if (closing) {
-      const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
-      const data = snapshotToClosingData(closing, monthlyTax);
+      const data = snapshotToClosingData(closing);
       return res.json({
         status:   'closed',
         closedAt: closing.closedAt,
@@ -557,7 +531,7 @@ async function getClosing(req, res) {
       });
     }
 
-    const computed = await buildClosingData(storeIds, month, req.userId);
+    const computed = await buildClosingData(storeIds, month);
     return res.json({ status: 'open', data: computed, groups: computed.groups });
   } catch (err) {
     console.error(err);
@@ -587,7 +561,7 @@ async function closeMonth(req, res) {
       });
     }
 
-    const d = await buildClosingData([sid], month, req.userId);
+    const d = await buildClosingData([sid], month);
 
     const closing = await prisma.monthlyClosing.upsert({
       where:  { storeId_periodMonth: { storeId: sid, periodMonth: month } },
@@ -728,11 +702,9 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
   y += 14;
 
   const dreIndX   = ML + 12;
-  const aliquota  = d.taxInfo?.aliquota ?? 0;
+  const aliquota  = d.gmvTotal > 0 ? r2((d.impostoTotal / d.gmvTotal) * 100) : 0;
   const aliqStr   = String(aliquota).replace('.', ',');
-  const taxLabel  = d.taxInfo?.fonte === 'das_real'
-    ? `(-) Imposto (DAS — aliquota efetiva ${aliqStr}%)`
-    : `(-) Imposto estimado (${aliqStr}% s/ faturamento)`;
+  const taxLabel  = `(-) Imposto (aliquota ${aliqStr}% s/ faturamento)`;
 
   const dreRows  = [
     { l: 'Repasse confirmado',                        v: fmtBRLpdf(d.repasseConfirmado) + ` (${d.confirmedOrders} liquidados)`, bold: false, sepBefore: false },
@@ -928,10 +900,9 @@ async function getPdf(req, res) {
       if (closing) {
         isClosed = true;
         closedAt = closing.closedAt;
-        const monthlyTax = await prisma.monthlyTax.findUnique({ where: { userId_month: { userId: req.userId, month } } });
-        d = snapshotToClosingData(closing, monthlyTax);
+        d = snapshotToClosingData(closing);
       } else {
-        d = await buildClosingData([store.id], month, req.userId);
+        d = await buildClosingData([store.id], month);
       }
 
       renderStoreSection(doc, store, d, month, { isClosed, closedAt });
@@ -942,8 +913,8 @@ async function getPdf(req, res) {
 
       // Parallel: consolidated total + per-store breakdown
       const [consolidatedData, ...storeDataArr] = await Promise.all([
-        buildClosingData(allStoreIds, month, req.userId),
-        ...stores.map(s => buildClosingData([s.id], month, req.userId)),
+        buildClosingData(allStoreIds, month),
+        ...stores.map(s => buildClosingData([s.id], month)),
       ]);
       const storeResults = stores.map((s, i) => ({ store: s, data: storeDataArr[i] }));
 
@@ -1021,11 +992,9 @@ async function getPdf(req, res) {
       y += 14;
 
       const dreIndX  = ML + 12;
-      const aliquota = d.taxInfo?.aliquota ?? 0;
+      const aliquota = d.gmvTotal > 0 ? r2((d.impostoTotal / d.gmvTotal) * 100) : 0;
       const aliqStr  = String(aliquota).replace('.', ',');
-      const taxLabel = d.taxInfo?.fonte === 'das_real'
-        ? `(-) Imposto (DAS — aliquota efetiva ${aliqStr}%)`
-        : `(-) Imposto estimado (${aliqStr}% s/ faturamento)`;
+      const taxLabel = `(-) Imposto (aliquota ${aliqStr}% s/ faturamento)`;
 
       const dreRows = [
         { l: 'Repasse confirmado',                        v: fmtBRLpdf(d.repasseConfirmado) + ` (${d.confirmedOrders} liquidados)`, bold: false, sepBefore: false },
