@@ -117,4 +117,20 @@ async function saveMonthlyTax(req, res) {
   }
 }
 
-module.exports = { getMonthlyTax, saveMonthlyTax };
+// ── GET /api/monthly-tax/history ─────────────────────────────────────────────
+async function getMonthlyTaxHistory(req, res) {
+  try {
+    const history = await prisma.monthlyTax.findMany({
+      where: { userId: req.userId },
+      orderBy: { month: 'desc' },
+      take: 12,
+      select: { month: true, totalRevenue: true, dasAmount: true, effectiveRate: true },
+    });
+    return res.json({ history });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Erro ao buscar histórico de DAS' });
+  }
+}
+
+module.exports = { getMonthlyTax, saveMonthlyTax, getMonthlyTaxHistory };

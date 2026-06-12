@@ -300,6 +300,7 @@ async function buildClosingData(storeIds, month, userId = null) {
         escrowAmount:  o.escrowAmount,
         orderCategory: o.orderCategory,
         variationName: o.variationName ?? null,
+        repasse:       orderRepasse,
       });
 
       // Quebra adicional por variação real (ProductVariant)
@@ -339,6 +340,7 @@ async function buildClosingData(storeIds, month, userId = null) {
           escrowAmount:  o.escrowAmount,
           orderCategory: o.orderCategory,
           variationName: o.variationName ?? null,
+          repasse:       orderRepasse,
         });
       }
     }
