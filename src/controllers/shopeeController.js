@@ -231,15 +231,17 @@ async function syncOrders(req, res) {
       return;
     }
 
-    // 2. Detalhes dos pedidos
-    importProgress.set(imp.id, { pct: 25, message: 'Buscando detalhes dos pedidos...' });
-    const details = await fetchOrderDetails(accessToken, store.spShopId, orderSns);
-
-    // 3. Repasse (escrow) — só para pedidos pagos/processados (UNPAID não tem escrow)
-    importProgress.set(imp.id, { pct: 30, message: 'Buscando repasses (escrow)...' });
-    const escrowEligible = details.filter(d => d.order_status !== 'UNPAID').map(d => d.order_sn);
-    const escrowMap = await fetchEscrowDetails(accessToken, store.spShopId, escrowEligible,
-      (done, total) => importProgress.set(imp.id, { pct: 30 + Math.round((done / total) * 35), message: `Buscando repasses (${done}/${total})...` }));
+    // 2-3. Detalhes dos pedidos + repasses (escrow) em paralelo — get_escrow_detail
+    // não depende dos detalhes do pedido, então buscamos para todos os order_sn e
+    // descartamos UNPAID depois (Shopee não retorna escrow para eles de qualquer forma)
+    importProgress.set(imp.id, { pct: 25, message: 'Buscando detalhes e repasses...' });
+    const [details, escrowMapRaw] = await Promise.all([
+      fetchOrderDetails(accessToken, store.spShopId, orderSns),
+      fetchEscrowDetails(accessToken, store.spShopId, orderSns,
+        (done, total) => importProgress.set(imp.id, { pct: 25 + Math.round((done / total) * 40), message: `Buscando repasses (${done}/${total})...` })),
+    ]);
+    const unpaidSns = new Set(details.filter(d => d.order_status === 'UNPAID').map(d => d.order_sn));
+    const escrowMap = Object.fromEntries(Object.entries(escrowMapRaw).filter(([sn]) => !unpaidSns.has(sn)));
 
     // 4. Upsert produtos a partir dos itens dos pedidos
     importProgress.set(imp.id, { pct: 65, message: 'Vinculando produtos...' });
@@ -253,6 +255,21 @@ async function syncOrders(req, res) {
       select: { id: true, variations: true },
     });
 
+    // Pré-carrega produtos/variantes em lote — evita 1 findFirst por chave única (item_id/model_id)
+    const allExternalIds = [...new Set(details.flatMap(d => (d.item_list ?? []).map(it => String(it.item_id))))];
+    const allRootSkus    = [...new Set(details.flatMap(d => (d.item_list ?? []).map(it => it.item_sku).filter(Boolean)))];
+    const allModelSkus   = [...new Set(details.flatMap(d => (d.item_list ?? []).map(it => it.model_sku).filter(Boolean)))];
+
+    const [productsByExternalId, productsBySku, variantsByModelSku] = await Promise.all([
+      prisma.product.findMany({ where: { storeId, externalId: { in: allExternalIds } }, include: { productVariants: true } }),
+      allRootSkus.length  ? prisma.product.findMany({ where: { storeId, sku: { in: allRootSkus } }, include: { productVariants: true } }) : Promise.resolve([]),
+      allModelSkus.length ? prisma.productVariant.findMany({ where: { sku: { in: allModelSkus }, product: { storeId } }, include: { product: { include: { productVariants: true } } } }) : Promise.resolve([]),
+    ]);
+
+    const productMapByExternalId = new Map(productsByExternalId.map(p => [p.externalId, p]));
+    const productMapBySku        = new Map(productsBySku.map(p => [p.sku, p]));
+    const variantMapByModelSku   = new Map(variantsByModelSku.map(v => [v.sku, v]));
+
     for (const detail of details) {
       for (const item of detail.item_list ?? []) {
         const key = `${item.item_id}_${item.model_id ?? 0}`;
@@ -263,16 +280,13 @@ async function syncOrders(req, res) {
         const modelId    = String(item.model_id ?? 0);
         const modelSku   = item.model_sku || null;
 
-        let product = await prisma.product.findFirst({ where: { storeId, externalId } });
+        let product = productMapByExternalId.get(externalId);
 
         if (!product && rootSku) {
-          product = await prisma.product.findFirst({ where: { storeId, sku: rootSku } });
+          product = productMapBySku.get(rootSku);
         }
         if (!product && modelSku) {
-          const variant = await prisma.productVariant.findFirst({
-            where: { sku: modelSku, product: { storeId } },
-            include: { product: true },
-          });
+          const variant = variantMapByModelSku.get(modelSku);
           if (variant) {
             product = variant.product;
             variantMap[key] = variant.id;
@@ -297,12 +311,15 @@ async function syncOrders(req, res) {
               costPrice: 0, packaging: 0, supplies: 0, stock: 0, minStock: 5,
             },
           });
+          product.productVariants = [];
           withVariations.push({ id: product.id, variations: product.variations });
+          productMapByExternalId.set(externalId, product);
         } else {
           const existingVariations = Array.isArray(product.variations) ? product.variations : [];
           if (!existingVariations.some(v => v.modelId === modelId)) {
             const merged = [...existingVariations, newVariation];
             await prisma.product.update({ where: { id: product.id }, data: { variations: merged } });
+            product.variations = merged;
             const cached = withVariations.find(p => p.id === product.id);
             if (cached) cached.variations = merged; else withVariations.push({ id: product.id, variations: merged });
           }
@@ -311,9 +328,7 @@ async function syncOrders(req, res) {
 
         // Resolve ProductVariant pelo model_id (se ainda não resolvido pelo fallback de SKU acima)
         if (!variantMap[key]) {
-          const variant = await prisma.productVariant.findFirst({
-            where: { productId: product.id, marketplaceVariantId: modelId },
-          });
+          const variant = (product.productVariants ?? []).find(v => v.marketplaceVariantId === modelId);
           if (variant) variantMap[key] = variant.id;
         }
 
@@ -322,9 +337,10 @@ async function syncOrders(req, res) {
         // via get_model_list e cria os ProductVariant, para já habilitar
         // custo por variação a partir deste pedido.
         if (!variantMap[key] && modelId !== '0') {
-          const existingCount = await prisma.productVariant.count({ where: { productId: product.id } });
+          const existingCount = (product.productVariants ?? []).length;
           if (existingCount === 0) {
             const models = await fetchModelList(accessToken, store.spShopId, item.item_id);
+            const createdVariants = [];
             for (const model of models) {
               const variant = await prisma.productVariant.create({
                 data: {
@@ -336,8 +352,10 @@ async function syncOrders(req, res) {
                   stock: model.stock_info_v2?.summary_info?.total_available_stock ?? 0,
                 },
               });
+              createdVariants.push(variant);
               if (String(model.model_id) === modelId) variantMap[key] = variant.id;
             }
+            product.productVariants = createdVariants;
           }
         }
       }

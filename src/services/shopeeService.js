@@ -69,7 +69,7 @@ async function fetchOrderDetails(accessToken, shopId, orderSnList) {
 async function fetchEscrowDetails(accessToken, shopId, orderSnList, onProgress) {
   const map = {};
   const chunks = [];
-  for (let i = 0; i < orderSnList.length; i += 10) chunks.push(orderSnList.slice(i, i + 10));
+  for (let i = 0; i < orderSnList.length; i += 25) chunks.push(orderSnList.slice(i, i + 25));
 
   let done = 0;
   for (const chunk of chunks) {

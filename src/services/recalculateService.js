@@ -35,7 +35,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
   });
   const variantBySku = new Map(variants.map(v => [`${v.productId}|${v.sku}`, v]));
 
-  const BATCH = 200;
+  const BATCH = 10;
   const updates = [];
 
   for (const order of orders) {
