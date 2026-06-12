@@ -143,6 +143,7 @@ model Order {
 
   // ── Identidade do pedido ──────────────────────────────────────────────────
   orderId       String   // "ID do pedido" Shopee
+  lineItemKey   String   @default("0")  // "0"=pedido normal (1 grupo); multi-anúncio: String(item_id) por grupo
   orderStatus   String   @default("")
   orderCategory String   @default("valid")  // valid|pending|cancelled_unpaid|cancelled_other|returned_full|returned_partial
   cancelReason  String?  @db.Text
@@ -209,7 +210,8 @@ model Order {
   margin    Float?
   snapshotTaxRate Float @default(0)
 
-  @@unique([storeId, orderId])
+  @@unique([storeId, orderId, lineItemKey])
+  @@index([storeId])
 }
 
 // ───────────────────────────────────────────

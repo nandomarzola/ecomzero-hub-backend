@@ -11,6 +11,7 @@ const {
   fetchOrderDetails,
   fetchEscrowDetails,
   convertShopeeOrder,
+  convertMultiItemShopeeOrder,
   fetchItemList,
   fetchItemBaseInfo,
   fetchModelList,
@@ -333,22 +334,32 @@ async function syncOrders(req, res) {
     }
     console.log(`[Shopee] ${Object.keys(itemMap).length} produtos vinculados/criados`);
 
-    // 5. Converter pedidos
-    const ordersData = details.map(detail => {
-      const items     = detail.item_list ?? [];
-      const item      = items[0];
-      const key       = item ? `${item.item_id}_${item.model_id ?? 0}` : null;
-      const productId = key ? (itemMap[key] ?? null) : null;
-      const variantId = key ? (variantMap[key] ?? null) : null;
+    // 5. Converter pedidos — agrupa item_list por anúncio (productId resolvido).
+    //    1 grupo → 1 Order (lineItemKey="0", comportamento atual preservado).
+    //    >1 grupo (pedido multi-anúncio) → 1 Order por grupo, com taxas/escrow
+    //    rateados proporcionalmente ao GMV de cada grupo.
+    const ordersData = details.flatMap(detail => {
+      const items = detail.item_list ?? [];
+      if (items.length === 0) return [];
 
-      // Pedidos com múltiplas variações do MESMO anúncio (mesmo productId) são
-      // somados em 1 Order — evita perder unidades/GMV e inflar a taxa marketplace
-      // por unidade (escrow cobre o pedido inteiro).
-      const sameProductItems = productId
-        ? items.filter(it => itemMap[`${it.item_id}_${it.model_id ?? 0}`] === productId)
-        : (item ? [item] : []);
+      const groups = new Map();
+      for (const it of items) {
+        const key       = `${it.item_id}_${it.model_id ?? 0}`;
+        const productId = itemMap[key] ?? null;
+        const groupKey  = productId ?? `__noproduct_${key}`;
+        if (!groups.has(groupKey)) {
+          groups.set(groupKey, { items: [], productId, variantId: variantMap[key] ?? null, firstItemId: it.item_id });
+        }
+        groups.get(groupKey).items.push(it);
+      }
+      const groupList = [...groups.values()];
+      const escrow    = escrowMap[detail.order_sn];
 
-      return convertShopeeOrder(detail, escrowMap[detail.order_sn], storeId, imp.id, store, productId, sameProductItems, variantId);
+      if (groupList.length === 1) {
+        const g = groupList[0];
+        return [convertShopeeOrder(detail, escrow, storeId, imp.id, store, g.productId, g.items, g.variantId, '0')];
+      }
+      return convertMultiItemShopeeOrder(detail, escrow, storeId, imp.id, store, groupList);
     });
 
     // 6. Salvar pedidos

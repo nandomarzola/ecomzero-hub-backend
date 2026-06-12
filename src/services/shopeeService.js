@@ -112,7 +112,7 @@ function categoryToStatus(cat) {
 // ── Converter pedido Shopee → nosso formato ────────────────────────────────────
 // escrow: order_income (get_escrow_detail) — null se ainda não disponível
 // productId: já resolvido pelo controller via itemMap (item_id/model_id → product.id)
-function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null, items = null, variantId = null) {
+function convertShopeeOrder(detail, escrow, storeId, importId, store, productId = null, items = null, variantId = null, lineItemKey = '0') {
   const allItems = (items && items.length) ? items : (detail.item_list?.slice(0, 1) ?? []);
   const item = allItems[0] ?? {};
 
@@ -168,6 +168,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     storeId,
     importId,
     orderId:       String(detail.order_sn),
+    lineItemKey,
     orderStatus:   detail.order_status,
     orderCategory,
     cancelReason:  detail.cancel_reason || null,
@@ -214,6 +215,50 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     margin:    isRevenue ? margin : 0,
     snapshotTaxRate: taxRate,
   };
+}
+
+// ── Pedido multi-anúncio: 1 Order por grupo (item_id), taxas/escrow rateados
+// proporcionalmente ao GMV de cada grupo. seller_discount e voucher_from_shopee
+// usam escrow.items[] quando disponível (valor exato por item).
+function convertMultiItemShopeeOrder(detail, escrow, storeId, importId, store, groupList) {
+  const allItems = detail.item_list ?? [];
+  const orderGmv = r2(allItems.reduce((s, it) => {
+    const price = r2(it.model_discounted_price ?? it.model_original_price ?? 0);
+    return s + price * (it.model_quantity_purchased ?? 1);
+  }, 0));
+
+  const totalCommission    = r2(escrow?.commission_fee ?? 0);
+  const totalServiceFee    = r2((escrow?.service_fee ?? 0) + (escrow?.seller_transaction_fee ?? 0));
+  const totalEscrow        = escrow?.escrow_amount != null ? r2(escrow.escrow_amount) : null;
+  const totalSellerVoucher = r2(escrow?.voucher_from_seller ?? 0);
+  const escrowItems        = escrow?.items ?? [];
+
+  return groupList.map(g => {
+    const groupGmv = r2(g.items.reduce((s, it) => {
+      const price = r2(it.model_discounted_price ?? it.model_original_price ?? 0);
+      return s + price * (it.model_quantity_purchased ?? 1);
+    }, 0));
+    const proportion = orderGmv > 0 ? groupGmv / orderGmv : 0;
+
+    const matched = g.items
+      .map(it => escrowItems.find(ei => ei.item_id === it.item_id && ei.model_id === (it.model_id ?? 0)))
+      .filter(Boolean);
+    const groupSellerDiscount = r2(matched.reduce((s, ei) => s + (ei.seller_discount ?? 0), 0));
+    const groupShopeeVoucher  = r2(matched.reduce((s, ei) => s + (ei.discount_from_voucher_shopee ?? 0), 0));
+
+    const groupEscrow = escrow ? {
+      ...escrow,
+      commission_fee:         r2(totalCommission * proportion),
+      service_fee:            r2(totalServiceFee * proportion),
+      seller_transaction_fee: 0, // já incluído acima em service_fee
+      escrow_amount:          totalEscrow != null ? r2(totalEscrow * proportion) : null,
+      seller_discount:        groupSellerDiscount,
+      voucher_from_shopee:    groupShopeeVoucher,
+      voucher_from_seller:    r2(totalSellerVoucher * proportion),
+    } : null;
+
+    return convertShopeeOrder(detail, groupEscrow, storeId, importId, store, g.productId, g.items, g.variantId, String(g.firstItemId));
+  });
 }
 
 // ── Catálogo: lista de item_ids ativos do shop ────────────────────────────────
@@ -296,6 +341,7 @@ module.exports = {
   fetchEscrowDetails,
   classifyShopeeOrder,
   convertShopeeOrder,
+  convertMultiItemShopeeOrder,
   fetchItemList,
   fetchItemBaseInfo,
   fetchModelList,

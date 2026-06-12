@@ -91,6 +91,12 @@ function snapshotToClosingData(closing, monthlyTax) {
       estimatedRepasse: repasseEstimado,
     },
 
+    // Snapshots de meses fechados nao guardam as listas individuais de pedidos —
+    // drawers ficam vazios nesse caso
+    returnedOrdersList:  [],
+    cancelledOrdersList: [],
+    pendingOrdersList:   [],
+
     groups: Array.isArray(snap) ? snap : [],
   };
 }
@@ -168,6 +174,11 @@ async function buildClosingData(storeIds, month, userId = null) {
 
   const groupMap = new Map();
 
+  // Listas para os drawers do frontend (devolucoes, cancelamentos, pendentes)
+  const returnedOrdersList  = [];
+  const cancelledOrdersList = [];
+  const pendingOrdersList   = [];
+
   for (const o of allOrders) {
     const isConfirmed = o.orderCategory === 'valid';
     const isPending   = o.orderCategory === 'pending';
@@ -194,6 +205,42 @@ async function buildClosingData(storeIds, month, userId = null) {
     else if (isPending)   pendingCount++;
     else if (isCancelled) cancelledCount++;
     if (isReturned)       returnedCount++;
+
+    if (isCancelled) {
+      cancelledOrdersList.push({
+        id:            o.id,
+        orderId:       o.orderId,
+        soldAt:        o.soldAt,
+        productName:   o.productName,
+        variationName: o.variationName,
+        calcGmv:       r2(o.calcGmv),
+        cancelReason:  o.cancelReason ?? null,
+      });
+    }
+    if (isReturned) {
+      returnedOrdersList.push({
+        id:            o.id,
+        orderId:       o.orderId,
+        soldAt:        o.soldAt,
+        productName:   o.productName,
+        variationName: o.variationName,
+        calcGmv:       r2(o.calcGmv),
+        escrowAmount:  o.escrowAmount,
+        orderCategory: o.orderCategory,
+        returnStatus:  o.returnStatus ?? null,
+      });
+    }
+    if (isPending) {
+      pendingOrdersList.push({
+        id:               o.id,
+        orderId:          o.orderId,
+        soldAt:           o.soldAt,
+        productName:      o.productName,
+        variationName:    o.variationName,
+        calcGmv:          r2(o.calcGmv),
+        estimatedRepasse: orderRepasse,
+      });
+    }
 
     if (isRevenue) {
       gmvTotal         += o.calcGmv;
@@ -227,6 +274,7 @@ async function buildClosingData(storeIds, month, userId = null) {
           gmv: 0, shopeeFee: 0, netRevenue: 0,
           productCost: 0, packaging: 0, grossProfit: 0,
           repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
+          orders: [],
           variantMap: new Map(),
         });
       }
@@ -244,6 +292,15 @@ async function buildClosingData(storeIds, month, userId = null) {
       if (isPending)   g.repasseEstimado   += orderRepasse;
       if (!o.hasCost)                    g.hasCost   = false;
       if (o.orderCategory === 'pending') g.hasPending = true;
+      g.orders.push({
+        orderId:       o.orderId,
+        soldAt:        o.soldAt,
+        quantity:      o.quantity,
+        calcGmv:       r2(o.calcGmv),
+        escrowAmount:  o.escrowAmount,
+        orderCategory: o.orderCategory,
+        variationName: o.variationName ?? null,
+      });
 
       // Quebra adicional por variação real (ProductVariant)
       if (o.variantId) {
@@ -257,6 +314,7 @@ async function buildClosingData(storeIds, month, userId = null) {
             gmv: 0, shopeeFee: 0, netRevenue: 0,
             productCost: 0, packaging: 0, grossProfit: 0,
             repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
+            orders: [],
           });
         }
         const v = g.variantMap.get(o.variantId);
@@ -273,6 +331,15 @@ async function buildClosingData(storeIds, month, userId = null) {
         if (isPending)   v.repasseEstimado   += orderRepasse;
         if (!o.hasCost)                    v.hasCost   = false;
         if (o.orderCategory === 'pending') v.hasPending = true;
+        v.orders.push({
+          orderId:       o.orderId,
+          soldAt:        o.soldAt,
+          quantity:      o.quantity,
+          calcGmv:       r2(o.calcGmv),
+          escrowAmount:  o.escrowAmount,
+          orderCategory: o.orderCategory,
+          variationName: o.variationName ?? null,
+        });
       }
     }
   }
@@ -307,6 +374,7 @@ async function buildClosingData(storeIds, month, userId = null) {
       repasseConfirmado: r2(g.repasseConfirmado),
       repasseEstimado:   r2(g.repasseEstimado),
       impostoTotal:      r2(g.impostoTotal),
+      orders: g.orders.slice().sort((a, b) => new Date(a.soldAt) - new Date(b.soldAt)),
       variants: [...g.variantMap.values()]
         .map(v => ({
           variantId:    v.variantId,
@@ -326,6 +394,7 @@ async function buildClosingData(storeIds, month, userId = null) {
           repasseConfirmado: r2(v.repasseConfirmado),
           repasseEstimado:   r2(v.repasseEstimado),
           impostoTotal:      r2(v.impostoTotal),
+          orders: v.orders.slice().sort((a, b) => new Date(a.soldAt) - new Date(b.soldAt)),
         }))
         .sort((a, b) => b.gmv - a.gmv),
     }))
@@ -368,6 +437,11 @@ async function buildClosingData(storeIds, month, userId = null) {
       gmv: r2(gmvPending),
       estimatedRepasse: r2(repasseEstimado),
     },
+
+    // Listas para drawers (devolucoes/cancelamentos/pendentes)
+    returnedOrdersList,
+    cancelledOrdersList,
+    pendingOrdersList,
 
     groups,
   };
