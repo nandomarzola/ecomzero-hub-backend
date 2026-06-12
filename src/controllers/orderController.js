@@ -5,12 +5,9 @@ const { recalculateOrdersForStore }       = require('../services/recalculateServ
 const { importShopeeOrderAll } = require('../services/importOrderAll');
 const { importSheinOrderAll }  = require('../services/importSheinService');
 const { importTiktokOrderAll } = require('../services/importTiktokService');
+const { importProgress } = require('../lib/importProgress');
 
 function r2(n) { return Math.round(n * 100) / 100; }
-
-// Progress em memória — sem Redis, sem BullMQ
-// importId → { pct, message }
-const importProgress = new Map();
 
 // POST /api/orders/import — dispara import em background, responde imediatamente
 async function importOrders(req, res) {

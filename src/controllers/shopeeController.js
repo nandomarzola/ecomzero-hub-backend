@@ -17,6 +17,7 @@ const {
   fetchModelList,
 } = require('../services/shopeeService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
+const { importProgress } = require('../lib/importProgress');
 
 const FRONTEND_URL = process.env.SHOPEE_FRONTEND_URL || 'https://profittrack.ecomzero.com.br';
 
@@ -210,29 +211,38 @@ async function syncOrders(req, res) {
     return res.status(401).json({ error: 'Token expirado — reconecte a Shopee' });
   }
 
-  try {
-    const periodMonth = dateFrom.substring(0, 7);
-    const imp = await prisma.import.create({
-      data: { storeId, filename: `shopee-sync-${periodMonth}`, periodMonth, totalRows: 0, status: 'processing' },
-    });
+  const periodMonth = dateFrom.substring(0, 7);
+  const imp = await prisma.import.create({
+    data: { storeId, filename: `shopee-sync-${periodMonth}`, periodMonth, totalRows: 0, status: 'processing' },
+  });
 
+  importProgress.set(imp.id, { pct: 2, message: 'Iniciando sincronização Shopee...' });
+
+  // Disparar em background — sem await
+  setImmediate(async () => {
+  try {
     // 1. Listar order_sn do período
+    importProgress.set(imp.id, { pct: 10, message: 'Buscando lista de pedidos...' });
     const orderSns = await fetchOrderList(accessToken, store.spShopId, dateFrom, dateTo);
     console.log(`[Shopee] ${orderSns.length} pedidos encontrados para ${periodMonth}`);
 
     if (orderSns.length === 0) {
       await prisma.import.update({ where: { id: imp.id }, data: { status: 'done', totalRows: 0 } });
-      return res.json({ imported: 0, message: 'Nenhum pedido encontrado no período' });
+      return;
     }
 
     // 2. Detalhes dos pedidos
+    importProgress.set(imp.id, { pct: 25, message: 'Buscando detalhes dos pedidos...' });
     const details = await fetchOrderDetails(accessToken, store.spShopId, orderSns);
 
     // 3. Repasse (escrow) — só para pedidos pagos/processados (UNPAID não tem escrow)
+    importProgress.set(imp.id, { pct: 30, message: 'Buscando repasses (escrow)...' });
     const escrowEligible = details.filter(d => d.order_status !== 'UNPAID').map(d => d.order_sn);
-    const escrowMap = await fetchEscrowDetails(accessToken, store.spShopId, escrowEligible);
+    const escrowMap = await fetchEscrowDetails(accessToken, store.spShopId, escrowEligible,
+      (done, total) => importProgress.set(imp.id, { pct: 30 + Math.round((done / total) * 35), message: `Buscando repasses (${done}/${total})...` }));
 
     // 4. Upsert produtos a partir dos itens dos pedidos
+    importProgress.set(imp.id, { pct: 65, message: 'Vinculando produtos...' });
     // Cada anúncio (item_id) vira 1 único Product, com variações guardadas em `variations`
     const itemMap    = {}; // `${item_id}_${model_id}` → productId
     const variantMap = {}; // `${item_id}_${model_id}` → ProductVariant.id
@@ -338,6 +348,7 @@ async function syncOrders(req, res) {
     //    1 grupo → 1 Order (lineItemKey="0", comportamento atual preservado).
     //    >1 grupo (pedido multi-anúncio) → 1 Order por grupo, com taxas/escrow
     //    rateados proporcionalmente ao GMV de cada grupo.
+    importProgress.set(imp.id, { pct: 80, message: 'Convertendo pedidos...' });
     const ordersData = details.flatMap(detail => {
       const items = detail.item_list ?? [];
       if (items.length === 0) return [];
@@ -363,6 +374,7 @@ async function syncOrders(req, res) {
     });
 
     // 6. Salvar pedidos
+    importProgress.set(imp.id, { pct: 85, message: 'Salvando pedidos...' });
     let saved = 0;
     for (const batch of chunkArr(ordersData, 200)) {
       const result = await prisma.order.createMany({ data: batch, skipDuplicates: true });
@@ -370,6 +382,7 @@ async function syncOrders(req, res) {
     }
 
     // Aplica costPrice dos produtos vinculados nos pedidos recém-importados
+    importProgress.set(imp.id, { pct: 95, message: 'Recalculando custos...' });
     await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
 
     // 7. Totais
@@ -385,11 +398,18 @@ async function syncOrders(req, res) {
     });
 
     console.log(`[Shopee] ${saved} pedidos salvos, ${linked} vinculados a produtos`);
-    return res.json({ imported: saved, total: details.length, valid, pending, cancelled, linked, products: Object.keys(itemMap).length, periodMonth });
   } catch (err) {
     console.error('[Shopee] sync erro:', err.message);
-    return res.status(500).json({ error: 'Erro ao sincronizar pedidos: ' + err.message });
+    await prisma.import.update({
+      where: { id: imp.id },
+      data: { status: 'error', errorMessage: err.message },
+    }).catch(() => {});
+  } finally {
+    importProgress.delete(imp.id);
   }
+  });
+
+  return res.status(202).json({ jobId: imp.id });
 }
 
 // POST /api/shopee/sync-items — sincroniza catálogo de produtos Shopee → Products

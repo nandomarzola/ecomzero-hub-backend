@@ -66,11 +66,12 @@ async function fetchOrderDetails(accessToken, shopId, orderSnList) {
 
 // ── Detalhe de repasse (escrow) por pedido — disponível após pagamento ────────
 // Retorna { [order_sn]: order_income }
-async function fetchEscrowDetails(accessToken, shopId, orderSnList) {
+async function fetchEscrowDetails(accessToken, shopId, orderSnList, onProgress) {
   const map = {};
   const chunks = [];
   for (let i = 0; i < orderSnList.length; i += 10) chunks.push(orderSnList.slice(i, i + 10));
 
+  let done = 0;
   for (const chunk of chunks) {
     await Promise.all(chunk.map(async (orderSn) => {
       try {
@@ -80,6 +81,8 @@ async function fetchEscrowDetails(accessToken, shopId, orderSnList) {
         // sem escrow disponível ainda — convertShopeeOrder usa fallback estimado
       }
     }));
+    done += chunk.length;
+    onProgress?.(done, orderSnList.length);
   }
 
   return map;

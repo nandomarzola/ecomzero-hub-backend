@@ -256,12 +256,13 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
 // ── Buscar custo de frete do VENDEDOR via /shipments/:id/costs ───────────────────
 // senders[0].cost = valor exato que o vendedor paga (mesmo mostrado no painel ML)
 // Ex: canivete R$22,99 → senders[0].cost = R$12,35 ✓
-async function fetchShippingCosts(accessToken, shipmentIds) {
+async function fetchShippingCosts(accessToken, shipmentIds, onProgress) {
   const costsMap = {};
 
   const chunks = [];
   for (let i = 0; i < shipmentIds.length; i += 10) chunks.push(shipmentIds.slice(i, i + 10));
 
+  let done = 0;
   for (const chunk of chunks) {
     await Promise.all(chunk.map(async (id) => {
       try {
@@ -273,6 +274,8 @@ async function fetchShippingCosts(accessToken, shipmentIds) {
         costsMap[id] = { sellerCost: 0 };
       }
     }));
+    done += chunk.length;
+    onProgress?.(done, shipmentIds.length);
   }
   return costsMap;
 }

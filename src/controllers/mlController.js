@@ -1,6 +1,7 @@
 const prisma = require('../lib/prisma');
 const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchShippingCosts, listingTypeLabel } = require('../services/mlService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
+const { importProgress } = require('../lib/importProgress');
 
 const FRONTEND_URL = process.env.ML_FRONTEND_URL || 'http://localhost:5173';
 
@@ -111,19 +112,24 @@ async function syncOrders(req, res) {
     }
   }
 
-  try {
-    const periodMonth = dateFrom.substring(0, 7);
-    const imp = await prisma.import.create({
-      data: { storeId, filename: `ml-sync-${periodMonth}`, periodMonth, totalRows: 0, status: 'processing' },
-    });
+  const periodMonth = dateFrom.substring(0, 7);
+  const imp = await prisma.import.create({
+    data: { storeId, filename: `ml-sync-${periodMonth}`, periodMonth, totalRows: 0, status: 'processing' },
+  });
 
+  importProgress.set(imp.id, { pct: 2, message: 'Iniciando sincronização Mercado Livre...' });
+
+  // Disparar em background — sem await
+  setImmediate(async () => {
+  try {
     // 1. Buscar pedidos na API ML
+    importProgress.set(imp.id, { pct: 10, message: 'Buscando pedidos...' });
     const mlOrders = await fetchOrders(accessToken, store.mlSellerId, dateFrom, dateTo);
     console.log(`[ML] ${mlOrders.length} pedidos encontrados para ${periodMonth}`);
 
     if (mlOrders.length === 0) {
       await prisma.import.update({ where: { id: imp.id }, data: { status: 'done', totalRows: 0 } });
-      return res.json({ imported: 0, message: 'Nenhum pedido encontrado no período' });
+      return;
     }
 
     // 2. Extrair IDs únicos dos itens nos pedidos
@@ -133,11 +139,13 @@ async function syncOrders(req, res) {
     console.log(`[ML] ${itemIdsInOrders.length} itens únicos nos pedidos`);
 
     // 3. Buscar detalhes dos itens dos pedidos (não todos os anúncios — só os que têm pedido)
+    importProgress.set(imp.id, { pct: 25, message: 'Buscando detalhes dos anúncios...' });
     const itemDetails = itemIdsInOrders.length > 0
       ? await fetchItemDetails(accessToken, itemIdsInOrders)
       : [];
 
     // 4. Upsert de produtos SOMENTE dos itens que têm pedidos
+    importProgress.set(imp.id, { pct: 35, message: 'Vinculando produtos...' });
     const itemMap = {}; // itemId → productId
     for (const item of itemDetails) {
       if (!item?.id) continue;
@@ -171,10 +179,12 @@ async function syncOrders(req, res) {
     console.log(`[ML] ${Object.keys(itemMap).length} produtos criados/atualizados`);
 
     // 5. Buscar custos de frete do vendedor para todos os pedidos com envio
+    importProgress.set(imp.id, { pct: 40, message: 'Buscando custos de frete...' });
     const shippingIds = [...new Set(mlOrders.map(o => o.shipping?.id).filter(Boolean))];
     console.log(`[ML] Buscando frete de ${shippingIds.length} envios...`);
     const shippingCosts = shippingIds.length > 0
-      ? await fetchShippingCosts(accessToken, shippingIds)
+      ? await fetchShippingCosts(accessToken, shippingIds,
+          (done, total) => importProgress.set(imp.id, { pct: 40 + Math.round((done / total) * 30), message: `Buscando custos de frete (${done}/${total})...` }))
       : {};
 
     // 6. Agrupar pedidos por pack_id para dividir frete proporcionalmente
@@ -207,6 +217,7 @@ async function syncOrders(req, res) {
     }
 
     // 7. Converter pedidos com productId e frete proporcional
+    importProgress.set(imp.id, { pct: 80, message: 'Convertendo pedidos...' });
     const ordersData = mlOrders.map(o => {
       const item          = o.order_items?.[0];
       const mlItemId      = item?.item?.id ?? null;
@@ -216,6 +227,7 @@ async function syncOrders(req, res) {
     });
 
     // 6. Salvar pedidos
+    importProgress.set(imp.id, { pct: 85, message: 'Salvando pedidos...' });
     let saved = 0;
     for (const batch of chunkArr(ordersData, 200)) {
       const result = await prisma.order.createMany({ data: batch, skipDuplicates: true });
@@ -223,6 +235,7 @@ async function syncOrders(req, res) {
     }
 
     // Aplica costPrice dos produtos vinculados nos pedidos recém-importados
+    importProgress.set(imp.id, { pct: 95, message: 'Recalculando custos...' });
     await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
 
     // 7. Totais
@@ -238,11 +251,18 @@ async function syncOrders(req, res) {
     });
 
     console.log(`[ML] ${saved} pedidos salvos, ${linked} vinculados a produtos`);
-    return res.json({ imported: saved, total: mlOrders.length, valid, pending, cancelled, linked, products: Object.keys(itemMap).length, periodMonth });
   } catch (err) {
     console.error('[ML] sync erro:', err.message);
-    return res.status(500).json({ error: 'Erro ao sincronizar pedidos: ' + err.message });
+    await prisma.import.update({
+      where: { id: imp.id },
+      data: { status: 'error', errorMessage: err.message },
+    }).catch(() => {});
+  } finally {
+    importProgress.delete(imp.id);
   }
+  });
+
+  return res.status(202).json({ jobId: imp.id });
 }
 
 // POST /api/ml/sync-items — sincroniza anúncios ML → Products
