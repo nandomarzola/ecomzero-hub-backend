@@ -262,7 +262,7 @@ async function listOrders(req, res) {
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const take = parseInt(limit);
 
-  const [orders, total, tabGroups, agg, aggCancelled] = await Promise.all([
+  const [orders, total, tabGroups, agg, aggCancelled, orphanCount] = await Promise.all([
     prisma.order.findMany({
       where,
       include: { product: { select: { name: true, sku: true } } },
@@ -287,6 +287,10 @@ async function listOrders(req, res) {
       where: { ...baseWhere, status: 'cancelled' },
       _sum:  { calcGmv: true },
       _count: { _all: true },
+    }),
+    // Pedidos com receita mas sem custo de produto cadastrado
+    prisma.order.count({
+      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] }, hasCost: false },
     }),
   ]);
 
@@ -315,7 +319,7 @@ async function listOrders(req, res) {
     cancelledCount: aggCancelled._count._all,
   };
 
-  return res.json({ orders, total, page: parseInt(page), limit: take, tabCounts, summary });
+  return res.json({ orders, total, page: parseInt(page), limit: take, tabCounts, summary, orphanCount });
 }
 
 // GET /api/orders/:id — detalhe de um pedido
