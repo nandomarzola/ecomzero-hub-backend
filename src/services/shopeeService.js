@@ -122,16 +122,27 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
   // Soma quantidade/GMV de todos os itens do pedido que pertencem ao mesmo anúncio
   // (variações diferentes do mesmo item_id viram 1 só Order — ver syncOrders)
   const quantity = allItems.reduce((s, it) => s + (it.model_quantity_purchased ?? 1), 0);
-  const gmv = r2(allItems.reduce((s, it) => {
+  const rawGmv = r2(allItems.reduce((s, it) => {
     const price = r2(it.model_discounted_price ?? it.model_original_price ?? 0);
     return s + price * (it.model_quantity_purchased ?? 1);
   }, 0));
+
+  // Shopee zera escrow_amount em pedidos COMPLETED que foram devolvidos, mas paga
+  // uma compensação ao vendedor via order_adjustment ("Return/Refund Compensation").
+  // Sem essa detecção o pedido fica 'valid' com gmv cheio e taxas zeradas,
+  // superestimando o lucro.
+  const returnAdjustment = escrow?.order_adjustment?.find(a => a.adjustment_reason === 'Return/Refund Compensation');
+  const isReturnCompensation = detail.order_status === 'COMPLETED'
+    && (escrow?.escrow_amount ?? 0) === 0
+    && returnAdjustment?.amount > 0;
+
+  const gmv = isReturnCompensation ? r2(returnAdjustment.amount) : rawGmv;
   const agreedPrice   = quantity > 0 ? r2(gmv / quantity) : 0;
   const originalPrice = quantity > 0
     ? r2(allItems.reduce((s, it) => s + r2(it.model_original_price ?? 0) * (it.model_quantity_purchased ?? 1), 0) / quantity)
     : agreedPrice;
 
-  const orderCategory = classifyShopeeOrder(detail.order_status);
+  const orderCategory = isReturnCompensation ? 'returned_partial' : classifyShopeeOrder(detail.order_status);
   const isRevenue     = ['valid', 'pending', 'returned_partial'].includes(orderCategory);
   const taxRate       = store.taxRate ?? 0;
 
@@ -149,7 +160,9 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     sellerCoupon       = r2(escrow.voucher_from_seller ?? 0);
     sellerDiscount     = r2(escrow.seller_discount ?? 0);
     calcShopeeFeeVal   = r2(platformCommission + platformServiceFee);
-    calcNetRevenue     = r2(escrow.escrow_amount ?? (gmv - calcShopeeFeeVal - sellerCoupon - sellerDiscount));
+    calcNetRevenue     = isReturnCompensation
+      ? gmv
+      : r2(escrow.escrow_amount ?? (gmv - calcShopeeFeeVal - sellerCoupon - sellerDiscount));
   } else {
     // Sem escrow ainda (pedido recente/pendente) — estimativa pela tabela de taxas Shopee
     const calc = calcOrderProfit({
@@ -190,7 +203,9 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     sellerCoupon,
     sellerDiscount,
     lmmDiscount:   0,
-    escrowAmount:  (escrow && escrow.escrow_amount != null) ? r2(escrow.escrow_amount) : null,
+    escrowAmount:  isReturnCompensation
+      ? gmv
+      : ((escrow && escrow.escrow_amount != null) ? r2(escrow.escrow_amount) : null),
     shopeeVoucher: escrow ? r2(escrow.voucher_from_shopee ?? 0) : null,
     globalTotal:   r2(detail.total_amount ?? gmv),
     orderTotal:    r2(detail.total_amount ?? gmv),
