@@ -86,6 +86,11 @@ model Product {
   createdAt  DateTime    @default(now())
   orders             Order[]
   purchaseOrderItems PurchaseOrderItem[]
+  updatedAt          DateTime @default(now()) @updatedAt
+
+  @@index([storeId])
+  @@index([storeId, sku])
+  @@index([storeId, externalId])   // ML/TikTok sync — findFirst por externalId em loop
 }
 
 // ── Variações de anúncio (Shopee model_id) com custo independente ───────────
@@ -104,6 +109,7 @@ model ProductVariant {
   orders               Order[]
 
   @@unique([productId, marketplaceVariantId])
+  @@index([productId, sku])   // lookup de custo por SKU no recalculate
 }
 
 // ── Controle de importações ──────────────────────────────────────────────────
@@ -130,6 +136,10 @@ model Import {
   errorMessage         String?
   jobId                String?
   orders               Order[]
+
+  @@index([storeId])
+  @@index([storeId, periodMonth])
+  @@index([storeId, status])
 }
 
 // ── Pedidos (1 linha = 1 linha do arquivo Shopee) ────────────────────────────
@@ -210,8 +220,15 @@ model Order {
   margin    Float?
   snapshotTaxRate Float @default(0)
 
+  updatedAt DateTime @default(now()) @updatedAt
+
   @@unique([storeId, orderId, lineItemKey])
   @@index([storeId])
+  @@index([storeId, soldAt])             // consultas mensais (mais usada)
+  @@index([storeId, orderCategory])      // filtro por aba (valid/pending/cancelled)
+  @@index([storeId, status, soldAt])     // dashboard sparkline (status+período)
+  @@index([storeId, productId])          // recalculate por produto
+  @@index([storeId, hasCost])            // banner de produtos sem custo
 }
 
 // ───────────────────────────────────────────
@@ -241,9 +258,9 @@ model Bill {
   userId      String
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   storeId     String?
-  store       Store?    @relation(fields: [storeId], references: [id])
+  store       Store?    @relation(fields: [storeId], references: [id], onDelete: SetNull)
   supplierId  String?
-  supplier    Supplier? @relation(fields: [supplierId], references: [id])
+  supplier    Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
   description String
   amount      Float
   dueDate     DateTime
@@ -254,6 +271,9 @@ model Bill {
   recurrence  String?
   notes       String?
   createdAt   DateTime  @default(now())
+
+  @@index([userId, status])
+  @@index([userId, dueDate])
 }
 
 // ───────────────────────────────────────────
@@ -264,7 +284,7 @@ model PurchaseOrder {
   userId     String
   user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   supplierId String?
-  supplier   Supplier?           @relation(fields: [supplierId], references: [id])
+  supplier   Supplier?           @relation(fields: [supplierId], references: [id], onDelete: SetNull)
   status     String              @default("draft")
   orderedAt  DateTime?
   expectedAt DateTime?
@@ -273,6 +293,8 @@ model PurchaseOrder {
   total      Float               @default(0)
   createdAt  DateTime            @default(now())
   items      PurchaseOrderItem[]
+
+  @@index([userId, status])
 }
 
 model PurchaseOrderItem {
@@ -341,6 +363,10 @@ model AccessLog {
   endpoint  String?
   status    Int?     // HTTP status
   createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([action])
+  @@index([userId])   // campo nullable — MySQL não cria FK index automático
 }
 
 model MonthlyClosing {

@@ -19,9 +19,9 @@ const {
 const { recalculateOrdersForStore } = require('../services/recalculateService');
 const { importProgress } = require('../lib/importProgress');
 
-const FRONTEND_URL = process.env.SHOPEE_FRONTEND_URL || 'https://profittrack.ecomzero.com.br';
+const { r2 } = require('../lib/utils');
 
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const FRONTEND_URL = process.env.SHOPEE_FRONTEND_URL || 'https://profittrack.ecomzero.com.br';
 
 function chunkArr(arr, size) {
   const out = [];

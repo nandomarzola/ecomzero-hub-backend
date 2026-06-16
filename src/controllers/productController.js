@@ -1,6 +1,7 @@
 const { z } = require('zod');
 const { Prisma } = require('@prisma/client');
 const prisma = require('../lib/prisma');
+const { parsePage } = require('../lib/utils');
 const PDFDocument = require('pdfkit');
 const { getShopeeRates, calcOrderProfit } = require('../services/calculatorService');
 const { recalculateStoreRates } = require('../services/storeRatesService');
@@ -76,8 +77,7 @@ async function list(req, res) {
     ...(andConditions.length ? { AND: andConditions } : {}),
   };
 
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  const take = parseInt(limit);
+  const { skip, take } = parsePage(page, limit);
 
   const [products, total] = await Promise.all([
     prisma.product.findMany({
@@ -120,7 +120,7 @@ async function list(req, res) {
     }
   }
 
-  return res.json({ products: products.map(withAlerts), total, page: parseInt(page), limit: take });
+  return res.json({ products: products.map(withAlerts), total, page: Math.max(1, parseInt(page, 10) || 1), limit: take });
 }
 
 // GET /api/products/:id

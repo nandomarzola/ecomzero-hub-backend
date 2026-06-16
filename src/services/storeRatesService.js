@@ -1,7 +1,7 @@
 const prisma = require('../lib/prisma');
+const { r2 } = require('../lib/utils');
 
 function r4(n) { return Math.round(n * 10000) / 10000; }
-function r2(n) { return Math.round(n * 100) / 100; }
 
 async function recalculateStoreRates(storeId, month, year) {
   const start = new Date(Date.UTC(year, month - 1, 1));

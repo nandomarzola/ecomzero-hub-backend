@@ -1,7 +1,6 @@
 const { shopApiGet } = require('./shopeeAuthService');
 const { calcOrderProfit } = require('./calculatorService');
-
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // API Shopee v2 limita o intervalo de get_order_list a 15 dias por chamada
 const MAX_RANGE_SECONDS = 15 * 24 * 60 * 60;

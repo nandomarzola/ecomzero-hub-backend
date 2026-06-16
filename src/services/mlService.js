@@ -6,7 +6,7 @@ const CLIENT_ID     = process.env.ML_CLIENT_ID;
 const CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const REDIRECT_URI  = process.env.ML_REDIRECT_URI;
 
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // ── HTTP helper ────────────────────────────────────────────────────────────────
 function mlGet(path, accessToken) {

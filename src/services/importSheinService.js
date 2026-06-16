@@ -3,8 +3,7 @@ const { randomUUID } = require('crypto');
 const prisma         = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
 const { recalculateStoreRates } = require('./storeRatesService');
-
-function r2(n) { return Math.round(n * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 function parseNum(v) {
   if (v === null || v === undefined || v === '') return 0;

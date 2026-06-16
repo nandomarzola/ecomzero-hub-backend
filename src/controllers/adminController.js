@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
 const PLANS  = require('../config/plans');
+const { parsePage } = require('../lib/utils');
 
 const ONLINE_THRESHOLD_MS  = 15 * 60 * 1000; // 15 min
 const ACTIVE_THRESHOLD_DAYS = 30;
@@ -81,8 +82,7 @@ async function listUsers(req, res) {
     ];
   }
 
-  const skip  = (parseInt(page) - 1) * parseInt(limit);
-  const take  = parseInt(limit);
+  const { skip, take } = parsePage(page, limit);
 
   const [users, total] = await Promise.all([
     prisma.user.findMany({
@@ -105,7 +105,7 @@ async function listUsers(req, res) {
     planInfo: PLANS.find((p) => p.id === u.plan) ?? null,
   }));
 
-  return res.json({ users: enriched, total, page: parseInt(page), limit: take });
+  return res.json({ users: enriched, total, page: Math.max(1, parseInt(page, 10) || 1), limit: take });
 }
 
 // PUT /api/admin/users/:id — alterar plano e/ou role
@@ -153,12 +153,13 @@ async function getAccessLogs(req, res) {
   if (email)  where.email  = { contains: email };
   if (action) where.action = action;
 
+  const { skip: logSkip, take: logTake } = parsePage(page, limit, { maxLimit: 500, defaultLimit: 100 });
   const [logs, total] = await Promise.all([
     prisma.accessLog.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      take: parseInt(limit),
-      skip: (parseInt(page) - 1) * parseInt(limit),
+      take: logTake,
+      skip: logSkip,
     }),
     prisma.accessLog.count({ where }),
   ]);

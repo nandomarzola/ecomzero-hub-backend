@@ -1,12 +1,11 @@
 const prisma = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
 const { randomUUID } = require('crypto');
+const { r2 } = require('../lib/utils');
 
 // Progress em memória — sem Redis, sem BullMQ
 // jobId → { pct, message, status, result, error }
 const recalcProgress = new Map();
-
-function r2(n) { return Math.round(n * 100) / 100; }
 
 function orderMonth(order) {
   const d = new Date(order.soldAt || order.orderPaidAt || order.orderCreatedAt || order.createdAt);

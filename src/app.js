@@ -1,8 +1,19 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const fs = require('fs');
+
+// ── Validação de variáveis críticas — falha rápido antes de qualquer import de DB ──
+const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
+const missingEnv = REQUIRED_ENV.filter((k) => !process.env[k]);
+if (missingEnv.length) {
+  console.error(`[FATAL] Variáveis de ambiente obrigatórias não definidas: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
+
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const fs           = require('fs');
+const prisma       = require('./lib/prisma');
 
 const authRoutes          = require('./routes/auth');
 const storeRoutes         = require('./routes/stores');
@@ -23,19 +34,27 @@ const tiktokRoutes        = require('./routes/tiktok');
 const shopeeRoutes        = require('./routes/shopee');
 const monthlyTaxRoutes    = require('./routes/monthlyTax');
 
-const { startRecalculateWorker }  = require('./services/recalculateQueue');
+const { startRecalculateWorker } = require('./services/recalculateQueue');
 
 const app = express();
 app.set('etag', false);
+
+// ── Security headers ────────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false, // gerenciado pelo frontend
+}));
+
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
 });
 
-// Garante que a pasta de uploads exista
+// ── Garante que a pasta de uploads exista ──────────────────────────────────────
 const uploadDir = process.env.UPLOAD_DIR || './uploads';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
+// ── CORS ────────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
   'http://localhost',
   'http://localhost:5173',
@@ -48,39 +67,62 @@ const allowedOrigins = [
 const corsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
+    if (allowedOrigins.includes(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
 };
 
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Log de todos os acessos à API
+// ── Rate limiters ───────────────────────────────────────────────────────────────
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas tentativas. Aguarde 15 minutos.' },
+  skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+// Sync dispara chamadas caras a APIs externas — limitar por usuário
+const syncLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas sincronizações em sequência. Aguarde 1 minuto.' },
+  keyGenerator: (req) => req.userId ?? req.ip,
+});
+
+// ── Log de todos os acessos à API ──────────────────────────────────────────────
 const { logAccess } = require('./middleware/accessLog');
 app.use('/api', logAccess);
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// ── Health check com verificação real do banco ─────────────────────────────────
+app.get('/api/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ok', db: 'ok', timestamp: new Date().toISOString() });
+  } catch {
+    res.status(503).json({ status: 'ok', db: 'error', timestamp: new Date().toISOString() });
+  }
 });
 
-app.use('/api/auth',           authRoutes);
-app.use('/api/stores',         storeRoutes);
-app.use('/api/products',       productRoutes);
-app.use('/api/orders',         orderRoutes);
-app.use('/api/dashboard',      dashboardRoutes);
-app.use('/api/suppliers',      supplierRoutes);
-app.use('/api/bills',          billRoutes);
+// ── Rotas ───────────────────────────────────────────────────────────────────────
+app.use('/api/auth',            authRoutes);          // rate limit aplicado na rota
+app.use('/api/stores',          storeRoutes);
+app.use('/api/products',        productRoutes);
+app.use('/api/orders',          orderRoutes);
+app.use('/api/dashboard',       dashboardRoutes);
+app.use('/api/suppliers',       supplierRoutes);
+app.use('/api/bills',           billRoutes);
 app.use('/api/purchase-orders', purchaseOrderRoutes);
-app.use('/api/news',           newsRoutes);
-app.use('/api/cashflow',       cashflowRoutes);
-app.use('/api/admin',          adminPanelRoutes);
+app.use('/api/news',            newsRoutes);
+app.use('/api/cashflow',        cashflowRoutes);
+app.use('/api/admin',           adminPanelRoutes);
 app.use('/api/goals',           goalsRoutes);
 app.use('/api/insights',        insightsRoutes);
 app.use('/api/closing',         closingRoutes);
@@ -89,21 +131,52 @@ app.use('/api/tiktok',          tiktokRoutes);
 app.use('/api/shopee',          shopeeRoutes);
 app.use('/api/monthly-tax',     monthlyTaxRoutes);
 
-// Tratamento de erros global
+// ── Error handler global com contexto de diagnóstico ───────────────────────────
+// Express 5: erros de async handlers chegam aqui automaticamente
 app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Erro interno do servidor' });
+  const status = err.status ?? err.statusCode ?? 500;
+  const isDev  = process.env.NODE_ENV !== 'production';
+
+  console.error({
+    msg:    err.message,
+    stack:  isDev ? err.stack : undefined,
+    method: req.method,
+    path:   req.path,
+    userId: req.userId ?? null,
+    body:   isDev ? req.body : undefined,
+    status,
+  });
+
+  res.status(status).json({ error: status === 500 ? 'Erro interno do servidor' : err.message });
 });
 
+// ── Exporta limiters para uso nas rotas ────────────────────────────────────────
+app.locals.authLimiter = authLimiter;
+app.locals.syncLimiter = syncLimiter;
+
 const PORT = process.env.PORT || 3333;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`ProfitTrack API rodando na porta ${PORT}`);
 
-  // Import roda direto em background (sem BullMQ/Redis)
   if (process.env.ENABLE_WORKER === 'true') {
     startRecalculateWorker();
     console.log('[recalculate-worker] Worker de recálculo iniciado');
   }
 });
+
+// ── Graceful shutdown: fecha conexões abertas antes de reiniciar ───────────────
+async function shutdown(signal) {
+  console.log(`[${signal}] Encerrando servidor...`);
+  server.close(async () => {
+    await prisma.$disconnect();
+    console.log('[shutdown] Banco desconectado. Processo encerrado.');
+    process.exit(0);
+  });
+  // Forçar saída após 10s se algo travar
+  setTimeout(() => process.exit(1), 10_000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 module.exports = app;

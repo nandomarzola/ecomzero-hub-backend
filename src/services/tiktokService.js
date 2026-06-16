@@ -8,7 +8,7 @@ const getAppSecret  = () => process.env.TIKTOK_APP_SECRET;
 const TT_AUTH_BASE = 'https://auth.tiktok-shops.com';
 const TT_API_BASE  = 'https://open-api.tiktokglobal.com';
 
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // ── Assinatura HMAC-SHA256 (obrigatória em todas as chamadas) ─────────────────
 function sign(path, params) {

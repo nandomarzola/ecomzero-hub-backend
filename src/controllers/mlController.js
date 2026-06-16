@@ -145,8 +145,18 @@ async function syncOrders(req, res) {
       : [];
 
     // 4. Upsert de produtos SOMENTE dos itens que têm pedidos
+    // Pré-carrega todos os produtos da store num Map para evitar N+1 queries no loop
     importProgress.set(imp.id, { pct: 35, message: 'Vinculando produtos...' });
     const itemMap = {}; // itemId → productId
+    const externalIds = itemDetails.map(i => i?.id).filter(Boolean);
+    const existingProducts = externalIds.length > 0
+      ? await prisma.product.findMany({
+          where: { storeId, externalId: { in: externalIds } },
+          select: { id: true, externalId: true, sku: true },
+        })
+      : [];
+    const existingByExternalId = new Map(existingProducts.map(p => [p.externalId, p]));
+
     for (const item of itemDetails) {
       if (!item?.id) continue;
       const skuFromAttr = item.attributes?.find(a => a.id === 'SELLER_SKU')?.value_name ?? null;
@@ -162,7 +172,7 @@ async function syncOrders(req, res) {
         stock:         item.available_quantity ?? 0,
       };
 
-      const existing = await prisma.product.findFirst({ where: { storeId, externalId: item.id } });
+      const existing = existingByExternalId.get(String(item.id));
       let product;
       if (existing) {
         product = await prisma.product.update({
@@ -297,6 +307,16 @@ async function syncItems(req, res) {
     let created = 0;
     let updated = 0;
 
+    // Pré-carrega todos os produtos da store num Map para evitar N+1 queries no loop
+    const allItemIds = items.map(i => i?.id).filter(Boolean);
+    const existingItems = allItemIds.length > 0
+      ? await prisma.product.findMany({
+          where: { storeId, externalId: { in: allItemIds.map(String) } },
+          select: { id: true, externalId: true, sku: true },
+        })
+      : [];
+    const existingItemMap = new Map(existingItems.map(p => [p.externalId, p]));
+
     for (const item of items) {
       if (!item?.id) continue;
 
@@ -329,7 +349,7 @@ async function syncItems(req, res) {
         stock:         item.available_quantity ?? 0,
       };
 
-      const existing = await prisma.product.findFirst({ where: { storeId, externalId: item.id } });
+      const existing = existingItemMap.get(String(item.id));
 
       if (existing) {
         await prisma.product.update({

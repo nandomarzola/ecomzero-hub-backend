@@ -1,7 +1,6 @@
 const prisma = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
-
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // Recalculates all orders for a specific store.
 // periodMonth: 'YYYY-MM' to filter by month, null to recalculate all periods.
@@ -35,7 +34,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
   });
   const variantBySku = new Map(variants.map(v => [`${v.productId}|${v.sku}`, v]));
 
-  const BATCH = 10;
+  const BATCH = 100;
   const updates = [];
 
   for (const order of orders) {

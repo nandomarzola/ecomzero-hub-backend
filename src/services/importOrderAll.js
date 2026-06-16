@@ -3,6 +3,7 @@ const { randomUUID } = require('crypto');
 const prisma       = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
 const { recalculateStoreRates } = require('./storeRatesService');
+const { r2 } = require('../lib/utils');
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
 
@@ -80,8 +81,6 @@ function categoryToStatus(cat) {
   if (cat.startsWith('cancelled')) return 'cancelled';
   return 'paid';
 }
-
-function r2(n) { return Math.round(n * 100) / 100; }
 
 function chunkArr(arr, size) {
   const out = [];

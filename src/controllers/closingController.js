@@ -1,7 +1,6 @@
 const prisma      = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
-
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 function fmtBRL(n) {
   const abs = Math.abs(n ?? 0).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');

@@ -1,6 +1,5 @@
 const prisma = require('../lib/prisma');
-
-function r2(n) { return Math.round((n ?? 0) * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // Soma o GMV (valid+pending) de cada loja do usuário no mês,
 // direto dos pedidos (Order), independente do mês estar fechado

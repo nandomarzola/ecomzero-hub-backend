@@ -6,8 +6,7 @@ const { importShopeeOrderAll } = require('../services/importOrderAll');
 const { importSheinOrderAll }  = require('../services/importSheinService');
 const { importTiktokOrderAll } = require('../services/importTiktokService');
 const { importProgress } = require('../lib/importProgress');
-
-function r2(n) { return Math.round(n * 100) / 100; }
+const { r2, parsePage, parseYearMonth } = require('../lib/utils');
 
 // POST /api/orders/import — dispara import em background, responde imediatamente
 async function importOrders(req, res) {
@@ -230,7 +229,7 @@ async function listOrders(req, res) {
   const baseWhere = { storeId: { in: storeIds } };
 
   if (month) {
-    const [y, mo] = month.split('-').map(Number);
+    const { year: y, month: mo } = parseYearMonth(month);
     baseWhere.soldAt = {
       gte: new Date(Date.UTC(y, mo - 1, 1)),
       lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
@@ -259,8 +258,7 @@ async function listOrders(req, res) {
     ];
   }
 
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  const take = parseInt(limit);
+  const { skip, take } = parsePage(page, limit);
 
   const [orders, total, tabGroups, agg, aggCancelled, orphanCount] = await Promise.all([
     prisma.order.findMany({
@@ -303,7 +301,6 @@ async function listOrders(req, res) {
     if (g.orderCategory === 'pending') tabCounts.pending   += g._count._all;
   }
 
-  const r2 = (n) => Math.round((n ?? 0) * 100) / 100;
   const gmv        = r2(agg._sum.calcGmv);
   const shopeeFee  = r2(agg._sum.calcShopeeFee);
   const netRevenue = r2(agg._sum.calcNetRevenue);
@@ -422,11 +419,16 @@ async function exportOrders(req, res) {
   }
   if (status) where.status = status;
 
+  const EXPORT_LIMIT = 10_000;
   const orders = await prisma.order.findMany({
     where,
     include: { product: { select: { name: true, sku: true } } },
     orderBy: { soldAt: 'desc' },
+    take: EXPORT_LIMIT + 1,  // +1 para detectar truncagem
   });
+
+  const truncated = orders.length > EXPORT_LIMIT;
+  if (truncated) orders.length = EXPORT_LIMIT;
 
   const header = ['Data', 'Nº Pedido', 'SKU', 'Produto', 'Qtd', 'Preço Acordado', 'GMV', 'Taxa Shopee', 'Lucro Bruto', 'Margem (%)', 'Categoria'];
 
@@ -451,7 +453,11 @@ async function exportOrders(req, res) {
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(';');
   });
 
-  const csv = [header.join(';'), ...rows].join('\r\n');
+  const warningRows = truncated
+    ? [`"AVISO: exportação limitada a ${EXPORT_LIMIT.toLocaleString('pt-BR')} registros. Use filtro por mês para exportar períodos menores."`]
+    : [];
+
+  const csv = [header.join(';'), ...warningRows, ...rows].join('\r\n');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="pedidos.csv"');
   res.send('﻿' + csv);

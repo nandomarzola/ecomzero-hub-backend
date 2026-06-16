@@ -121,7 +121,24 @@ async function syncOrders(req, res) {
     const detailsMap  = await fetchOrderDetails(accessToken, store.ttShopId, orderIds);
 
     // 3. Upsert produtos dos itens dos pedidos
+    // Pré-carrega produtos existentes para evitar N+1 (1 query no lugar de 1 por produto)
     const itemMap = {};
+    const ttProductIds = [
+      ...new Set(
+        ttOrders.flatMap(o => {
+          const detail = detailsMap[o.id];
+          return (o.line_items ?? detail?.line_items ?? []).map(i => i.product_id).filter(Boolean);
+        })
+      ),
+    ];
+    const existingTtProducts = ttProductIds.length > 0
+      ? await prisma.product.findMany({
+          where: { storeId, externalId: { in: ttProductIds.map(String) } },
+          select: { id: true, externalId: true },
+        })
+      : [];
+    const existingTtMap = new Map(existingTtProducts.map(p => [p.externalId, p.id]));
+
     for (const order of ttOrders) {
       const detail = detailsMap[order.id];
       const items  = order.line_items ?? detail?.line_items ?? [];
@@ -129,11 +146,9 @@ async function syncOrders(req, res) {
         const productId = item.product_id;
         if (!productId || itemMap[productId]) continue;
 
-        const existing = await prisma.product.findFirst({
-          where: { storeId, externalId: String(productId) },
-        });
-        if (existing) {
-          itemMap[productId] = existing.id;
+        const existingId = existingTtMap.get(String(productId));
+        if (existingId) {
+          itemMap[productId] = existingId;
         } else {
           const created = await prisma.product.create({
             data: {
@@ -146,6 +161,7 @@ async function syncOrders(req, res) {
             },
           });
           itemMap[productId] = created.id;
+          existingTtMap.set(String(productId), created.id);
         }
       }
     }

@@ -1,4 +1,4 @@
-function r2(n) { return Math.round(n * 100) / 100; }
+const { r2 } = require('../lib/utils');
 
 // ── Taxas Shopee 2026 (tiers por preço unitário) ──────────────────────────────
 function calcShopeeFeePorUnidade(agreedPrice) {
