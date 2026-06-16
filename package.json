@@ -7,7 +7,8 @@
     "start": "node src/app.js",
     "migrate": "prisma migrate dev",
     "db:push": "prisma db push",
-    "studio": "prisma studio"
+    "studio": "prisma studio",
+    "test": "node --test --test-reporter=spec src/__tests__/calculatorService.test.js"
   },
   "keywords": [],
   "author": "",

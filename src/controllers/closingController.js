@@ -1,6 +1,6 @@
 const prisma      = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
-const { r2 } = require('../lib/utils');
+const { r2, parseYearMonth } = require('../lib/utils');
 
 function fmtBRL(n) {
   const abs = Math.abs(n ?? 0).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
@@ -89,7 +89,7 @@ function fmtDateTime(d) {
 }
 
 function monthLabel(month) {
-  const [y, m] = month.split('-').map(Number);
+  const { year: y, month: m } = parseYearMonth(month);
   return new Date(y, m - 1, 1).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
 }
 
@@ -118,7 +118,7 @@ function makeH(doc, ML = 42, MR = 553) {
 
 // ── Core: compute monthly data ─────────────────────────────────────────────────
 async function buildClosingData(storeIds, month) {
-  const [y, mo] = month.split('-').map(Number);
+  const { year: y, month: mo } = parseYearMonth(month);
   const start = new Date(Date.UTC(y, mo - 1, 1));
   const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
 
@@ -143,7 +143,7 @@ async function buildClosingData(storeIds, month) {
   let shopeeDeductions = 0, sellerDiscounts = 0, netRevenue = 0;
   let taxAmount = 0, productCost = 0, packagingCost = 0, grossProfit = 0;
   let repasseConfirmado = 0, repasseEstimado = 0;
-  let cancelledGmv = 0, returnedValue = 0;
+  let cancelledGmv = 0, returnedValue = 0, returnedCost = 0;
   let unitCount = 0;
   let confirmedCount = 0, pendingCount = 0, cancelledCount = 0, returnedCount = 0;
 
@@ -174,7 +174,8 @@ async function buildClosingData(storeIds, month) {
     const aliquotaOrder = storeTaxRateMap.get(o.storeId) ?? 0;
     const orderTax      = r2((o.calcGmv ?? 0) * aliquotaOrder / 100);
 
-    const orderProfit = r2(orderNet - orderTax - o.calcProductCost - o.calcPackaging);
+    // Para pedidos confirmados: usa escrowAmount real como base (já computado em orderRepasse)
+    const orderProfit = r2(orderRepasse - orderTax - o.calcProductCost - o.calcPackaging);
 
     if (isConfirmed)      confirmedCount++;
     else if (isPending)   pendingCount++;
@@ -231,7 +232,10 @@ async function buildClosingData(storeIds, month) {
       if (isPending)   { gmvPending   += o.calcGmv; repasseEstimado   += orderRepasse; }
     }
     if (isCancelled) cancelledGmv += o.calcGmv;
-    if (isReturned)  returnedValue += o.calcGmv;
+    if (isReturned) {
+      returnedValue += o.calcGmv;
+      returnedCost  += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+    }
 
     if (isRevenue) {
       const key = o.productId
@@ -398,6 +402,7 @@ async function buildClosingData(storeIds, month) {
     avgMargin:        r2(avgMargin),
     cancelledGmv:     r2(cancelledGmv),
     returnedValue:    r2(returnedValue),
+    returnedCost:     r2(returnedCost),
     orphanCount:      groups.filter(g => !g.hasCost).length,
 
     // ── Novo modelo: repasse / imposto / resultado líquido ──────────────────
@@ -437,7 +442,7 @@ async function getProductOrders(req, res) {
     const storeIds = stores.map(s => s.id);
     if (!storeIds.length) return res.json({ orders: [] });
 
-    const [y, mo] = month.split('-').map(Number);
+    const { year: y, month: mo } = parseYearMonth(month);
     const start = new Date(Date.UTC(y, mo - 1, 1));
     const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
 

@@ -9,13 +9,14 @@ function calcShopeeFeePorUnidade(agreedPrice) {
 }
 
 // ── Taxas Mercado Livre 2026 ───────────────────────────────────────────────────
-// listingType: 'gold_pro' = Premium (16%), 'gold_special' = Clássico (11%), 'free' = Grátis (0%)
+// listingType: 'gold_pro' = Premium (17%), 'gold_special' = Clássico (11%), 'free' = Grátis (0%)
+// ML cobra R$6 por unidade adicional para produtos com preço > R$79 (Clássico e Premium)
 function calcMLFeePorUnidade(price, listingType = 'gold_special') {
   const type = (listingType ?? 'gold_special').toLowerCase();
-  if (type === 'gold_pro')  return r2(price * 0.16);
-  if (type === 'free')      return 0;
-  // Clássico (gold_special / padrão): 11%
-  return r2(price * 0.11);
+  if (type === 'free') return 0;
+  const pct      = type === 'gold_pro' ? 0.17 : 0.11;
+  const fixedFee = price > 79 ? 6.00 : 0;
+  return r2(price * pct + fixedFee);
 }
 
 // ── Rates compat (usado no simulador de produtos) ─────────────────────────────
@@ -28,9 +29,10 @@ function getMarketplaceRates(marketplace, unitPrice, listingType) {
     return                      { commissionPct: 14, fixedFee: 26.00 };
   }
   if (mp === 'mercadolivre') {
-    const type = (listingType ?? 'gold_special').toLowerCase();
-    const pct  = type === 'gold_pro' ? 16 : type === 'free' ? 0 : 11;
-    return { commissionPct: pct, fixedFee: 0 };
+    const type     = (listingType ?? 'gold_special').toLowerCase();
+    const pct      = type === 'gold_pro' ? 17 : type === 'free' ? 0 : 11;
+    const fixedFee = (unitPrice > 79 && type !== 'free') ? 6.00 : 0;
+    return { commissionPct: pct, fixedFee };
   }
   return { commissionPct: 0, fixedFee: 0 };
 }

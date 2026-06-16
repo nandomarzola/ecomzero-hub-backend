@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
 const { generateMonthlyReport } = require('../services/reportService');
+const { parseYearMonth } = require('../lib/utils');
 
 function buildDateFilter(startDate, endDate) {
   if (!startDate && !endDate) return undefined;
@@ -354,7 +355,7 @@ async function getMonthlyReport(req, res) {
   const store = await prisma.store.findFirst({ where: { id: storeId, userId: req.userId } });
   if (!store) return res.status(404).json({ error: 'Loja não encontrada' });
 
-  const [year, mon] = month.split('-').map(Number);
+  const { year, month: mon } = parseYearMonth(month);
   const startDate = new Date(year, mon - 1, 1);
   const endDate   = new Date(year, mon, 0, 23, 59, 59);
 

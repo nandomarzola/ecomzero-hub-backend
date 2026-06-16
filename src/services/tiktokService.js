@@ -179,11 +179,12 @@ function convertTTOrder(ttOrder, detail, storeId, importId, store) {
   const agreedPrice = r2(parseFloat(item.sale_price ?? item.original_price ?? 0));
   const quantity    = parseInt(item.quantity ?? 1);
   const gmv         = r2(agreedPrice * quantity);
-  const ttFee       = r2(parseFloat(payment.commission_fee ?? 0));
-  const taxRate     = store.taxRate ?? 0;
-  const taxAmount   = r2(gmv * (taxRate / 100));
-  const netRevenue  = r2(gmv - ttFee);
-  const grossProfit = r2(netRevenue - taxAmount);
+  const ttFee          = r2(parseFloat(payment.commission_fee ?? 0));
+  const affiliateComm  = r2(parseFloat(payment.affiliate_commission ?? 0));
+  const taxRate        = store.taxRate ?? 0;
+  const taxAmount      = r2(gmv * (taxRate / 100));
+  const netRevenue     = r2(gmv - ttFee - affiliateComm);
+  const grossProfit    = r2(netRevenue - taxAmount);
   const margin      = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
 
   const orderCategory = classifyTTOrder(ttOrder.status);
@@ -206,6 +207,7 @@ function convertTTOrder(ttOrder, detail, storeId, importId, store) {
     productId:     null,
     originalPrice: agreedPrice, agreedPrice, quantity,
     platformCommission: ttFee, platformServiceFee: 0,
+    affiliateCommission: affiliateComm,
     sellerCoupon: r2(parseFloat(payment.seller_discount ?? 0)),
     sellerDiscount: 0, lmmDiscount: 0,
     globalTotal:  r2(parseFloat(payment.total_amount ?? gmv)),

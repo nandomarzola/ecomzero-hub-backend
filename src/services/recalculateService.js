@@ -1,6 +1,6 @@
 const prisma = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
-const { r2 } = require('../lib/utils');
+const { r2, parseYearMonth } = require('../lib/utils');
 
 // Recalculates all orders for a specific store.
 // periodMonth: 'YYYY-MM' to filter by month, null to recalculate all periods.
@@ -8,7 +8,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
   const where = { storeId };
 
   if (periodMonth) {
-    const [y, mo] = periodMonth.split('-').map(Number);
+    const { year: y, month: mo } = parseYearMonth(periodMonth);
     where.soldAt = {
       gte: new Date(Date.UTC(y, mo - 1, 1)),
       lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
@@ -49,13 +49,19 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
 
     let platformNetRevenue = null;
     if (marketplace === 'shopee') {
-      platformNetRevenue = r2(
-        (order.calcGmv ?? 0)
-        - (order.platformCommission ?? 0)
-        - (order.platformServiceFee ?? 0)
-        - (order.sellerCoupon ?? 0)
-        - (order.lmmDiscount ?? 0)
-      );
+      if (order.orderCategory === 'valid' && order.escrowAmount != null) {
+        // Pedido confirmado: usa o repasse real depositado pela Shopee
+        platformNetRevenue = r2(order.escrowAmount);
+      } else {
+        // Pedido pendente ou sem escrow: estima a partir dos campos de taxa
+        platformNetRevenue = r2(
+          (order.calcGmv ?? 0)
+          - (order.platformCommission ?? 0)
+          - (order.platformServiceFee ?? 0)
+          - (order.sellerCoupon ?? 0)
+          - (order.lmmDiscount ?? 0)
+        );
+      }
     } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {
       platformNetRevenue = r2(order.orderTotal);
     } else if (marketplace === 'tiktok' && (order.orderTotal ?? 0) > 0) {
@@ -65,6 +71,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
         - (order.platformCommission ?? 0)
         - mlFrete
         - (order.sellerDiscount ?? 0)
+        - (order.affiliateCommission ?? 0)
       );
     }
 

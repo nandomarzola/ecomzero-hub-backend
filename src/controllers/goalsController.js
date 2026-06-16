@@ -1,4 +1,5 @@
 const prisma = require('../lib/prisma');
+const { parseYearMonth } = require('../lib/utils');
 
 async function upsertGoal(req, res) {
   const { month, revenue = 0, profit = 0, orders = 0 } = req.body;
@@ -36,7 +37,7 @@ async function getGoalWithProgress(req, res) {
   ]);
 
   const storeIds = stores.map((s) => s.id);
-  const [y, mo]  = month.split('-').map(Number);
+  const { year: y, month: mo } = parseYearMonth(month);
   const startDate  = new Date(y, mo - 1, 1);
   const today      = new Date();
   const isCurrentMonth = today.getFullYear() === y && today.getMonth() + 1 === mo;

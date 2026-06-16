@@ -107,7 +107,7 @@ async function getClosing(req, res) {
   const storeIds = stores.map((s) => s.id);
   if (!storeIds.length) return res.json({ summary: null, groups: [], orphanCount: 0, month });
 
-  const [y, mo] = month.split('-').map(Number);
+  const { year: y, month: mo } = parseYearMonth(month);
   const start = new Date(Date.UTC(y, mo - 1, 1));
   const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
 
@@ -404,7 +404,7 @@ async function exportOrders(req, res) {
 
   const where = { storeId: { in: storeIds } };
   if (month) {
-    const [y, mo] = month.split('-').map(Number);
+    const { year: y, month: mo } = parseYearMonth(month);
     where.soldAt = {
       gte: new Date(Date.UTC(y, mo - 1, 1)),
       lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),

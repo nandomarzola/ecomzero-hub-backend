@@ -191,6 +191,9 @@ model Order {
   // ── Voucher custeado pela Shopee (não reduz repasse, mas reduz base fiscal) ─
   shopeeVoucher Float?  // null = escrow ainda não disponível
 
+  // ── TikTok Shop ───────────────────────────────────────────────────────────
+  affiliateCommission Float @default(0)  // Comissão paga pelo seller ao criador/afiliado TikTok
+
   // ── Logística ─────────────────────────────────────────────────────────────
   listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
   mlShippingCost   Float    @default(0)  // Frete pago pelo VENDEDOR (Mercado Envios)
