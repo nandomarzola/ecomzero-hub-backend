@@ -7,17 +7,19 @@ const { getShopeeRates, calcOrderProfit } = require('../services/calculatorServi
 const { recalculateStoreRates } = require('../services/storeRatesService');
 
 const productSchema = z.object({
-  storeId:    z.string().uuid('storeId inválido'),
-  name:       z.string().min(1, 'Nome obrigatório'),
-  externalId: z.string().nullish(),
-  sku:        z.string().nullish(),
-  barcode:    z.string().nullish(),
-  costPrice:  z.number().min(0, 'Custo deve ser positivo'),
-  listPrice:  z.number().min(0).optional(),
-  packaging:  z.number().min(0).optional(),
-  supplies:   z.number().min(0).optional(),
-  stock:      z.number().int().min(0).optional(),
-  minStock:   z.number().int().min(0).optional(),
+  storeId:             z.string().uuid('storeId inválido'),
+  name:                z.string().min(1, 'Nome obrigatório'),
+  externalId:          z.string().nullish(),
+  sku:                 z.string().nullish(),
+  barcode:             z.string().nullish(),
+  category:            z.string().nullish(),
+  costPrice:           z.number().min(0, 'Custo deve ser positivo'),
+  listPrice:           z.number().min(0).optional(),
+  packaging:           z.number().min(0).optional(),
+  supplies:            z.number().min(0).optional(),
+  shopeeShippingCost:  z.number().min(0).optional(),
+  stock:               z.number().int().min(0).optional(),
+  minStock:            z.number().int().min(0).optional(),
 });
 
 const variantSchema = z.object({

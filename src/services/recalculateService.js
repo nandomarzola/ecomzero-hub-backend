@@ -19,7 +19,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
     where,
     include: {
       store:   { select: { taxRate: true, marketplace: true } },
-      product: { select: { costPrice: true, packaging: true, category: true } },
+      product: { select: { costPrice: true, packaging: true, category: true, shopeeShippingCost: true } },
       variant: { select: { costPrice: true } },
     },
   });
@@ -92,7 +92,10 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       platformNetRevenue,
       listingType:        order.listingType,
       category:           order.product?.category ?? null,
-      shopeeShippingCost: order.shopeeShippingCost ?? 0,
+      // order-level shipping (importado da API) tem prioridade; produto define o default
+      shopeeShippingCost: order.shopeeShippingCost > 0
+        ? order.shopeeShippingCost
+        : (order.product?.shopeeShippingCost ?? 0),
     });
 
     const isRevenue   = ['valid', 'pending', 'returned_partial'].includes(order.orderCategory);

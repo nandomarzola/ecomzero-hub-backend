@@ -75,8 +75,9 @@ model Product {
   barcode    String?
   costPrice  Float
   listPrice  Float       @default(0)
-  packaging  Float       @default(0)
-  supplies   Float       @default(0)
+  packaging           Float       @default(0)
+  supplies            Float       @default(0)
+  shopeeShippingCost  Float       @default(0)  // Frete padrão pago pelo seller (Shopee envio não integrado) — usado no simulador e como fallback no recalculate
   stock      Int         @default(0)
   minStock   Int         @default(5)
   variations Json?       // Shopee: [{ modelId, sku, name, price, stock }] — legado, mantido para fallback/histórico
