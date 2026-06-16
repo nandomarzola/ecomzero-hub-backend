@@ -19,7 +19,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
     where,
     include: {
       store:   { select: { taxRate: true, marketplace: true } },
-      product: { select: { costPrice: true, packaging: true } },
+      product: { select: { costPrice: true, packaging: true, category: true } },
       variant: { select: { costPrice: true } },
     },
   });
@@ -80,17 +80,19 @@ async function recalculateOrdersForStore(storeId, periodMonth = null) {
       : null;
 
     const calc = calcOrderProfit({
-      agreedPrice:       order.agreedPrice,
-      quantity:          order.quantity,
-      sellerCoupon:      order.sellerCoupon,
-      lmmDiscount:       order.lmmDiscount,
-      costPrice:         order.variant?.costPrice ?? skuMatch?.costPrice ?? order.product?.costPrice ?? 0,
-      packagingCost:     order.product?.packaging ?? 0,
+      agreedPrice:        order.agreedPrice,
+      quantity:           order.quantity,
+      sellerCoupon:       order.sellerCoupon,
+      lmmDiscount:        order.lmmDiscount,
+      costPrice:          order.variant?.costPrice ?? skuMatch?.costPrice ?? order.product?.costPrice ?? 0,
+      packagingCost:      order.product?.packaging ?? 0,
       taxRate,
       marketplace,
       precomputedFee,
       platformNetRevenue,
-      listingType:       order.listingType,
+      listingType:        order.listingType,
+      category:           order.product?.category ?? null,
+      shopeeShippingCost: order.shopeeShippingCost ?? 0,
     });
 
     const isRevenue   = ['valid', 'pending', 'returned_partial'].includes(order.orderCategory);

@@ -69,6 +69,7 @@ model Product {
   mlListingType String?   // gold_pro | gold_special | free
   mlFeeRate     Float?    // taxa de comissão real (%) cobrada pelo ML
   mlStatus      String?   // active | paused | closed | under_review
+  category      String?   // Categoria Shopee: eletronicos|moda|casa|saude_beleza|esportes|brinquedos|geral
   name       String
   sku        String?
   barcode    String?
@@ -196,8 +197,9 @@ model Order {
 
   // ── Logística ─────────────────────────────────────────────────────────────
   listingType      String?  // ML: gold_pro=Premium | gold_special=Clássico | free=Grátis
-  mlShippingCost   Float    @default(0)  // Frete pago pelo VENDEDOR (Mercado Envios)
-  mlInstallmentFee Float    @default(0)  // Taxa de parcelamento cobrada pelo ML (total_paid - paid_amount)
+  mlShippingCost      Float @default(0)  // Frete pago pelo VENDEDOR (Mercado Envios)
+  mlInstallmentFee    Float @default(0)  // Taxa de parcelamento cobrada pelo ML (total_paid - paid_amount)
+  shopeeShippingCost  Float @default(0)  // Frete pago pelo seller fora do escrow Shopee (envio não integrado)
   trackingNumber   String?
   shippingOption   String?
   orderCreatedAt   DateTime?

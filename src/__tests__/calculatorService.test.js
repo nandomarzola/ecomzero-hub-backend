@@ -101,6 +101,64 @@ describe('calcShopeeFeePorUnidade', () => {
   });
 });
 
+// ── calcShopeeFeePorUnidade — por categoria ────────────────────────────────
+describe('calcShopeeFeePorUnidade — por categoria', () => {
+  test('eletronicos: 7% do preço (mais justo que faixa de preço)', () => {
+    // R$120 × 7% = R$8.40  (sem categoria seria 14%+R$20 = R$36.80)
+    assert.equal(calcShopeeFeePorUnidade(120, 'eletronicos'), r2(120 * 0.07));
+  });
+
+  test('moda: 12% do preço', () => {
+    assert.equal(calcShopeeFeePorUnidade(80, 'moda'), r2(80 * 0.12));
+  });
+
+  test('casa: 10% do preço', () => {
+    assert.equal(calcShopeeFeePorUnidade(100, 'casa'), r2(100 * 0.10));
+  });
+
+  test('saude_beleza: 10% do preço', () => {
+    assert.equal(calcShopeeFeePorUnidade(50, 'saude_beleza'), r2(50 * 0.10));
+  });
+
+  test('categoria não mapeada usa geral (12%)', () => {
+    assert.equal(calcShopeeFeePorUnidade(100, 'categoria_nova'), r2(100 * 0.12));
+  });
+
+  test('sem categoria usa tabela de faixa de preço (backward compat)', () => {
+    // faixa < 80: 20% + R$4
+    assert.equal(calcShopeeFeePorUnidade(50), 14);
+    // faixa 100-199: 14% + R$20
+    assert.equal(calcShopeeFeePorUnidade(100), 34);
+  });
+});
+
+// ── getMarketplaceRates — Shopee com categoria ─────────────────────────────
+describe('getMarketplaceRates — Shopee com categoria', () => {
+  test('shopee eletronicos: 7% total, sem taxa fixa', () => {
+    const result = getMarketplaceRates('shopee', 120, null, 'eletronicos');
+    assert.equal(result.commissionPct, 7);
+    assert.equal(result.fixedFee, 0);
+  });
+
+  test('shopee moda: 12% total', () => {
+    const result = getMarketplaceRates('shopee', 80, null, 'moda');
+    assert.equal(result.commissionPct, 12);
+    assert.equal(result.fixedFee, 0);
+  });
+
+  test('shopee casa: 10% total', () => {
+    const result = getMarketplaceRates('shopee', 100, null, 'casa');
+    assert.equal(result.commissionPct, 10);
+    assert.equal(result.fixedFee, 0);
+  });
+
+  test('shopee sem categoria: fallback para tabela de preço (backward compat)', () => {
+    const result = getMarketplaceRates('shopee', 50);
+    assert.equal(result.commissionPct, 20);
+    assert.equal(result.fixedFee, 4);
+  });
+});
+
 // ── calcMLFeePorUnidade ────────────────────────────────────────────────────
 describe('calcMLFeePorUnidade', () => {
   test('gold_pro: 17% + R$6 fixo para produto > R$79', () => {
@@ -214,6 +272,52 @@ describe('calcOrderProfit — Shopee', () => {
     const sem = calcOrderProfit({ agreedPrice: 100, quantity: 1, costPrice: 0, taxRate: 0, marketplace: 'shopee' });
     const com = calcOrderProfit({ agreedPrice: 100, quantity: 1, costPrice: 0, taxRate: 0, marketplace: 'shopee', sellerCoupon: 10 });
     assert.equal(r2(sem.netRevenue - com.netRevenue), 10);
+  });
+});
+
+// ── calcOrderProfit — categoria Shopee ────────────────────────────────────
+describe('calcOrderProfit — categoria Shopee', () => {
+  test('eletronicos R$120: taxa 7% em vez de tabela de preço (14%+R$20)', () => {
+    const comCat = calcOrderProfit({
+      agreedPrice: 120, quantity: 1, costPrice: 40, taxRate: 6,
+      marketplace: 'shopee', category: 'eletronicos',
+    });
+    const semCat = calcOrderProfit({
+      agreedPrice: 120, quantity: 1, costPrice: 40, taxRate: 6,
+      marketplace: 'shopee',
+    });
+    // Com categoria: taxa = 120*7% = R$8.40 → netRevenue = R$111.60
+    assert.equal(comCat.marketplaceFee, r2(120 * 0.07));
+    // Sem categoria (faixa): taxa = 120*14%+R$20 = R$36.80 → netRevenue = R$83.20
+    assert.equal(semCat.marketplaceFee, r2(120 * 0.14 + 20));
+    // Lucro com categoria é maior (taxa menor)
+    assert.ok(comCat.grossProfit > semCat.grossProfit);
+  });
+
+  test('shopeeShippingCost reduz grossProfit sem afetar imposto', () => {
+    const semFrete = calcOrderProfit({
+      agreedPrice: 100, quantity: 1, costPrice: 20, taxRate: 6,
+      marketplace: 'shopee', platformNetRevenue: 90,
+    });
+    const comFrete = calcOrderProfit({
+      agreedPrice: 100, quantity: 1, costPrice: 20, taxRate: 6,
+      marketplace: 'shopee', platformNetRevenue: 90,
+      shopeeShippingCost: 12,
+    });
+    // Imposto não muda (base = GMV)
+    assert.equal(semFrete.taxAmount, comFrete.taxAmount);
+    // Lucro reduz exatamente pelo frete
+    assert.equal(r2(semFrete.grossProfit - comFrete.grossProfit), 12);
+    assert.equal(comFrete.shopeeShipping, 12);
+  });
+
+  test('shopeeShippingCost ignorado para ML', () => {
+    const result = calcOrderProfit({
+      agreedPrice: 100, quantity: 1, costPrice: 20, taxRate: 5,
+      marketplace: 'mercadolivre', precomputedFee: 17,
+      shopeeShippingCost: 15,
+    });
+    assert.equal(result.shopeeShipping, 0);
   });
 });
 
