@@ -143,8 +143,9 @@ const FAIXAS_SIMPLES = [
 ];
 
 // ── GET /api/monthly-tax/simples-faixa ───────────────────────────────────────
-// Retorna em qual faixa do Simples Nacional o seller está baseado no RBT12
-// (Receita Bruta acumulada dos últimos 12 meses), e alerta se está próximo de mudar.
+// Retorna em qual faixa do Simples Nacional o seller está baseado no RBT12.
+// Query param opcional: ?rbt12Override=500000 — seller informa o valor real dos
+// últimos 12 meses quando o sistema não tem dados completos.
 async function getSimplesFaixaInfo(req, res) {
   try {
     const stores = await prisma.store.findMany({
@@ -166,26 +167,46 @@ async function getSimplesFaixaInfo(req, res) {
         orderCategory: { in: ['valid', 'pending'] },
       },
       _sum: { calcGmv: true },
+      _min: { soldAt: true },
+      _max: { soldAt: true },
+      _count: true,
     });
 
     const rbt12 = r2(result._sum.calcGmv ?? 0);
-    const faixa = FAIXAS_SIMPLES.find((f) => rbt12 <= f.limite) ?? FAIXAS_SIMPLES[FAIXAS_SIMPLES.length - 1];
-    const aliquotaEfetivaPct = rbt12 > 0
-      ? r2(((rbt12 * faixa.aliquota - faixa.pd) / rbt12) * 100)
+
+    // Meses de dados: diferença entre o pedido mais antigo e o mais recente no período
+    let mesesDeData = 0;
+    if ((result._count ?? 0) > 0 && result._min.soldAt) {
+      const minDate = new Date(result._min.soldAt);
+      const maxDate = new Date(result._max.soldAt);
+      mesesDeData = (maxDate.getFullYear() - minDate.getFullYear()) * 12
+        + (maxDate.getMonth() - minDate.getMonth()) + 1;
+    }
+    const incompleto = mesesDeData < 12;
+
+    // rbt12Override: seller informa o faturamento real dos últimos 12 meses
+    const overrideRaw = req.query.rbt12Override ? parseFloat(req.query.rbt12Override) : null;
+    const rbt12Efetivo = (overrideRaw && overrideRaw > 0) ? overrideRaw : rbt12;
+
+    const faixa = FAIXAS_SIMPLES.find((f) => rbt12Efetivo <= f.limite) ?? FAIXAS_SIMPLES[FAIXAS_SIMPLES.length - 1];
+    const aliquotaEfetivaPct = rbt12Efetivo > 0
+      ? r2(((rbt12Efetivo * faixa.aliquota - faixa.pd) / rbt12Efetivo) * 100)
       : 0;
     const nextFaixa = FAIXAS_SIMPLES.find((f) => f.numero === faixa.numero + 1) ?? null;
     const proximoLimite = nextFaixa?.limite ?? null;
-    const distanciaProximaFaixa = proximoLimite ? r2(proximoLimite - rbt12) : null;
+    const distanciaProximaFaixa = proximoLimite ? r2(proximoLimite - rbt12Efetivo) : null;
 
     return res.json({
       rbt12,
+      rbt12Efetivo,
+      mesesDeData,
+      incompleto,
       faixa: faixa.numero,
       aliquotaNominalPct: r2(faixa.aliquota * 100),
       parcelaDeducao: faixa.pd,
       aliquotaEfetivaPct,
       proximoLimite,
       distanciaProximaFaixa,
-      // true quando o seller está dentro de 10% do limite da próxima faixa
       alertaFaixa: !!proximoLimite && distanciaProximaFaixa < proximoLimite * 0.1,
     });
   } catch (err) {
