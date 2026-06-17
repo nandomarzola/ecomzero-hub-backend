@@ -12,10 +12,13 @@ async function getIntegrationStatus(req, res) {
       name:             true,
       marketplace:      true,
       spAccessToken:    true,
+      spRefreshToken:   true,
       spTokenExpiresAt: true,
       mlAccessToken:    true,
+      mlRefreshToken:   true,
       mlTokenExpiresAt: true,
       ttAccessToken:    true,
+      ttRefreshToken:   true,
       ttTokenExpiresAt: true,
     },
   });
@@ -32,34 +35,35 @@ async function getIntegrationStatus(req, res) {
     let tokenStatus;
     const mp = store.marketplace;
 
+    // Regra: tokenStatus só é 'reconnect_required' quando NÃO há refresh token
+    // e o access token já expirou. Se o refresh token existe, o sistema auto-renova
+    // o access token na próxima sync — não é necessária ação do usuário.
     if (mp === 'shopee') {
-      if (!store.spAccessToken) {
+      if (!store.spAccessToken && !store.spRefreshToken) {
         tokenStatus = 'not_connected';
-      } else if (store.spTokenExpiresAt && new Date(store.spTokenExpiresAt) < now) {
-        tokenStatus = 'expired';
+      } else if (!store.spRefreshToken && store.spTokenExpiresAt && new Date(store.spTokenExpiresAt) < now) {
+        tokenStatus = 'reconnect_required';
       } else {
         tokenStatus = 'connected';
       }
     } else if (mp === 'mercadolivre') {
-      if (!store.mlAccessToken) {
+      if (!store.mlAccessToken && !store.mlRefreshToken) {
         tokenStatus = 'not_connected';
-      } else if (store.mlTokenExpiresAt && new Date(store.mlTokenExpiresAt) < now) {
-        tokenStatus = 'expired';
+      } else if (!store.mlRefreshToken && store.mlTokenExpiresAt && new Date(store.mlTokenExpiresAt) < now) {
+        tokenStatus = 'reconnect_required';
       } else {
         tokenStatus = 'connected';
       }
     } else if (mp === 'tiktok') {
-      if (!store.ttAccessToken) {
+      if (!store.ttAccessToken && !store.ttRefreshToken) {
         tokenStatus = 'not_connected';
-      } else if (store.ttTokenExpiresAt && new Date(store.ttTokenExpiresAt) < now) {
-        tokenStatus = 'expired';
+      } else if (!store.ttRefreshToken && store.ttTokenExpiresAt && new Date(store.ttTokenExpiresAt) < now) {
+        tokenStatus = 'reconnect_required';
       } else {
         tokenStatus = 'connected';
       }
     } else {
-      tokenStatus = store.spAccessToken || store.mlAccessToken || store.ttAccessToken
-        ? 'connected'
-        : 'not_connected';
+      tokenStatus = 'not_connected';
     }
 
     return {
