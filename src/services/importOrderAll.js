@@ -522,11 +522,11 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
     const [toDeduct, toRestore] = await Promise.all([
       prisma.order.findMany({
         where: { storeId, orderCategory: 'valid',         stockDeducted: false, productId: { not: null } },
-        select: { id: true, productId: true, quantity: true, orderCategory: true, stockDeducted: true },
+        select: { id: true, productId: true, variantId: true, quantity: true, orderCategory: true, stockDeducted: true },
       }),
       prisma.order.findMany({
         where: { storeId, orderCategory: 'returned_full', stockDeducted: true,  productId: { not: null } },
-        select: { id: true, productId: true, quantity: true, orderCategory: true, stockDeducted: true },
+        select: { id: true, productId: true, variantId: true, quantity: true, orderCategory: true, stockDeducted: true },
       }),
     ]);
     for (const order of [...toDeduct, ...toRestore]) {

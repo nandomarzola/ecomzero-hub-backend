@@ -1104,6 +1104,58 @@ async function setComponents(req, res) {
   return res.json({ components: updated });
 }
 
+// GET /api/products/:id/variants/:variantId/components
+async function getVariantComponents(req, res) {
+  const variant = await prisma.productVariant.findFirst({
+    where: { id: req.params.variantId, product: { store: { userId: req.userId } } },
+  });
+  if (!variant) return res.status(404).json({ error: 'Variação não encontrada' });
+
+  const components = await prisma.productVariantComponent.findMany({
+    where: { variantId: req.params.variantId },
+    include: {
+      baseProduct: { select: { id: true, name: true, sku: true, stock: true, costPrice: true } },
+    },
+    orderBy: { baseProduct: { name: 'asc' } },
+  });
+  return res.json({ components });
+}
+
+// POST /api/products/:id/variants/:variantId/components
+// Body: { components: [{ baseProductId, quantity }] }
+async function setVariantComponents(req, res) {
+  const { variantId } = req.params;
+  const { components = [] } = req.body;
+
+  const variant = await prisma.productVariant.findFirst({
+    where: { id: variantId, product: { store: { userId: req.userId } } },
+  });
+  if (!variant) return res.status(404).json({ error: 'Variação não encontrada' });
+
+  if (components.length > 0) {
+    const baseIds = components.map(c => c.baseProductId);
+    const valid = await prisma.product.count({
+      where: { id: { in: baseIds }, store: { userId: req.userId } },
+    });
+    if (valid !== baseIds.length) {
+      return res.status(400).json({ error: 'Um ou mais produtos base inválidos' });
+    }
+  }
+
+  await prisma.$transaction([
+    prisma.productVariantComponent.deleteMany({ where: { variantId } }),
+    ...(components.length > 0 ? [prisma.productVariantComponent.createMany({
+      data: components.map(c => ({
+        variantId,
+        baseProductId: c.baseProductId,
+        quantity: parseInt(c.quantity) || 1,
+      })),
+    })] : []),
+  ]);
+
+  return res.json({ ok: true });
+}
+
 // PATCH /api/products/:id/mark-base
 // Body: { isBase: boolean }
 async function markAsBase(req, res) {
@@ -1123,4 +1175,4 @@ async function markAsBase(req, res) {
   return res.json({ product });
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats, getComponents, setComponents, markAsBase };
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats, getComponents, setComponents, markAsBase, getVariantComponents, setVariantComponents };

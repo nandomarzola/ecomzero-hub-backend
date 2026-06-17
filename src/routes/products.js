@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats, getComponents, setComponents, markAsBase } = require('../controllers/productController');
+const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats, getComponents, setComponents, markAsBase, getVariantComponents, setVariantComponents } = require('../controllers/productController');
 const { authMiddleware } = require('../middleware/auth');
 
 router.use(authMiddleware);
@@ -24,5 +24,7 @@ router.patch('/:id/stock', adjustStock);
 router.post('/:id/variants', addVariant);
 router.delete('/:id/variants/:variantId', removeVariant);
 router.patch('/:id/variants/:variantId/cost', updateVariantCost);
+router.get('/:id/variants/:variantId/components', getVariantComponents);
+router.post('/:id/variants/:variantId/components', setVariantComponents);
 
 module.exports = router;
