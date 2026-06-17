@@ -1,5 +1,7 @@
 const prisma = require('../lib/prisma');
 
+const r2 = n => Math.round((n + Number.EPSILON) * 100) / 100;
+
 async function listPurchaseOrders(req, res) {
   const { status } = req.query;
   const where = { userId: req.userId };
@@ -66,59 +68,71 @@ async function sendPurchaseOrder(req, res) {
 
   const updated = await prisma.purchaseOrder.update({
     where: { id: req.params.id },
-    data:  { status: 'ordered', orderedAt: new Date() },
+    data:  { status: 'sent', orderedAt: new Date() },
   });
   return res.json({ order: updated });
 }
 
 async function receivePurchaseOrder(req, res) {
-  const { createBill = true } = req.body;
+  const { items: bodyItems } = req.body;
 
   const order = await prisma.purchaseOrder.findFirst({
     where:   { id: req.params.id, userId: req.userId },
     include: { items: { include: { product: true } }, supplier: true },
   });
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
-  if (order.status === 'received') return res.status(400).json({ error: 'Pedido já recebido' });
+  if (order.status === 'delivered') return res.status(409).json({ error: 'Pedido já foi entregue e não pode ser reprocessado' });
   if (order.status === 'cancelled') return res.status(400).json({ error: 'Pedido cancelado' });
 
-  await prisma.$transaction(async (tx) => {
-    // Atualiza status do pedido
-    await tx.purchaseOrder.update({
-      where: { id: order.id },
-      data:  { status: 'received', receivedAt: new Date() },
-    });
+  let billTotal = 0;
 
-    // Incrementa estoque de cada produto
+  await prisma.$transaction(async (tx) => {
     for (const item of order.items) {
-      await tx.product.update({
-        where: { id: item.productId },
-        data:  { stock: { increment: item.quantity } },
+      const recv = bodyItems?.find(i => i.itemId === item.id)?.receivedQty ?? item.quantity;
+
+      await tx.purchaseOrderItem.update({
+        where: { id: item.id },
+        data:  { receivedQty: recv },
       });
+
+      if (item.productId != null) {
+        await tx.product.update({
+          where: { id: item.productId },
+          data:  { stock: { increment: recv } },
+        });
+      }
+
+      billTotal += recv * item.unitCost;
     }
 
-    // Cria conta a pagar automaticamente
-    if (createBill && order.total > 0) {
+    billTotal = r2(billTotal);
+
+    await tx.purchaseOrder.update({
+      where: { id: order.id },
+      data:  { status: 'delivered', receivedAt: new Date() },
+    });
+
+    if (billTotal > 0) {
       await tx.bill.create({
         data: {
           userId:      req.userId,
           supplierId:  order.supplierId,
           description: `Compra #${order.id.slice(0, 8).toUpperCase()}${order.supplier ? ` — ${order.supplier.name}` : ''}`,
-          amount:      order.total,
-          dueDate:     new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // +30 dias padrão
+          amount:      billTotal,
+          dueDate:     new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
           category:    'compra',
         },
       });
     }
   });
 
-  return res.json({ message: 'Pedido recebido, estoque atualizado', billCreated: Boolean(createBill && order.total > 0) });
+  return res.json({ message: 'Pedido recebido, estoque atualizado', billCreated: billTotal > 0, billAmount: billTotal });
 }
 
 async function cancelPurchaseOrder(req, res) {
   const order = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, userId: req.userId } });
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
-  if (order.status === 'received') return res.status(400).json({ error: 'Pedido já recebido, não pode cancelar' });
+  if (order.status === 'delivered') return res.status(400).json({ error: 'Pedido já entregue, não pode cancelar' });
 
   await prisma.purchaseOrder.update({ where: { id: order.id }, data: { status: 'cancelled' } });
   return res.json({ message: 'Pedido cancelado' });
@@ -127,7 +141,7 @@ async function cancelPurchaseOrder(req, res) {
 async function deletePurchaseOrder(req, res) {
   const order = await prisma.purchaseOrder.findFirst({ where: { id: req.params.id, userId: req.userId } });
   if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
-  if (order.status === 'received') return res.status(400).json({ error: 'Não é possível excluir um pedido recebido' });
+  if (order.status === 'delivered') return res.status(400).json({ error: 'Não é possível excluir um pedido entregue' });
   await prisma.purchaseOrder.delete({ where: { id: order.id } });
   return res.json({ message: 'Pedido excluído' });
 }
