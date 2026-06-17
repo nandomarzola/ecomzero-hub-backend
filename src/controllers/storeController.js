@@ -10,6 +10,9 @@ const storeSchema = z.object({
   taxType: z.enum(['mei', 'simples', 'lucro_presumido']).optional(),
   taxRate: z.number().min(0).max(100).optional(),
   fixedMonthlyTax: z.number().min(0).optional(),
+  sellerType: z.enum(['cnpj', 'cpf_low', 'cpf_high']).optional(),
+  shopeeFixedFee: z.number().min(0).nullable().optional(),
+  pfgEnabled: z.boolean().optional(),
 });
 
 async function list(req, res) {
