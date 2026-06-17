@@ -46,8 +46,25 @@ async function create(req, res) {
     return res.status(400).json({ error: 'Dados inválidos', issues: parsed.error.issues });
   }
 
+  // Regra de negócio: CNPJ pode ter no máximo 1 loja por marketplace
+  const user = await prisma.user.findUnique({ where: { id: req.userId }, select: { cnpj: true } });
+  const isCnpj = user?.cnpj && user.cnpj.replace(/\D/g, '').length === 14;
+  if (isCnpj) {
+    const existing = await prisma.store.findFirst({
+      where: { userId: req.userId, marketplace: parsed.data.marketplace },
+    });
+    if (existing) {
+      return res.status(409).json({
+        error: `CNPJ só pode ter 1 loja por marketplace. Você já tem uma loja ${parsed.data.marketplace} cadastrada.`,
+      });
+    }
+  }
+
+  // Deriva sellerType do documento do usuário — não precisa perguntar na loja
+  const sellerType = isCnpj ? 'cnpj' : (parsed.data.sellerType ?? 'cpf_low');
+
   const store = await prisma.store.create({
-    data: { ...parsed.data, userId: req.userId },
+    data: { ...parsed.data, sellerType, userId: req.userId },
   });
 
   return res.status(201).json({ store });

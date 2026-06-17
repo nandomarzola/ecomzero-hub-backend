@@ -73,7 +73,7 @@ async function login(req, res) {
 async function me(req, res) {
   const user = await prisma.user.findUnique({
     where: { id: req.userId },
-    select: { id: true, name: true, email: true, plan: true, role: true, createdAt: true },
+    select: { id: true, name: true, email: true, cnpj: true, plan: true, role: true, createdAt: true },
   });
 
   if (!user) {
@@ -84,7 +84,7 @@ async function me(req, res) {
 }
 
 async function updateMe(req, res) {
-  const { name, currentPassword, newPassword } = req.body;
+  const { name, currentPassword, newPassword, cnpj } = req.body;
 
   const user = await prisma.user.findUnique({ where: { id: req.userId } });
   if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
@@ -93,6 +93,11 @@ async function updateMe(req, res) {
 
   if (name && name.trim().length >= 2) {
     data.name = name.trim();
+  }
+
+  if (cnpj !== undefined) {
+    // Aceita string (CNPJ/CPF) ou null para limpar
+    data.cnpj = cnpj ? String(cnpj).trim() : null;
   }
 
   if (newPassword) {
@@ -112,7 +117,7 @@ async function updateMe(req, res) {
   const updated = await prisma.user.update({
     where: { id: req.userId },
     data,
-    select: { id: true, name: true, email: true, plan: true, role: true, createdAt: true },
+    select: { id: true, name: true, email: true, cnpj: true, plan: true, role: true, createdAt: true },
   });
 
   return res.json({ user: updated });
