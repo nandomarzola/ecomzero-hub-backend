@@ -4,6 +4,7 @@ const prisma       = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
 const { recalculateStoreRates } = require('./storeRatesService');
 const { r2 } = require('../lib/utils');
+const { applyStockFromOrder } = require('../lib/stockHelper');
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
 
@@ -513,6 +514,28 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
   });
 
   await recalculateStoreRates(storeId, mon, year).catch(() => {});
+
+  // ═══ FASE 8: Ajuste de estoque por composição ════════════════════════════
+  // Consulta o banco (não o array em memória) para capturar pedidos cujo status
+  // mudou desde o último import (ex: pending → valid, valid → returned_full).
+  try {
+    const [toDeduct, toRestore] = await Promise.all([
+      prisma.order.findMany({
+        where: { storeId, orderCategory: 'valid',         stockDeducted: false, productId: { not: null } },
+        select: { id: true, productId: true, quantity: true, orderCategory: true, stockDeducted: true },
+      }),
+      prisma.order.findMany({
+        where: { storeId, orderCategory: 'returned_full', stockDeducted: true,  productId: { not: null } },
+        select: { id: true, productId: true, quantity: true, orderCategory: true, stockDeducted: true },
+      }),
+    ]);
+    for (const order of [...toDeduct, ...toRestore]) {
+      await applyStockFromOrder(order);
+    }
+  } catch (e) {
+    console.error('[stock] Erro ao ajustar estoque pós-import:', e.message);
+    // Não falha o import por erro de estoque
+  }
 
   await onProgress?.({ pct: 100, message: 'Concluído!' });
 

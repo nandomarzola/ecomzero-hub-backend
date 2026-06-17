@@ -94,6 +94,11 @@ model Product {
   purchaseOrderItems PurchaseOrderItem[]
   updatedAt          DateTime @default(now()) @updatedAt
 
+  // ── Estoque composto (kit/variação de anúncio) ────────────────────────────
+  isBase     Boolean            @default(false)  // true = produto físico (aparece na tela de Estoque)
+  components ProductComponent[] @relation("AnnouncementComponents")  // anúncio → componentes físicos
+  usedIn     ProductComponent[] @relation("BaseComponents")           // produto físico → anúncios que o usam
+
   @@index([storeId])
   @@index([storeId, sku])
   @@index([storeId, externalId])   // ML/TikTok sync — findFirst por externalId em loop
@@ -116,6 +121,22 @@ model ProductVariant {
 
   @@unique([productId, marketplaceVariantId])
   @@index([productId, sku])   // lookup de custo por SKU no recalculate
+}
+
+// ── Composição de anúncios (kit → produtos físicos) ──────────────────────────
+// Permite que um anúncio (Product) consuma N produtos físicos (isBase=true) ao ser vendido.
+// Ex: "Kit 2un" → baseProduct: produto físico quantity=2
+model ProductComponent {
+  id            String  @id @default(uuid())
+  productId     String  // anúncio (quem é vendido)
+  product       Product @relation("AnnouncementComponents", fields: [productId], references: [id], onDelete: Cascade)
+  baseProductId String  // produto físico descontado do estoque
+  baseProduct   Product @relation("BaseComponents", fields: [baseProductId], references: [id], onDelete: Cascade)
+  quantity      Int     @default(1)
+
+  @@unique([productId, baseProductId])
+  @@index([productId])
+  @@index([baseProductId])
 }
 
 // ── Controle de importações ──────────────────────────────────────────────────
@@ -221,6 +242,7 @@ model Order {
   calcGrossProfit Float   @default(0)
   calcMargin      Float   @default(0)
   hasCost         Boolean @default(false)
+  stockDeducted   Boolean @default(false)  // true quando estoque já foi decrementado por esta venda
 
   // ── Compat com dashboard/cashflow existentes ──────────────────────────────
   status    String   @default("paid")  // paid|cancelled|returned

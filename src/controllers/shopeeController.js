@@ -23,6 +23,43 @@ const { r2 } = require('../lib/utils');
 
 const FRONTEND_URL = process.env.SHOPEE_FRONTEND_URL || 'https://profittrack.ecomzero.com.br';
 
+// ── Decrementa/restaura estoque ao confirmar ou devolver um pedido ────────────
+// Regras:
+//   valid + !stockDeducted  → decrementa estoque, seta stockDeducted=true
+//   returned_full + stockDeducted → restaura estoque, seta stockDeducted=false
+//   qualquer outro caso     → não mexe
+// tx: instância Prisma opcional (para uso em transaction — null usa o singleton)
+async function applyStockFromOrder(order, tx) {
+  const db = tx ?? prisma;
+  const shouldDeduct  = order.orderCategory === 'valid'         && !order.stockDeducted;
+  const shouldRestore = order.orderCategory === 'returned_full' && order.stockDeducted;
+  if (!shouldDeduct && !shouldRestore) return;
+  if (!order.productId) return;
+
+  const delta = shouldDeduct ? -1 : 1;
+
+  const components = await db.productComponent.findMany({ where: { productId: order.productId } });
+
+  if (components.length > 0) {
+    for (const comp of components) {
+      await db.product.update({
+        where: { id: comp.baseProductId },
+        data: { stock: { increment: delta * comp.quantity * order.quantity } },
+      });
+    }
+  } else {
+    await db.product.update({
+      where: { id: order.productId },
+      data: { stock: { increment: delta * order.quantity } },
+    });
+  }
+
+  await db.order.update({
+    where: { id: order.id },
+    data: { stockDeducted: shouldDeduct },
+  });
+}
+
 function chunkArr(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -402,6 +439,24 @@ async function syncOrders(req, res) {
     for (const batch of chunkArr(ordersData, 200)) {
       const result = await prisma.order.createMany({ data: batch, skipDuplicates: true });
       saved += result.count;
+    }
+
+    // 6b. Ajuste de estoque — busca pedidos do import que precisam de decremento/restauro
+    // Roda APÓS createMany (que não retorna ids individuais) consultando por importId.
+    // Só processa valid+!stockDeducted e returned_full+stockDeducted para garantir idempotência.
+    const stockOrders = await prisma.order.findMany({
+      where: {
+        importId: imp.id,
+        productId: { not: null },
+        OR: [
+          { orderCategory: 'valid',         stockDeducted: false },
+          { orderCategory: 'returned_full', stockDeducted: true  },
+        ],
+      },
+      select: { id: true, orderCategory: true, stockDeducted: true, productId: true, quantity: true },
+    });
+    for (const o of stockOrders) {
+      await applyStockFromOrder(o).catch(() => {});
     }
 
     // Aplica costPrice dos produtos vinculados nos pedidos recém-importados

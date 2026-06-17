@@ -1044,4 +1044,83 @@ async function getProductStats(req, res) {
   });
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats };
+// GET /api/products/:id/components
+async function getComponents(req, res) {
+  const product = await prisma.product.findFirst({
+    where: { id: req.params.id, store: { userId: req.userId } },
+    select: { id: true },
+  });
+  if (!product) return res.status(404).json({ error: 'Produto não encontrado' });
+
+  const components = await prisma.productComponent.findMany({
+    where: { productId: req.params.id },
+    include: { baseProduct: { select: { id: true, name: true, sku: true, stock: true } } },
+  });
+  return res.json({ components });
+}
+
+// POST /api/products/:id/components
+// Body: { components: [{ baseProductId, quantity }] }
+async function setComponents(req, res) {
+  const productId = req.params.id;
+
+  const product = await prisma.product.findFirst({
+    where: { id: productId, store: { userId: req.userId } },
+    select: { id: true, storeId: true },
+  });
+  if (!product) return res.status(404).json({ error: 'Produto não encontrado' });
+
+  const { components } = req.body;
+  if (!Array.isArray(components)) return res.status(400).json({ error: 'components deve ser um array' });
+
+  if (components.length > 0) {
+    // Verificar que cada baseProductId pertence ao mesmo userId
+    const baseIds = components.map(c => c.baseProductId);
+    const validBases = await prisma.product.findMany({
+      where: { id: { in: baseIds }, store: { userId: req.userId } },
+      select: { id: true },
+    });
+    const validBaseIds = new Set(validBases.map(p => p.id));
+    const invalid = baseIds.filter(id => !validBaseIds.has(id));
+    if (invalid.length > 0) {
+      return res.status(403).json({ error: 'Um ou mais produtos base não pertencem ao usuário', invalid });
+    }
+
+    await prisma.$transaction([
+      prisma.productComponent.deleteMany({ where: { productId } }),
+      prisma.productComponent.createMany({
+        data: components.map(c => ({ productId, baseProductId: c.baseProductId, quantity: c.quantity ?? 1 })),
+      }),
+    ]);
+  } else {
+    // Array vazio: apenas deletar, não chamar createMany com array vazio
+    await prisma.productComponent.deleteMany({ where: { productId } });
+  }
+
+  const updated = await prisma.productComponent.findMany({
+    where: { productId },
+    include: { baseProduct: { select: { id: true, name: true, sku: true, stock: true } } },
+  });
+  return res.json({ components: updated });
+}
+
+// PATCH /api/products/:id/mark-base
+// Body: { isBase: boolean }
+async function markAsBase(req, res) {
+  const productId = req.params.id;
+
+  const existing = await prisma.product.findFirst({
+    where: { id: productId, store: { userId: req.userId } },
+    select: { id: true },
+  });
+  if (!existing) return res.status(404).json({ error: 'Produto não encontrado' });
+
+  const { isBase } = req.body;
+  const product = await prisma.product.update({
+    where: { id: productId },
+    data: { isBase: !!isBase },
+  });
+  return res.json({ product });
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats, getComponents, setComponents, markAsBase };

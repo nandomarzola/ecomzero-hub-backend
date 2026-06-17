@@ -2,6 +2,7 @@ const prisma = require('../lib/prisma');
 const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchShippingCosts, listingTypeLabel } = require('../services/mlService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
 const { importProgress } = require('../lib/importProgress');
+const { applyStockFromOrder } = require('../lib/stockHelper');
 
 const FRONTEND_URL = process.env.ML_FRONTEND_URL || 'http://localhost:5173';
 
@@ -242,6 +243,23 @@ async function syncOrders(req, res) {
     for (const batch of chunkArr(ordersData, 200)) {
       const result = await prisma.order.createMany({ data: batch, skipDuplicates: true });
       saved += result.count;
+    }
+
+    // 6b. Ajuste de estoque — busca pedidos do import que precisam de decremento/restauro
+    // Só processa valid+!stockDeducted e returned_full+stockDeducted para garantir idempotência.
+    const stockOrders = await prisma.order.findMany({
+      where: {
+        importId: imp.id,
+        productId: { not: null },
+        OR: [
+          { orderCategory: 'valid',         stockDeducted: false },
+          { orderCategory: 'returned_full', stockDeducted: true  },
+        ],
+      },
+      select: { id: true, orderCategory: true, stockDeducted: true, productId: true, quantity: true },
+    });
+    for (const o of stockOrders) {
+      await applyStockFromOrder(o).catch(() => {});
     }
 
     // Aplica costPrice dos produtos vinculados nos pedidos recém-importados
