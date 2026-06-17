@@ -54,6 +54,7 @@ model Store {
 
   sellerType       String?   @default("cnpj")  // "cpf" | "cnpj"
   shopeeFixedFee   Float?                       // override manual da taxa fixa Shopee por item
+  pfgEnabled       Boolean   @default(false)    // participa do Programa Frete Grátis Shopee (+6%)
 
   products         Product[]
   orders           Order[]
