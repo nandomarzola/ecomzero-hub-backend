@@ -968,4 +968,80 @@ async function updateVariantCost(req, res) {
   }
 }
 
-module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost };
+// GET /api/products/stats — contagens de margem para o Dashboard (sem paginação)
+async function getProductStats(req, res) {
+  const { storeId } = req.query;
+  const { r2 } = require('../lib/utils');
+
+  const products = await prisma.product.findMany({
+    where: {
+      parentId: null,
+      store: { userId: req.userId },
+      ...(storeId ? { storeId } : {}),
+    },
+    select: {
+      id: true,
+      costPrice: true,
+      listPrice: true,
+      store: { select: { taxRate: true, sellerType: true, pfgEnabled: true, marketplace: true } },
+      productVariants: { select: { costPrice: true, price: true } },
+    },
+  });
+
+  let totalCount = 0, noCostCount = 0, atRiskCount = 0;
+  let marginSum = 0, marginCount = 0;
+
+  for (const p of products) {
+    totalCount++;
+    const mp = (p.store?.marketplace ?? 'shopee').toLowerCase();
+    const taxRate = p.store?.taxRate ?? 0;
+    const pfgEnabled = p.store?.pfgEnabled ?? false;
+    const sellerType = p.store?.sellerType ?? 'cnpj';
+
+    let commissionPct = 0, fixedFee = 0;
+    if (mp === 'shopee') {
+      commissionPct = 14 + (pfgEnabled ? 6 : 0);
+      fixedFee = sellerType === 'cnpj' ? 4 : 7;
+    } else if (mp === 'mercadolivre') {
+      commissionPct = 12; fixedFee = 0;
+    }
+
+    const items = p.productVariants?.length
+      ? p.productVariants
+          .filter(v => (v.costPrice ?? 0) > 0 && (v.price ?? 0) > 0)
+          .map(v => {
+            const profit = v.price - r2(v.price * commissionPct / 100) - fixedFee - r2(v.price * taxRate / 100) - v.costPrice;
+            return (profit / v.price) * 100;
+          })
+      : [];
+
+    let margin = null;
+    if (items.length > 0) {
+      margin = Math.min(...items);
+    } else if ((p.costPrice ?? 0) > 0 && (p.listPrice ?? 0) > 0) {
+      const profit = p.listPrice - r2(p.listPrice * commissionPct / 100) - fixedFee - r2(p.listPrice * taxRate / 100) - p.costPrice;
+      margin = (profit / p.listPrice) * 100;
+    }
+
+    if (margin === null) {
+      noCostCount++;
+      continue;
+    }
+
+    marginSum += margin;
+    marginCount++;
+
+    const score = margin >= 25 ? 'healthy' : margin >= 15 ? 'warning' : margin >= 10 ? 'risk' : 'loss';
+    if (score === 'risk' || score === 'loss') atRiskCount++;
+  }
+
+  return res.json({
+    totalCount,
+    noCostCount,
+    atRiskCount,
+    avgMargin: marginCount > 0 ? r2(marginSum / marginCount) : null,
+    hasEnoughData: marginCount >= 5,
+  });
+}
+
+module.exports = { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats };

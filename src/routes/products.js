@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost } = require('../controllers/productController');
+const { list, get, create, update, remove, adjustStock, addVariant, removeVariant, stockReport, exportPdf, setCostBySku, searchWithCost, saveAndRecalc, updateVariantCost, getProductStats } = require('../controllers/productController');
 const { authMiddleware } = require('../middleware/auth');
 
 router.use(authMiddleware);
 
+router.get('/stats', getProductStats);
 router.get('/stock-report', stockReport);
 router.get('/export-pdf', exportPdf);
 router.get('/search-cost', searchWithCost);
