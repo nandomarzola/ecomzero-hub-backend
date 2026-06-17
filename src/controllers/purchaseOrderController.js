@@ -33,18 +33,23 @@ async function getPurchaseOrder(req, res) {
 }
 
 async function createPurchaseOrder(req, res) {
-  const { supplierId, expectedAt, notes, items } = req.body;
+  const { supplierId, expectedAt, notes, items, shippingCost, discount } = req.body;
   if (!items?.length) return res.status(400).json({ error: 'Pelo menos um item é obrigatório' });
 
-  const total = items.reduce((s, i) => s + (parseFloat(i.unitCost) * parseInt(i.quantity)), 0);
+  const itemsTotal = items.reduce((s, i) => s + (parseFloat(i.unitCost) * parseInt(i.quantity)), 0);
+  const shipping   = parseFloat(shippingCost ?? 0) || 0;
+  const disc       = parseFloat(discount ?? 0) || 0;
+  const total      = r2(itemsTotal + shipping - disc);
 
   const order = await prisma.purchaseOrder.create({
     data: {
-      userId:     req.userId,
-      supplierId: supplierId || null,
-      expectedAt: expectedAt ? new Date(expectedAt) : null,
-      notes:      notes?.trim() || null,
-      total:      parseFloat(total.toFixed(2)),
+      userId:       req.userId,
+      supplierId:   supplierId || null,
+      expectedAt:   expectedAt ? new Date(expectedAt) : null,
+      notes:        notes?.trim() || null,
+      total,
+      shippingCost: shipping,
+      discount:     disc,
       items: {
         create: items.map((i) => ({
           productId: i.productId,
@@ -74,7 +79,7 @@ async function sendPurchaseOrder(req, res) {
 }
 
 async function receivePurchaseOrder(req, res) {
-  const { items: bodyItems } = req.body;
+  const { items: bodyItems, createBill } = req.body;
 
   const order = await prisma.purchaseOrder.findFirst({
     where:   { id: req.params.id, userId: req.userId },
@@ -84,7 +89,7 @@ async function receivePurchaseOrder(req, res) {
   if (order.status === 'delivered') return res.status(409).json({ error: 'Pedido já foi entregue e não pode ser reprocessado' });
   if (order.status === 'cancelled') return res.status(400).json({ error: 'Pedido cancelado' });
 
-  let billTotal = 0;
+  let itemsTotal = 0;
 
   await prisma.$transaction(async (tx) => {
     for (const item of order.items) {
@@ -102,31 +107,34 @@ async function receivePurchaseOrder(req, res) {
         });
       }
 
-      billTotal += recv * item.unitCost;
+      itemsTotal += recv * item.unitCost;
     }
 
-    billTotal = r2(billTotal);
+    const billAmount = r2(itemsTotal + (order.shippingCost ?? 0) - (order.discount ?? 0));
 
     await tx.purchaseOrder.update({
       where: { id: order.id },
       data:  { status: 'delivered', receivedAt: new Date() },
     });
 
-    if (billTotal > 0) {
+    if (createBill !== false && billAmount > 0) {
       await tx.bill.create({
         data: {
           userId:      req.userId,
           supplierId:  order.supplierId,
           description: `Compra #${order.id.slice(0, 8).toUpperCase()}${order.supplier ? ` — ${order.supplier.name}` : ''}`,
-          amount:      billTotal,
+          amount:      billAmount,
           dueDate:     new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
           category:    'compra',
         },
       });
     }
+
+    itemsTotal = r2(itemsTotal);
   });
 
-  return res.json({ message: 'Pedido recebido, estoque atualizado', billCreated: billTotal > 0, billAmount: billTotal });
+  const billAmount = r2(itemsTotal + (order.shippingCost ?? 0) - (order.discount ?? 0));
+  return res.json({ message: 'Pedido recebido, estoque atualizado', billCreated: createBill !== false && billAmount > 0, billAmount });
 }
 
 async function cancelPurchaseOrder(req, res) {
@@ -146,4 +154,26 @@ async function deletePurchaseOrder(req, res) {
   return res.json({ message: 'Pedido excluído' });
 }
 
-module.exports = { listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, sendPurchaseOrder, receivePurchaseOrder, cancelPurchaseOrder, deletePurchaseOrder };
+async function getProductCosts(req, res) {
+  const userId = req.userId;
+  const lastCosts = await prisma.purchaseOrderItem.findMany({
+    where: {
+      purchaseOrder: { userId, status: 'delivered' },
+      productId: { not: null },
+    },
+    orderBy: { id: 'desc' },
+    distinct: ['productId'],
+    select: {
+      productId: true,
+      unitCost: true,
+      purchaseOrder: { select: { createdAt: true } },
+    },
+  });
+  return res.json(lastCosts.map(r => ({
+    productId: r.productId,
+    lastCost:  r.unitCost,
+    lastDate:  r.purchaseOrder.createdAt,
+  })));
+}
+
+module.exports = { listPurchaseOrders, getPurchaseOrder, createPurchaseOrder, sendPurchaseOrder, receivePurchaseOrder, cancelPurchaseOrder, deletePurchaseOrder, getProductCosts };

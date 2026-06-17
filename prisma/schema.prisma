@@ -286,19 +286,21 @@ model Bill {
 // PEDIDOS DE COMPRA
 // ───────────────────────────────────────────
 model PurchaseOrder {
-  id         String              @id @default(uuid())
-  userId     String
-  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
-  supplierId String?
-  supplier   Supplier?           @relation(fields: [supplierId], references: [id], onDelete: SetNull)
-  status     String              @default("draft")
-  orderedAt  DateTime?
-  expectedAt DateTime?
-  receivedAt DateTime?
-  notes      String?
-  total      Float               @default(0)
-  createdAt  DateTime            @default(now())
-  items      PurchaseOrderItem[]
+  id           String              @id @default(uuid())
+  userId       String
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  supplierId   String?
+  supplier     Supplier?           @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  status       String              @default("draft")
+  orderedAt    DateTime?
+  expectedAt   DateTime?
+  receivedAt   DateTime?
+  notes        String?
+  total        Float               @default(0)
+  shippingCost Float               @default(0)
+  discount     Float               @default(0)
+  createdAt    DateTime            @default(now())
+  items        PurchaseOrderItem[]
 
   @@index([userId, status])
 }
