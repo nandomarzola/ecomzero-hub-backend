@@ -1,4 +1,5 @@
 const prisma = require('../lib/prisma');
+const { r2 }  = require('../lib/utils');
 
 function computeStatus(bill) {
   if (bill.status === 'paid') return 'paid';
@@ -34,11 +35,24 @@ async function listBills(req, res) {
 
   if (status) bills = bills.filter((b) => b.computedStatus === status);
 
-  const totalPending  = bills.filter((b) => b.computedStatus === 'pending').reduce((s, b) => s + b.amount, 0);
-  const totalOverdue  = bills.filter((b) => b.computedStatus === 'overdue').reduce((s, b) => s + b.amount, 0);
-  const totalPaid     = bills.filter((b) => b.computedStatus === 'paid').reduce((s, b) => s + b.amount, 0);
+  const totalPending  = r2(bills.filter((b) => b.computedStatus === 'pending').reduce((s, b) => s + b.amount, 0));
+  const totalOverdue  = r2(bills.filter((b) => b.computedStatus === 'overdue').reduce((s, b) => s + b.amount, 0));
+  const totalPaid     = r2(bills.filter((b) => b.computedStatus === 'paid').reduce((s, b) => s + b.amount, 0));
 
-  return res.json({ bills, totalPending, totalOverdue, totalPaid });
+  const now  = new Date(); now.setHours(0, 0, 0, 0);
+  const week = new Date(now); week.setDate(week.getDate() + 7);
+
+  const totalDueToday    = r2(bills.filter((b) => {
+    const due = new Date(b.dueDate); due.setHours(0, 0, 0, 0);
+    return b.status !== 'paid' && due.getTime() === now.getTime();
+  }).reduce((s, b) => s + b.amount, 0));
+
+  const totalDueThisWeek = r2(bills.filter((b) => {
+    const due = new Date(b.dueDate); due.setHours(0, 0, 0, 0);
+    return b.status !== 'paid' && due > now && due <= week;
+  }).reduce((s, b) => s + b.amount, 0));
+
+  return res.json({ bills, totalPending, totalOverdue, totalPaid, totalDueToday, totalDueThisWeek });
 }
 
 async function createBill(req, res) {
