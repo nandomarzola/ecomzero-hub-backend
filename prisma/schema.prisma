@@ -52,6 +52,9 @@ model Store {
   spShopName       String?
   spTokenExpiresAt DateTime?
 
+  sellerType       String?   @default("cnpj")  // "cpf" | "cnpj"
+  shopeeFixedFee   Float?                       // override manual da taxa fixa Shopee por item
+
   products         Product[]
   orders           Order[]
   imports          Import[]
