@@ -314,7 +314,7 @@ async function stockReport(req, res) {
       select: { productId: true, quantity: true },
     }),
     prisma.purchaseOrderItem.findMany({
-      where:   { purchaseOrder: { userId: req.userId, status: 'received' } },
+      where:   { purchaseOrder: { userId: req.userId, status: 'delivered' } },
       select:  { productId: true, purchaseOrder: { select: { receivedAt: true } } },
       orderBy: { purchaseOrder: { receivedAt: 'desc' } },
     }),

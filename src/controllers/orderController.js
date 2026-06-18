@@ -139,7 +139,13 @@ async function listOrders(req, res) {
 
   const { skip, take } = parsePage(page, limit);
 
-  const [orders, total, tabGroups, agg, aggCancelled, orphanCount] = await Promise.all([
+  // Mapa de alíquota por loja — imposto sempre sobre GMV bruto (Simples Nacional)
+  const taxStores = await prisma.store.findMany({
+    where: { id: { in: storeIds } }, select: { id: true, taxRate: true },
+  });
+  const taxRateMap = new Map(taxStores.map((s) => [s.id, s.taxRate ?? 0]));
+
+  const [orders, total, tabGroups, revenueOrders, aggCancelled, orphanCount] = await Promise.all([
     prisma.order.findMany({
       where,
       include: { product: { select: { name: true, sku: true } } },
@@ -153,11 +159,16 @@ async function listOrders(req, res) {
       where: baseWhere,
       _count: { _all: true },
     }),
-    // Totais financeiros de pedidos com receita (valid + pending) — consistente com Fechamento Mensal
-    prisma.order.aggregate({
+    // Totais financeiros recomputados do RAW (igual ao Fechamento Mensal) —
+    // nunca confiar em calcShopeeFee/calcNetRevenue/calcGrossProfit armazenados (podem estar desatualizados)
+    prisma.order.findMany({
       where: { ...baseWhere, orderCategory: { in: ['valid', 'pending'] } },
-      _sum:  { calcGmv: true, calcShopeeFee: true, calcNetRevenue: true, calcGrossProfit: true, calcTax: true, quantity: true },
-      _count: { _all: true },
+      select: {
+        storeId: true, orderCategory: true, calcGmv: true, quantity: true,
+        platformCommission: true, platformServiceFee: true,
+        sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+        calcProductCost: true, calcPackaging: true,
+      },
     }),
     // Totais de cancelados
     prisma.order.aggregate({
@@ -180,22 +191,59 @@ async function listOrders(req, res) {
     if (g.orderCategory === 'pending') tabCounts.pending   += g._count._all;
   }
 
-  const gmv        = r2(agg._sum.calcGmv);
-  const shopeeFee  = r2(agg._sum.calcShopeeFee);
-  const netRevenue = r2(agg._sum.calcNetRevenue);
-  const grossProfit= r2(agg._sum.calcGrossProfit);
+  // Recompute idêntico ao closingController.buildClosingData
+  let gmv = 0, shopeeFee = 0, netRevenue = 0, grossProfit = 0, units = 0;
+  for (const o of revenueOrders) {
+    const isConfirmed = o.orderCategory === 'valid';
+    const orderFee  = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+    const orderDisc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+    const orderNet  = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
+    const repasse   = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+    const orderTax  = r2((o.calcGmv ?? 0) * (taxRateMap.get(o.storeId) ?? 0) / 100);
+    const orderProfit = r2(repasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+    gmv         += o.calcGmv ?? 0;
+    shopeeFee   += orderFee;
+    netRevenue  += repasse;
+    grossProfit += orderProfit;
+    units       += o.quantity ?? 0;
+  }
+  gmv = r2(gmv); shopeeFee = r2(shopeeFee); netRevenue = r2(netRevenue); grossProfit = r2(grossProfit);
+
   const summary = {
     gmv,
     shopeeFee,
     netRevenue,
     grossProfit,
-    margin:       gmv > 0 ? r2((grossProfit / gmv) * 100) : 0,
-    units:        agg._sum.quantity ?? 0,
+    margin:       netRevenue > 0 ? r2((grossProfit / netRevenue) * 100) : 0,
+    units,
     cancelledGmv: r2(aggCancelled._sum.calcGmv),
     cancelledCount: aggCancelled._count._all,
   };
 
-  return res.json({ orders, total, page: parseInt(page), limit: take, tabCounts, summary, orphanCount });
+  // Recompute dos campos calc* exibidos na tabela/detalhe, a partir do RAW —
+  // mantém cada linha consistente com o Fechamento Mensal e com o summary acima.
+  const ordersOut = orders.map((o) => {
+    const hasRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+    if (!hasRevenue) return o;
+    const isConfirmed = o.orderCategory === 'valid';
+    const orderFee  = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+    const orderDisc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+    const orderNet  = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
+    const repasse   = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+    const orderTax  = r2((o.calcGmv ?? 0) * (taxRateMap.get(o.storeId) ?? 0) / 100);
+    const profit    = r2(repasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+    const margin    = repasse > 0 ? r2((profit / repasse) * 100) : 0;
+    return {
+      ...o,
+      calcShopeeFee:   orderFee,
+      calcNetRevenue:  repasse,
+      calcTax:         orderTax,
+      calcGrossProfit: profit,
+      calcMargin:      margin,
+    };
+  });
+
+  return res.json({ orders: ordersOut, total, page: parseInt(page), limit: take, tabCounts, summary, orphanCount });
 }
 
 // GET /api/orders/:id — detalhe de um pedido
@@ -298,6 +346,10 @@ async function exportOrders(req, res) {
   }
   if (status) where.status = status;
 
+  // Mapa de alíquota por loja — imposto sempre sobre GMV bruto (Simples Nacional)
+  const taxStores  = await prisma.store.findMany({ where: { id: { in: storeIds } }, select: { id: true, taxRate: true } });
+  const taxRateMap = new Map(taxStores.map((s) => [s.id, s.taxRate ?? 0]));
+
   const EXPORT_LIMIT = 10_000;
   const orders = await prisma.order.findMany({
     where,
@@ -318,17 +370,35 @@ async function exportOrders(req, res) {
     returned_full: 'Devolvido (total)', returned_partial: 'Devolvido (parcial)',
   };
 
+  // Recomputa taxa/lucro/margem do RAW — mantém CSV consistente com a tela (listOrders)
   const rows = orders.map((o) => {
     const date = o.soldAt ? new Date(o.soldAt).toLocaleDateString('pt-BR') : '';
     const sku  = o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '';
     const name = o.product?.name ?? o.productName ?? '';
+
+    const hasRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+    let orderFee = 0;
+    let profit   = 0;
+    let margin   = 0;
+
+    if (hasRevenue) {
+      const isConfirmed = o.orderCategory === 'valid';
+      orderFee          = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+      const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+      const orderNet    = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
+      const repasse     = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+      const orderTax    = r2((o.calcGmv ?? 0) * (taxRateMap.get(o.storeId) ?? 0) / 100);
+      profit            = r2(repasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+      margin            = repasse > 0 ? r2((profit / repasse) * 100) : 0;
+    }
+
     return [
       date, o.orderId, sku, name, o.quantity,
       o.agreedPrice.toFixed(2).replace('.', ','),
       o.calcGmv.toFixed(2).replace('.', ','),
-      o.calcShopeeFee.toFixed(2).replace('.', ','),
-      o.calcGrossProfit.toFixed(2).replace('.', ','),
-      o.calcMargin.toFixed(1).replace('.', ','),
+      orderFee.toFixed(2).replace('.', ','),
+      profit.toFixed(2).replace('.', ','),
+      margin.toFixed(1).replace('.', ','),
       catLabel[o.orderCategory] ?? o.orderCategory,
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(';');
   });
@@ -395,7 +465,7 @@ async function skuReport(req, res) {
       select: { productId: true, quantity: true },
     }),
     prisma.purchaseOrderItem.findMany({
-      where:   { purchaseOrder: { userId: req.userId, status: 'received' } },
+      where:   { purchaseOrder: { userId: req.userId, status: 'delivered' } },
       select:  { productId: true, purchaseOrder: { select: { receivedAt: true } } },
       orderBy: { purchaseOrder: { receivedAt: 'desc' } },
     }),

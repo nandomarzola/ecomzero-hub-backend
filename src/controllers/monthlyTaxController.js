@@ -150,9 +150,24 @@ async function getSimplesFaixaInfo(req, res) {
   try {
     const stores = await prisma.store.findMany({
       where: { userId: req.userId },
-      select: { id: true },
+      select: { id: true, taxType: true },
     });
-    if (!stores.length) return res.json({ rbt12: 0, faixa: null });
+    if (!stores.length) {
+      return res.json({
+        confiabilidade: 'indeterminado',
+        mesesDeData: 0,
+        rbt12Parcial: 0,
+        faixaEstimativaMinima: 1,
+        aliquotaEstimativaMinima: 4.0,
+        faixa: null,
+        aliquotaEfetivaPct: null,
+      });
+    }
+
+    const allMei = stores.length > 0 && stores.every((s) => s.taxType === 'mei');
+    if (allMei) {
+      return res.json({ taxType: 'mei', faixa: null, aliquotaEfetivaPct: null, confiabilidade: 'mei' });
+    }
 
     const storeIds = stores.map((s) => s.id);
     const since = new Date();
@@ -196,7 +211,23 @@ async function getSimplesFaixaInfo(req, res) {
     const proximoLimite = nextFaixa?.limite ?? null;
     const distanciaProximaFaixa = proximoLimite ? r2(proximoLimite - rbt12Efetivo) : null;
 
+    const temOverride = !!(overrideRaw && overrideRaw > 0);
+    const confiabilidade = (mesesDeData >= 12 || temOverride) ? 'confiavel' : 'indeterminado';
+
+    if (confiabilidade === 'indeterminado') {
+      return res.json({
+        confiabilidade: 'indeterminado',
+        mesesDeData,
+        rbt12Parcial: rbt12,
+        faixaEstimativaMinima: faixa.numero,
+        aliquotaEstimativaMinima: aliquotaEfetivaPct,
+        faixa: null,
+        aliquotaEfetivaPct: null,
+      });
+    }
+
     return res.json({
+      confiabilidade: 'confiavel',
       rbt12,
       rbt12Efetivo,
       mesesDeData,
