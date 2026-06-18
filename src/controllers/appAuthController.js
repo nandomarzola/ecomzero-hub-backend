@@ -81,6 +81,28 @@ async function getAppDashboard(req, res) {
 
   if (storeIds.length === 0) return res.json({ stores: [], summary: null });
 
+  // GMV do ano (1° de janeiro até agora)
+  const startOfYear = new Date(now.getFullYear(), 0, 1);
+  const yearOrders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      soldAt: { gte: startOfYear },
+      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+      calcGmv: { gt: 0 },
+    },
+    select: { calcGmv: true },
+  });
+  const yearGmv = r2(yearOrders.reduce((s, o) => s + (o.calcGmv ?? 0), 0));
+
+  // Devoluções e cancelamentos do dia
+  const todayReturns = await prisma.order.count({
+    where: {
+      storeId: { in: storeIds },
+      soldAt: { gte: startOfDay },
+      orderCategory: { in: ['returned_full', 'returned_partial', 'cancelled_other', 'cancelled_unpaid'] },
+    },
+  });
+
   // Pedidos do mês com receita
   const orders = await prisma.order.findMany({
     where: {
@@ -90,6 +112,7 @@ async function getAppDashboard(req, res) {
     },
     select: {
       id: true, storeId: true, soldAt: true, quantity: true,
+      orderId: true, // para contar pedidos únicos (1 pedido multi-item = N linhas com mesmo orderId)
       calcGmv: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
@@ -99,10 +122,16 @@ async function getAppDashboard(req, res) {
 
   // Calcular por loja (recompute do raw)
   const byStore = {};
-  for (const s of stores) byStore[s.id] = { storeId: s.id, name: s.name, marketplace: s.marketplace, gmv: 0, profit: 0, orders: 0 };
+  for (const s of stores) byStore[s.id] = { storeId: s.id, name: s.name, marketplace: s.marketplace, gmv: 0, profit: 0, orders: 0, items: 0 };
 
-  let totalGmv = 0, totalProfit = 0, totalOrders = 0;
-  let todayGmv = 0, todayProfit = 0, todayOrders = 0;
+  let totalGmv = 0, totalProfit = 0, totalItems = 0;
+  let todayGmv = 0, todayProfit = 0, todayItems = 0;
+
+  // Sets para contar pedidos únicos por orderId
+  const uniqueOrderIds      = new Set();
+  const uniqueOrderIdsToday = new Set();
+  const uniqueByStore       = {}; // storeId → Set de orderIds únicos
+  for (const s of stores) uniqueByStore[s.id] = new Set();
 
   for (const o of orders) {
     const taxRate = taxRateMap[o.storeId] ?? 0;
@@ -116,17 +145,25 @@ async function getAppDashboard(req, res) {
 
     byStore[o.storeId].gmv    += o.calcGmv;
     byStore[o.storeId].profit += profit;
-    byStore[o.storeId].orders += 1;
+    byStore[o.storeId].items  += 1;
+    uniqueByStore[o.storeId].add(o.orderId);
     totalGmv    += o.calcGmv;
     totalProfit += profit;
-    totalOrders += 1;
+    totalItems  += 1;
+    uniqueOrderIds.add(o.orderId);
 
     const orderDate = new Date(o.soldAt);
     if (orderDate >= startOfDay) {
       todayGmv    += o.calcGmv;
       todayProfit += profit;
-      todayOrders += 1;
+      todayItems  += 1;
+      uniqueOrderIdsToday.add(o.orderId);
     }
+  }
+
+  // Contar pedidos únicos por loja
+  for (const s of stores) {
+    byStore[s.id].orders = uniqueByStore[s.id].size;
   }
 
   // Projeção do mês
@@ -138,11 +175,19 @@ async function getAppDashboard(req, res) {
   return res.json({
     month,
     summary: {
-      gmv: r2(totalGmv), profit: r2(totalProfit), orders: totalOrders,
+      gmv:    r2(totalGmv),
+      profit: r2(totalProfit),
+      orders: uniqueOrderIds.size,  // pedidos únicos (order_sn distintos)
+      items:  totalItems,           // linhas totais (itens — 1 pedido multi-produto = N itens)
       margin: totalGmv > 0 ? r2((totalProfit / totalGmv) * 100) : 0,
     },
+    yearGmv,
     today: {
-      gmv: r2(todayGmv), profit: r2(todayProfit), orders: todayOrders,
+      gmv:     r2(todayGmv),
+      profit:  r2(todayProfit),
+      orders:  uniqueOrderIdsToday.size, // pedidos únicos hoje
+      items:   todayItems,               // itens hoje
+      returns: todayReturns,
     },
     projection: {
       gmv: projectedGmv, profit: projectedProfit,
@@ -153,7 +198,7 @@ async function getAppDashboard(req, res) {
       gmv: r2(s.gmv),
       profit: r2(s.profit),
       margin: s.gmv > 0 ? r2((s.profit / s.gmv) * 100) : 0,
-    })).sort((a, b) => b.profit - a.profit),
+    })).sort((a, b) => b.gmv - a.gmv),
   });
 }
 
