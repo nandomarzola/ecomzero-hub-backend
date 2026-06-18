@@ -67,7 +67,7 @@ async function getSummary(req, res) {
   const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
-      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true },
+      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true },
     }),
     prevFilter
       ? prisma.order.findMany({
@@ -118,7 +118,10 @@ async function getSummary(req, res) {
   const orderProfit = (o) => o.calcGrossProfit ?? o.profit ?? 0;
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
-  const totalOrders   = orders.length;
+  // Pedidos únicos: conta orderId distintos (1 pedido multi-produto = N linhas, 1 order_sn)
+  const uniqueOrderIds = new Set(orders.map(o => o.orderId).filter(Boolean));
+  const totalOrders   = uniqueOrderIds.size || orders.length; // fallback se orderId ausente
+  const totalItems    = orders.length; // itens totais (linhas)
   const totalRevenue  = orders.reduce((s, o) => s + o.salePrice, 0);
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
@@ -338,7 +341,8 @@ async function getSummary(req, res) {
     totalRevenue:   parseFloat(totalRevenue.toFixed(2)),
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
-    totalOrders,
+    totalOrders,   // pedidos únicos (order_sn distintos)
+    totalItems,    // itens totais (linhas — inclui multi-produto)
     avgTicket:      parseFloat(avgTicket.toFixed(2)),
     negativeMargin,
     topProducts,
