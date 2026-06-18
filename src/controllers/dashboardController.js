@@ -1,6 +1,6 @@
 const prisma = require('../lib/prisma');
 const { generateMonthlyReport } = require('../services/reportService');
-const { parseYearMonth } = require('../lib/utils');
+const { parseYearMonth, r2 } = require('../lib/utils');
 
 function buildDateFilter(startDate, endDate) {
   if (!startDate && !endDate) return undefined;
@@ -770,4 +770,203 @@ async function getShopeeLosses(req, res) {
   });
 }
 
-module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison, getShopeeSummary, getShopeeLosses };
+// GET /api/dashboard/stores-comparison
+// Comparativo de rentabilidade por loja + produtos campeões cross-loja.
+// Recomputa SEMPRE do raw — nunca usa calc* armazenados (regras invioláveis 1/2/3).
+async function getStoresComparison(req, res) {
+  const { storeId } = req.query;
+
+  const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
+
+  const stores = await prisma.store.findMany({
+    where:  storeWhere,
+    select: { id: true, name: true, marketplace: true, taxRate: true },
+  });
+
+  if (!stores.length) {
+    const now = new Date();
+    let y = now.getUTCFullYear(), m = now.getUTCMonth();
+    if (now.getUTCDate() < 5) { m -= 1; if (m < 0) { m = 11; y -= 1; } }
+    const periodKey = `${y}-${String(m + 1).padStart(2, '0')}`;
+    return res.json({ period: { month: periodKey, start: null, end: null }, stores: [], crossStoreProducts: [] });
+  }
+
+  // Período: mês atual, ou anterior se dia < 5
+  const now = new Date();
+  let y = now.getUTCFullYear(), m = now.getUTCMonth(); // 0-indexed
+  if (now.getUTCDate() < 5) { m -= 1; if (m < 0) { m = 11; y -= 1; } }
+  const periodStart = new Date(Date.UTC(y, m, 1));
+  const periodEnd   = new Date(Date.UTC(y, m + 1, 0, 23, 59, 59, 999));
+  const periodKey   = `${y}-${String(m + 1).padStart(2, '0')}`;
+
+  const storeIds         = stores.map((s) => s.id);
+  const storeTaxRateMap  = new Map(stores.map((s) => [s.id, s.taxRate ?? 0]));
+  const storeMetaMap     = new Map(stores.map((s) => [s.id, s]));
+
+  // Buscar todos os pedidos do período (sem filtro de status — classificar por orderCategory)
+  const orders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      soldAt:  { gte: periodStart, lte: periodEnd },
+    },
+    select: {
+      storeId:            true,
+      orderCategory:      true,
+      calcGmv:            true,
+      platformCommission: true,
+      platformServiceFee: true,
+      sellerCoupon:       true,
+      lmmDiscount:        true,
+      escrowAmount:       true,
+      calcProductCost:    true,
+      calcPackaging:      true,
+      productId:          true,
+      quantity:           true,
+      soldAt:             true,
+      product: { select: { id: true, name: true } },
+    },
+  });
+
+  // Acumuladores por loja
+  const storeAcc = {}; // storeId → { gmv, netRevenue, profit, orders }
+  for (const s of stores) {
+    storeAcc[s.id] = { gmv: 0, netRevenue: 0, profit: 0, orders: 0 };
+  }
+
+  // Map para topProduct por loja: storeId → { productId → { name, profit, netRevenue } }
+  const productByStore = {};
+
+  // Map para crossStoreProducts: normalizedName → { name (original), storeId → { profit, netRevenue, orders } }
+  const crossMap = {};
+
+  for (const o of orders) {
+    const isConfirmed = o.orderCategory === 'valid';
+    const isPending   = o.orderCategory === 'pending';
+    const isRevenue   = isConfirmed || isPending;
+
+    if (!isRevenue) continue;
+
+    const aliquota    = storeTaxRateMap.get(o.storeId) ?? 0;
+    const orderFee    = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
+    const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
+    const orderNet    = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
+    const orderRepasse = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+    const orderTax    = r2((o.calcGmv ?? 0) * aliquota / 100);
+    const orderProfit = r2(orderRepasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+
+    // Acumular por loja
+    const acc = storeAcc[o.storeId];
+    acc.gmv        += o.calcGmv ?? 0;
+    acc.netRevenue += orderRepasse;
+    acc.profit     += orderProfit;
+    acc.orders++;
+
+    // Acumular por produto na loja (topProduct)
+    if (o.productId) {
+      if (!productByStore[o.storeId]) productByStore[o.storeId] = {};
+      const pm = productByStore[o.storeId];
+      if (!pm[o.productId]) {
+        pm[o.productId] = { name: o.product?.name ?? '', profit: 0, netRevenue: 0 };
+      }
+      pm[o.productId].profit     += orderProfit;
+      pm[o.productId].netRevenue += orderRepasse;
+    }
+
+    // Acumular para crossStoreProducts
+    if (o.productId && o.product?.name) {
+      const normName = o.product.name.toLowerCase().trim();
+      if (!crossMap[normName]) {
+        crossMap[normName] = { name: o.product.name, stores: {} };
+      }
+      if (!crossMap[normName].stores[o.storeId]) {
+        crossMap[normName].stores[o.storeId] = { profit: 0, netRevenue: 0, orders: 0 };
+      }
+      crossMap[normName].stores[o.storeId].profit     += orderProfit;
+      crossMap[normName].stores[o.storeId].netRevenue += orderRepasse;
+      crossMap[normName].stores[o.storeId].orders++;
+    }
+  }
+
+  // Montar array de lojas com topProduct
+  const storesResult = stores.map((s) => {
+    const acc    = storeAcc[s.id];
+    const gmv    = r2(acc.gmv);
+    const net    = r2(acc.netRevenue);
+    const profit = r2(acc.profit);
+    const margin = net > 0 ? r2(profit / net * 100) : 0;
+    const avgTicket = acc.orders > 0 ? r2(gmv / acc.orders) : 0;
+
+    // topProduct da loja: produto com maior profit acumulado
+    let topProduct = null;
+    const pm = productByStore[s.id];
+    if (pm) {
+      const best = Object.values(pm).reduce((a, b) => (b.profit > a.profit ? b : a), { profit: -Infinity, name: '', netRevenue: 0 });
+      if (best.name) {
+        topProduct = { name: best.name, profit: r2(best.profit) };
+      }
+    }
+
+    return {
+      storeId:    s.id,
+      storeName:  s.name,
+      marketplace: s.marketplace,
+      gmv,
+      netRevenue: net,
+      profit,
+      margin,
+      orders:     acc.orders,
+      avgTicket,
+      topProduct,
+    };
+  }).sort((a, b) => b.profit - a.profit);
+
+  // Montar crossStoreProducts: apenas produtos em >= 2 lojas distintas
+  const crossStoreProducts = [];
+  for (const [normName, data] of Object.entries(crossMap)) {
+    const storeEntries = Object.entries(data.stores); // [storeId, { profit, netRevenue, orders }]
+    if (storeEntries.length < 2) continue;
+
+    const channels = storeEntries.map(([sid, vals]) => {
+      const meta   = storeMetaMap.get(sid);
+      const margin = vals.netRevenue > 0 ? r2(vals.profit / vals.netRevenue * 100) : 0;
+      return {
+        storeId:    sid,
+        storeName:  meta?.name ?? sid,
+        marketplace: meta?.marketplace ?? 'outros',
+        margin,
+        profit:  r2(vals.profit),
+        orders:  vals.orders,
+      };
+    });
+
+    const bestChannel = channels.reduce((a, b) => (b.margin > a.margin ? b : a));
+    const totalProfit = channels.reduce((s, c) => s + c.profit, 0);
+
+    crossStoreProducts.push({
+      name: data.name,
+      channels,
+      bestChannel: {
+        marketplace: bestChannel.marketplace,
+        storeName:   bestChannel.storeName,
+        margin:      bestChannel.margin,
+      },
+      _totalProfit: totalProfit, // campo auxiliar para ordenação, removido abaixo
+    });
+  }
+
+  crossStoreProducts.sort((a, b) => b._totalProfit - a._totalProfit);
+  const crossTop8 = crossStoreProducts.slice(0, 8).map(({ _totalProfit, ...rest }) => rest);
+
+  return res.json({
+    period: {
+      month: periodKey,
+      start: periodStart.toISOString(),
+      end:   periodEnd.toISOString(),
+    },
+    stores:              storesResult,
+    crossStoreProducts:  crossTop8,
+  });
+}
+
+module.exports = { getSummary, getAlerts, getMonthlyReport, getMonthlyComparison, getShopeeSummary, getShopeeLosses, getStoresComparison };
