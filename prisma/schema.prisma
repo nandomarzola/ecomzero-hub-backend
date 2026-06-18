@@ -24,6 +24,20 @@ model User {
   newsReads      NewsRead[]
   goals          Goal[]
   monthlyTaxes   MonthlyTax[]
+  appAccessCodes AppAccessCode[]
+}
+
+model AppAccessCode {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code      String    @unique  // 6 dígitos, ex: "847291"
+  expiresAt DateTime
+  usedAt    DateTime?           // null = ainda válido; preenchido = já usado
+  createdAt DateTime  @default(now())
+
+  @@index([code])
+  @@index([userId])
 }
 
 model Store {

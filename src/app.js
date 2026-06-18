@@ -33,6 +33,7 @@ const mlRoutes            = require('./routes/ml');
 const tiktokRoutes        = require('./routes/tiktok');
 const shopeeRoutes        = require('./routes/shopee');
 const monthlyTaxRoutes    = require('./routes/monthlyTax');
+const appRoutes           = require('./routes/app');
 
 const { startRecalculateWorker } = require('./services/recalculateQueue');
 
@@ -130,6 +131,7 @@ app.use('/api/ml',              mlRoutes);
 app.use('/api/tiktok',          tiktokRoutes);
 app.use('/api/shopee',          shopeeRoutes);
 app.use('/api/monthly-tax',     monthlyTaxRoutes);
+app.use('/api/app',             appRoutes);
 
 // ── Error handler global com contexto de diagnóstico ───────────────────────────
 // Express 5: erros de async handlers chegam aqui automaticamente
