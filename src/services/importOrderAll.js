@@ -238,16 +238,17 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
       // LOOKUP O(1) — sem query
       let product = findProduct(skuVar, skuPai);
 
-      // Sem SKU → fallback por nome (pedidos legados)
-      if (!product && !skuVar && !skuPai) {
+      // Fallback por nome: quando SKU não resolve (produto novo, legado sem SKU, ou SKU mudou)
+      if (!product) {
         product = findProductByName(productName, variationName);
       }
 
-      // Registrar SKU para atualizar produtos encontrados sem SKU
-      if (product && skuVar && !product.sku) {
+      // Registrar SKU para atualizar produtos encontrados sem SKU OU com SKU diferente
+      if (product && skuVar && (!product.sku || product.sku.toLowerCase() !== skuVar.toLowerCase())) {
         toUpdateSkus.set(product.id, skuVar);
         product.sku = skuVar;
-        bySkuMap.set(skuVar.toLowerCase(), product);
+        bySkuMap.set(skuVar.toLowerCase(), product);      // indexar o novo SKU p/ pedidos seguintes
+        bySkuMap.delete((product.sku ?? '').toLowerCase()); // remover chave antiga do índice
       }
 
       const cappedGlobal = globalTotal > 0 ? Math.min(globalTotal, salePrice * quantity) : 0;
@@ -439,22 +440,107 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
     }
   }
 
-  // 6b. Atualizar listPrice: variações (preço mais recente de cada produto via SQL)
+  // 6a2. Sincronizar SKU do anúncio com o skuPrincipal mais recente dos pedidos
+  // Cobre o caso de seller que reorganizou o sistema de SKUs sem criar novo anúncio.
+  // Usa apenas pedidos com calcGmv > 0 (receita real) para evitar cancelados/devoluções.
   await prisma.$executeRaw`
     UPDATE Product p
     INNER JOIN (
-      SELECT productId, agreedPrice
-      FROM \`Order\`
-      WHERE importId = ${imp.id}
-        AND productId IS NOT NULL
-        AND agreedPrice > 0
-      ORDER BY COALESCE(orderPaidAt, orderCreatedAt, soldAt) DESC
-    ) latest ON latest.productId = p.id
-    SET p.listPrice = latest.agreedPrice
-    WHERE p.storeId = ${storeId} AND p.listPrice = 0
+      SELECT o.productId, o.skuPrincipal
+      FROM \`Order\` o
+      INNER JOIN (
+        SELECT productId, MAX(COALESCE(soldAt, orderCreatedAt)) AS maxDate
+        FROM \`Order\`
+        WHERE storeId = ${storeId}
+          AND productId IS NOT NULL
+          AND skuPrincipal IS NOT NULL
+          AND skuPrincipal != ''
+          AND calcGmv > 0
+        GROUP BY productId
+      ) latest ON o.productId = latest.productId
+        AND COALESCE(o.soldAt, o.orderCreatedAt) = latest.maxDate
+      WHERE o.storeId = ${storeId}
+      GROUP BY o.productId
+    ) recent ON recent.productId = p.id
+    SET p.sku = recent.skuPrincipal
+    WHERE p.storeId = ${storeId}
+      AND (p.sku IS NULL OR p.sku != recent.skuPrincipal)
   `;
 
-  // 6c. Propagar listPrice do pai (herda preço da variação mais barata)
+  // 6a3. Sincronizar SKU das variações (ProductVariant) com o skuVariacao mais recente
+  await prisma.$executeRaw`
+    UPDATE ProductVariant pv
+    INNER JOIN (
+      SELECT o.variantId, o.skuVariacao
+      FROM \`Order\` o
+      INNER JOIN (
+        SELECT variantId, MAX(COALESCE(soldAt, orderCreatedAt)) AS maxDate
+        FROM \`Order\`
+        WHERE storeId = ${storeId}
+          AND variantId IS NOT NULL
+          AND skuVariacao IS NOT NULL
+          AND skuVariacao != ''
+          AND calcGmv > 0
+        GROUP BY variantId
+      ) latest ON o.variantId = latest.variantId
+        AND COALESCE(o.soldAt, o.orderCreatedAt) = latest.maxDate
+      WHERE o.storeId = ${storeId}
+      GROUP BY o.variantId
+    ) recent ON recent.variantId = pv.id
+    SET pv.sku = recent.skuVariacao
+    WHERE pv.productId IN (SELECT id FROM Product WHERE storeId = ${storeId})
+      AND (pv.sku IS NULL OR pv.sku != recent.skuVariacao)
+  `;
+
+  // 6b. Atualizar listPrice: preço de venda mais recente de cada produto (todos os imports)
+  // Usa toda a base histórica de pedidos — detecta alterações de preço ao longo do tempo.
+  // Nunca altera agreedPrice dos pedidos antigos — apenas atualiza o preço atual do anúncio.
+  await prisma.$executeRaw`
+    UPDATE Product p
+    INNER JOIN (
+      SELECT o.productId, o.agreedPrice
+      FROM \`Order\` o
+      INNER JOIN (
+        SELECT productId, MAX(COALESCE(soldAt, orderCreatedAt)) AS maxDate
+        FROM \`Order\`
+        WHERE storeId = ${storeId}
+          AND productId IS NOT NULL
+          AND agreedPrice > 0
+          AND calcGmv > 0
+        GROUP BY productId
+      ) latest ON o.productId = latest.productId
+        AND COALESCE(o.soldAt, o.orderCreatedAt) = latest.maxDate
+      WHERE o.storeId = ${storeId}
+      GROUP BY o.productId
+    ) recent ON recent.productId = p.id
+    SET p.listPrice = recent.agreedPrice
+    WHERE p.storeId = ${storeId}
+  `;
+
+  // 6b2. Atualizar price das variações (ProductVariant) com o preço mais recente
+  await prisma.$executeRaw`
+    UPDATE ProductVariant pv
+    INNER JOIN (
+      SELECT o.variantId, o.agreedPrice
+      FROM \`Order\` o
+      INNER JOIN (
+        SELECT variantId, MAX(COALESCE(soldAt, orderCreatedAt)) AS maxDate
+        FROM \`Order\`
+        WHERE storeId = ${storeId}
+          AND variantId IS NOT NULL
+          AND agreedPrice > 0
+          AND calcGmv > 0
+        GROUP BY variantId
+      ) latest ON o.variantId = latest.variantId
+        AND COALESCE(o.soldAt, o.orderCreatedAt) = latest.maxDate
+      WHERE o.storeId = ${storeId}
+      GROUP BY o.variantId
+    ) recent ON recent.variantId = pv.id
+    SET pv.price = recent.agreedPrice
+    WHERE pv.productId IN (SELECT id FROM Product WHERE storeId = ${storeId})
+  `;
+
+  // 6c. Propagar listPrice do pai (herda preço da variação mais barata com preço atualizado)
   await prisma.$executeRaw`
     UPDATE Product p
     JOIN (
@@ -464,7 +550,7 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
       GROUP BY parentId
     ) v ON v.parentId = p.id
     SET p.listPrice = v.minPrice
-    WHERE p.storeId = ${storeId} AND p.listPrice = 0
+    WHERE p.storeId = ${storeId}
   `;
 
   await onProgress?.({ pct: 87, message: 'Consolidando totais do período...' });
