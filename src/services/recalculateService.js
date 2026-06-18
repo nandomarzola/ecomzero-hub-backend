@@ -4,6 +4,15 @@ const { r2, parseYearMonth } = require('../lib/utils');
 
 // Recalculates all orders for a specific store.
 // periodMonth: 'YYYY-MM' to filter by month, null to recalculate all periods.
+//
+// IDEMPOTÊNCIA: esta função é segura para rodar N vezes sobre os mesmos pedidos.
+// Todos os campos calc* são DERIVADOS dos campos raw (agreedPrice, quantity,
+// escrowAmount, platformCommission, platformServiceFee, sellerCoupon, lmmDiscount)
+// e do custo cadastrado (variant/sku/product) — e gravados via prisma.order.update
+// (substituição, NUNCA increment). Logo, rodar duas vezes produz exatamente o mesmo
+// resultado; não há acúmulo nem double-count. O único efeito colateral mutável do
+// sistema (estoque) NÃO ocorre aqui — fica isolado em stockHelper::applyStockFromOrder,
+// protegido pela flag Order.stockDeducted contra dedução dupla em re-sync.
 async function recalculateOrdersForStore(storeId, periodMonth = null) {
   const where = { storeId };
 

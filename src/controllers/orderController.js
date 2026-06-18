@@ -96,127 +96,6 @@ async function importStatus(req, res) {
   });
 }
 
-// GET /api/orders/closing?storeId=&month= — dados agregados para Fechamento Mensal
-async function getClosing(req, res) {
-  const { storeId, month } = req.query;
-  if (!month) return res.status(400).json({ error: 'month obrigatório (YYYY-MM)' });
-
-  const storeWhere = { userId: req.userId };
-  if (storeId) storeWhere.id = storeId;
-  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
-  const storeIds = stores.map((s) => s.id);
-  if (!storeIds.length) return res.json({ summary: null, groups: [], orphanCount: 0, month });
-
-  const { year: y, month: mo } = parseYearMonth(month);
-  const start = new Date(Date.UTC(y, mo - 1, 1));
-  const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
-
-  const revenueOrders = await prisma.order.findMany({
-    where: {
-      storeId:       { in: storeIds },
-      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
-      soldAt:        { gte: start, lte: end },
-    },
-    include: { product: { select: { id: true, name: true, sku: true } } },
-  });
-
-  let gmv = 0, shopeeFee = 0, netRevenue = 0, tax = 0, productCost = 0, packaging = 0, grossProfit = 0;
-  let validCount = 0, pendingCount = 0, unitCount = 0;
-  let validGmv = 0, pendingGmv = 0;
-
-  const groupMap = new Map();
-
-  for (const o of revenueOrders) {
-    gmv         += o.calcGmv;
-    shopeeFee   += o.calcShopeeFee;
-    netRevenue  += o.calcNetRevenue;
-    tax         += o.calcTax;
-    productCost += o.calcProductCost;
-    packaging   += o.calcPackaging;
-    grossProfit += o.calcGrossProfit;
-    unitCount   += o.quantity;
-    if (o.orderCategory === 'valid') { validCount++; validGmv += o.calcGmv; }
-    else if (o.orderCategory === 'pending') { pendingCount++; pendingGmv += o.calcGmv; }
-
-    const groupKey = o.productId
-      ? `pid:${o.productId}`
-      : `sku:${o.skuVariacao || o.skuPrincipal || o.productName || o.orderId}`;
-
-    if (!groupMap.has(groupKey)) {
-      groupMap.set(groupKey, {
-        productId:    o.productId,
-        productName:  o.product?.name ?? o.productName ?? '(sem nome)',
-        sku:          o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
-        variationName: o.variationName ?? null,
-        hasCost:      true,
-        orderCount:   0,
-        qty:          0,
-        gmv:          0,
-        shopeeFee:    0,
-        shippingCost: 0,
-        netRevenue:   0,
-        productCost:  0,
-        packaging:    0,
-        grossProfit:  0,
-      });
-    }
-
-    const g = groupMap.get(groupKey);
-    g.orderCount  += 1;
-    g.qty         += o.quantity;
-    g.gmv         += o.calcGmv;
-    g.shopeeFee   += o.calcShopeeFee;
-    g.shippingCost += o.mlShippingCost ?? 0;
-    g.netRevenue  += o.calcNetRevenue;
-    g.productCost += o.calcProductCost;
-    g.packaging   += o.calcPackaging;
-    g.grossProfit += o.calcGrossProfit;
-    if (!o.hasCost) g.hasCost = false;
-  }
-
-  const summary = gmv > 0
-    ? {
-        gmv:          r2(gmv),
-        shopeeFee:    r2(shopeeFee),
-        netRevenue:   r2(netRevenue),
-        tax:          r2(tax),
-        productCost:  r2(productCost),
-        packaging:    r2(packaging),
-        grossProfit:  r2(grossProfit),
-        margin:       r2((grossProfit / gmv) * 100),
-        validCount,
-        pendingCount,
-        validGmv:     r2(validGmv),
-        pendingGmv:   r2(pendingGmv),
-        unitCount,
-      }
-    : null;
-
-  const groups = [...groupMap.values()]
-    .map((g) => ({
-      productId:    g.productId,
-      productName:  g.productName,
-      sku:          g.sku,
-      variationName: g.variationName,
-      hasCost:      g.hasCost,
-      orderCount:   g.orderCount,
-      qty:          g.qty,
-      gmv:          r2(g.gmv),
-      shopeeFee:    r2(g.shopeeFee),
-      shippingCost: r2(g.shippingCost),
-      netRevenue:   r2(g.netRevenue),
-      productCost:  r2(g.productCost),
-      packaging:    r2(g.packaging),
-      grossProfit:  r2(g.grossProfit),
-      margin:       g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
-    }))
-    .sort((a, b) => b.gmv - a.gmv);
-
-  const orphanCount = groups.filter((g) => !g.hasCost).length;
-
-  return res.json({ summary, groups, orphanCount, month });
-}
-
 // GET /api/orders — lista paginada com contagem por aba
 async function listOrders(req, res) {
   const { storeId, month, orderCategory, status, search, page = 1, limit = 30 } = req.query;
@@ -430,7 +309,8 @@ async function exportOrders(req, res) {
   const truncated = orders.length > EXPORT_LIMIT;
   if (truncated) orders.length = EXPORT_LIMIT;
 
-  const header = ['Data', 'Nº Pedido', 'SKU', 'Produto', 'Qtd', 'Preço Acordado', 'GMV', 'Taxa Shopee', 'Lucro Bruto', 'Margem (%)', 'Categoria'];
+  // "Lucro Líquido": calcGrossProfit já subtrai imposto, taxas, custo e embalagem — não é "bruto"
+  const header = ['Data', 'Nº Pedido', 'SKU', 'Produto', 'Qtd', 'Preço Acordado', 'GMV', 'Taxa Shopee', 'Lucro Líquido', 'Margem (%)', 'Categoria'];
 
   const catLabel = {
     valid: 'Faturado', pending: 'Pendente',
@@ -653,6 +533,6 @@ async function importTiktokOrders(req, res) {
 
 module.exports = {
   importOrders, importStatus, importSheinOrders, importTiktokOrders,
-  getClosing, listOrders, getOrder, deleteOrder,
+  listOrders, getOrder, deleteOrder,
   recalculateOrders, recalculateStatus, exportOrders, skuReport,
 };

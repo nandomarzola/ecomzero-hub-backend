@@ -64,32 +64,36 @@ async function getSummary(req, res) {
   sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
   // Busca paralela: todos os dados de uma vez
-  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw] = await Promise.all([
+  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
-      select: { salePrice: true, profit: true, margin: true, soldAt: true, storeId: true },
+      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true },
     }),
     prevFilter
       ? prisma.order.findMany({
           where:  { storeId: { in: storeIds }, status: 'paid', soldAt: prevFilter },
-          select: { salePrice: true, profit: true, margin: true },
+          select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true },
         })
       : Promise.resolve([]),
     prisma.order.findMany({
       where:  { storeId: { in: storeIds }, status: 'paid', soldAt: { gte: sixMonthsAgo } },
-      select: { salePrice: true, profit: true, margin: true, soldAt: true },
+      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true },
     }),
     prisma.order.findMany({
       where:   { ...orderWhere, productId: { not: null } },
       select: {
-        productId:       true,
-        quantity:        true,
-        calcGmv:         true,
-        calcGrossProfit: true,
-        calcProductCost: true,
-        calcShopeeFee:   true,
-        profit:          true,
-        margin:          true,
+        productId:          true,
+        storeId:            true,
+        quantity:           true,
+        calcGmv:            true,
+        calcGrossProfit:    true,
+        calcProductCost:    true,
+        calcShopeeFee:      true,
+        calcTax:            true,
+        platformServiceFee: true,
+        shopeeShippingCost: true,
+        profit:             true,
+        margin:             true,
         product: { select: { id: true, name: true, costPrice: true, packaging: true } },
       },
     }),
@@ -100,15 +104,26 @@ async function getSummary(req, res) {
       where:  { storeId: { in: storeIds }, status: 'closed' },
       select: { periodMonth: true, gmvTotal: true },
     }),
+    // Contagem por categoria no período (TODOS os status) para a taxa de devolução
+    prisma.order.groupBy({
+      by:     ['orderCategory'],
+      where:  { storeId: { in: storeIds }, ...(dateFilter ? { soldAt: dateFilter } : {}) },
+      _count: { _all: true },
+    }),
   ]);
+
+  // Lucro robusto por pedido: calcGrossProfit é a fonte da verdade (recomputado do raw
+  // no recalculateService). Fallback para o campo legado `profit` quando calc* ausente
+  // — assim o número não depende de o recalculate ter rodado.
+  const orderProfit = (o) => o.calcGrossProfit ?? o.profit ?? 0;
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
   const totalOrders   = orders.length;
   const totalRevenue  = orders.reduce((s, o) => s + o.salePrice, 0);
-  const totalProfit   = orders.reduce((s, o) => s + (o.profit ?? 0), 0);
-  const avgMargin     = totalOrders ? orders.reduce((s, o) => s + (o.margin ?? 0), 0) / totalOrders : 0;
+  const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
+  const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
   const avgTicket     = totalOrders ? totalRevenue / totalOrders : 0;
-  const negativeMargin = orders.filter((o) => (o.profit ?? 0) < 0).length;
+  const negativeMargin = orders.filter((o) => orderProfit(o) < 0).length;
 
   // ── Faturamento consolidado (apenas meses fechados) ────────────────────────
   const closedByMonth = {};
@@ -127,10 +142,11 @@ async function getSummary(req, res) {
   if (prevFilter) {
     const prevCount   = prevOrdersRaw.length;
     const prevRevenue = prevOrdersRaw.reduce((s, o) => s + o.salePrice, 0);
+    const prevProfit  = prevOrdersRaw.reduce((s, o) => s + orderProfit(o), 0);
     prevKPIs = {
       totalRevenue: parseFloat(prevRevenue.toFixed(2)),
-      totalProfit:  parseFloat(prevOrdersRaw.reduce((s, o) => s + (o.profit ?? 0), 0).toFixed(2)),
-      avgMargin:    prevCount ? parseFloat((prevOrdersRaw.reduce((s, o) => s + (o.margin ?? 0), 0) / prevCount).toFixed(2)) : 0,
+      totalProfit:  parseFloat(prevProfit.toFixed(2)),
+      avgMargin:    prevRevenue > 0 ? parseFloat(((prevProfit / prevRevenue) * 100).toFixed(2)) : 0,
       totalOrders:  prevCount,
       avgTicket:    prevCount ? parseFloat((prevRevenue / prevCount).toFixed(2)) : 0,
     };
@@ -142,7 +158,7 @@ async function getSummary(req, res) {
     const key = o.soldAt.toISOString().substring(0, 7);
     if (!sparkMap[key]) sparkMap[key] = { revenue: 0, profit: 0, margin: 0, count: 0 };
     sparkMap[key].revenue += o.salePrice;
-    sparkMap[key].profit  += o.profit ?? 0;
+    sparkMap[key].profit  += orderProfit(o);
     sparkMap[key].margin  += o.margin ?? 0;
     sparkMap[key].count++;
   }
@@ -164,7 +180,7 @@ async function getSummary(req, res) {
 
   // ── Top / worst products + costs breakdown ─────────────────────────────────
   const productMap = {};
-  const costsAcc   = { commission: 0, tax: 0, cogs: 0, packaging: 0 };
+  const costsAcc   = { commission: 0, serviceFee: 0, tax: 0, cogs: 0, packaging: 0, freight: 0 };
 
   for (const o of itemsRaw) {
     const pid = o.product?.id ?? o.productId;
@@ -178,7 +194,7 @@ async function getSummary(req, res) {
         profit: 0, margin: 0, quantity: 0, count: 0, revenue: 0, cogs: 0,
       };
     }
-    productMap[pid].profit   += o.calcGrossProfit ?? 0;
+    productMap[pid].profit   += orderProfit(o);
     productMap[pid].margin   += o.margin          ?? 0;
     productMap[pid].quantity += o.quantity;
     productMap[pid].revenue  += o.calcGmv;
@@ -186,17 +202,20 @@ async function getSummary(req, res) {
     productMap[pid].count++;
 
     costsAcc.commission += o.calcShopeeFee;
+    costsAcc.serviceFee += o.platformServiceFee ?? 0;
+    costsAcc.tax        += o.calcTax            ?? 0;
     costsAcc.cogs       += o.calcProductCost;
     costsAcc.packaging  += o.product ? (o.product.packaging ?? 0) * o.quantity : 0;
+    costsAcc.freight    += o.shopeeShippingCost  ?? 0;
   }
 
   const costsBreakdown = {
     commission: parseFloat(costsAcc.commission.toFixed(2)),
-    serviceFee: 0,
+    serviceFee: parseFloat(costsAcc.serviceFee.toFixed(2)),
     tax:        parseFloat(costsAcc.tax.toFixed(2)),
     cogs:       parseFloat(costsAcc.cogs.toFixed(2)),
     packaging:  parseFloat(costsAcc.packaging.toFixed(2)),
-    freight:    0,
+    freight:    parseFloat(costsAcc.freight.toFixed(2)),
   };
 
   const productList = Object.values(productMap).map((p) => ({
@@ -217,7 +236,7 @@ async function getSummary(req, res) {
     const key = o.soldAt.toISOString().substring(0, 7);
     if (!monthlyMap[key]) monthlyMap[key] = { month: key, revenue: 0, profit: 0 };
     monthlyMap[key].revenue += o.salePrice;
-    monthlyMap[key].profit  += o.profit ?? 0;
+    monthlyMap[key].profit  += orderProfit(o);
   }
   const monthlyChart = Object.values(monthlyMap)
     .sort((a, b) => a.month.localeCompare(b.month))
@@ -229,15 +248,18 @@ async function getSummary(req, res) {
     const ch = marketplaceByStore[o.storeId] ?? 'outros';
     if (!channelMap[ch]) channelMap[ch] = { channel: ch, revenue: 0, profit: 0, orders: 0 };
     channelMap[ch].revenue += o.salePrice;
-    channelMap[ch].profit  += o.profit ?? 0;
+    channelMap[ch].profit  += orderProfit(o);
     channelMap[ch].orders++;
   }
   const channelBreakdown = Object.values(channelMap).map((c) => ({
     ...c,
     revenue: parseFloat(c.revenue.toFixed(2)),
     profit:  parseFloat(c.profit.toFixed(2)),
+    // share de faturamento (GMV) — vaidade
     share:   totalRevenue > 0 ? parseFloat(((c.revenue / totalRevenue) * 100).toFixed(1)) : 0,
-  })).sort((a, b) => b.revenue - a.revenue);
+    // share de lucro — realidade; usado para eleger o canal campeão
+    profitShare: totalProfit > 0 ? parseFloat(((c.profit / totalProfit) * 100).toFixed(1)) : 0,
+  })).sort((a, b) => b.profit - a.profit);
 
   // ── Heatmap diário (total + por loja) ─────────────────────────────────────
   const dailyMap      = {};
@@ -269,6 +291,49 @@ async function getSummary(req, res) {
     days: Object.values(dayMap).map((d) => ({ ...d, revenue: parseFloat(d.revenue.toFixed(2)) })),
   }));
 
+  // ── Projeção de fechamento (só para o mês corrente em andamento) ──
+  let projection = null;
+  if (startDate && endDate) {
+    const sd = new Date(startDate);
+    const now = new Date();
+    const isCurrentMonth = sd.getUTCFullYear() === now.getUTCFullYear() && sd.getUTCMonth() === now.getUTCMonth();
+    if (isCurrentMonth) {
+      const daysInMonth = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0).getDate();
+      const dayOfMonth  = now.getUTCDate();
+      if (dayOfMonth > 0 && dayOfMonth < daysInMonth) {
+        const factor = daysInMonth / dayOfMonth;
+        projection = {
+          revenue:     parseFloat((totalRevenue * factor).toFixed(2)),
+          profit:      parseFloat((totalProfit  * factor).toFixed(2)),
+          daysElapsed: dayOfMonth,
+          daysInMonth,
+        };
+      }
+    }
+  }
+
+  // ── Taxa de devolução do período ───────────────────────────────────────────
+  // (returned_full + returned_partial) / total de pedidos gerados no período × 100.
+  // Base = TODOS os pedidos (qualquer status), pois cancelados/devolvidos também
+  // contam como pedidos gerados. Alta taxa destrói a margem real (frete + embalagem).
+  const catCount = {};
+  let totalGenerated = 0;
+  for (const g of categoryGroups) {
+    const n = g._count._all;
+    catCount[g.orderCategory ?? 'valid'] = (catCount[g.orderCategory ?? 'valid'] ?? 0) + n;
+    totalGenerated += n;
+  }
+  const returnedFullCount    = catCount.returned_full ?? 0;
+  const returnedPartialCount = catCount.returned_partial ?? 0;
+  const returnedCount        = returnedFullCount + returnedPartialCount;
+  const returnRate = {
+    rate:                 totalGenerated > 0 ? parseFloat(((returnedCount / totalGenerated) * 100).toFixed(1)) : 0,
+    returnedCount,
+    returnedFullCount,
+    returnedPartialCount,
+    totalGenerated,
+  };
+
   return res.json({
     totalRevenue:   parseFloat(totalRevenue.toFixed(2)),
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
@@ -286,6 +351,8 @@ async function getSummary(req, res) {
     dailyHeatmap,
     heatmapByStore,
     closedRevenue,
+    projection,
+    returnRate,
   });
 }
 
@@ -369,7 +436,8 @@ async function getMonthlyReport(req, res) {
   const totalOrders  = orders.length;
   const totalRevenue = orders.reduce((s, o) => s + o.salePrice, 0);
   const totalProfit  = orders.reduce((s, o) => s + (o.profit ?? 0), 0);
-  const avgMargin    = totalOrders ? orders.reduce((s, o) => s + (o.margin ?? 0), 0) / totalOrders : 0;
+  // Margem ponderada (lucro ÷ faturamento) — consistente com getSummary; não média aritmética
+  const avgMargin    = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
 
   const ordersWithProducts = await prisma.order.findMany({
     where:  { ...orderWhere, productId: { not: null } },
