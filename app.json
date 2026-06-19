@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "a265fa30-8351-4279-9b6a-48a2cb6d9fc8"
+      }
+    },
+    "android": {
+      "package": "com.nandomarzola.profittrackbackend"
+    }
+  }
+}
