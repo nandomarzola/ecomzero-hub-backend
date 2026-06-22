@@ -154,6 +154,42 @@ function buildChampionScore(item) {
   };
 }
 
+const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
+
+function addUnique(bucket, order) {
+  bucket.orderIds.add(order.orderId);
+  bucket.lines += 1;
+  bucket.units += order.quantity ?? 0;
+}
+
+function summarizeOrderBreakdown(orders) {
+  const makeBucket = () => ({ orderIds: new Set(), lines: 0, units: 0 });
+  const buckets = {
+    created: makeBucket(),
+    paid: makeBucket(),
+    valid: makeBucket(),
+    pending: makeBucket(),
+    unpaid: makeBucket(),
+    cancelled: makeBucket(),
+    returned: makeBucket(),
+  };
+
+  for (const order of orders) {
+    addUnique(buckets.created, order);
+    if (REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) addUnique(buckets.paid, order);
+    if (order.orderCategory === 'valid') addUnique(buckets.valid, order);
+    if (order.orderCategory === 'pending') addUnique(buckets.pending, order);
+    if (order.orderCategory === 'cancelled_unpaid') addUnique(buckets.unpaid, order);
+    if (order.orderCategory === 'cancelled_other') addUnique(buckets.cancelled, order);
+    if (['returned_full', 'returned_partial'].includes(order.orderCategory)) addUnique(buckets.returned, order);
+  }
+
+  return Object.fromEntries(Object.entries(buckets).map(([key, bucket]) => [
+    key,
+    { orders: bucket.orderIds.size, lines: bucket.lines, units: bucket.units },
+  ]));
+}
+
 async function getAppDashboard(req, res) {
   const { storeId, period = 'today' } = req.query;
   const userId = req.userId;
@@ -187,21 +223,12 @@ async function getAppDashboard(req, res) {
   });
   const yearGmv = r2(yearOrders.reduce((s, o) => s + (o.calcGmv ?? 0), 0));
 
-  // Devoluções e cancelamentos no período selecionado
-  const periodReturns = await prisma.order.count({
+  // Todos os pedidos do período, incluindo não pagos/cancelados. O financeiro
+  // usa só categorias com receita, mas os contadores precisam bater com a Shopee.
+  const allPeriodOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
       soldAt: { gte: range.start, lte: range.end },
-      orderCategory: { in: ['returned_full', 'returned_partial', 'cancelled_other', 'cancelled_unpaid'] },
-    },
-  });
-
-  // Pedidos do período selecionado com receita
-  const orders = await prisma.order.findMany({
-    where: {
-      storeId: { in: storeIds },
-      soldAt: { gte: range.start, lte: range.end },
-      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
       id: true, storeId: true, soldAt: true, quantity: true,
@@ -212,6 +239,8 @@ async function getAppDashboard(req, res) {
       productId: true,
     },
   });
+  const orders = allPeriodOrders.filter((order) => REVENUE_ORDER_CATEGORIES.includes(order.orderCategory));
+  const breakdown = summarizeOrderBreakdown(allPeriodOrders);
 
   const monthOrders = await prisma.order.findMany({
     where: {
@@ -237,7 +266,9 @@ async function getAppDashboard(req, res) {
   const uniqueOrderIds      = new Set();
   const uniqueOrderIdsToday = new Set();
   const uniqueByStore       = {}; // storeId → Set de orderIds únicos
+  const unitsByStore        = {};
   for (const s of stores) uniqueByStore[s.id] = new Set();
+  for (const s of stores) unitsByStore[s.id] = 0;
 
   for (const o of orders) {
     const calc = calcOrderProfit(o, taxRateMap);
@@ -246,6 +277,7 @@ async function getAppDashboard(req, res) {
     byStore[o.storeId].netRevenue += calc.netRevenue;
     byStore[o.storeId].profit += calc.profit;
     byStore[o.storeId].items  += 1;
+    unitsByStore[o.storeId] += o.quantity ?? 0;
     uniqueByStore[o.storeId].add(o.orderId);
     totalGmv    += o.calcGmv;
     totalNetRevenue += calc.netRevenue;
@@ -265,6 +297,7 @@ async function getAppDashboard(req, res) {
   // Contar pedidos únicos por loja
   for (const s of stores) {
     byStore[s.id].orders = uniqueByStore[s.id].size;
+    byStore[s.id].units = unitsByStore[s.id] ?? 0;
   }
 
   // Projeção do mês
@@ -284,17 +317,29 @@ async function getAppDashboard(req, res) {
       netRevenue: r2(totalNetRevenue),
       profit: r2(totalProfit),
       orders: uniqueOrderIds.size,  // pedidos únicos (order_sn distintos)
-      items:  totalItems,           // linhas totais (itens — 1 pedido multi-produto = N itens)
+      items:  totalItems,           // linhas totais com receita
+      units:  breakdown.paid.units, // unidades pagas/vendidas
+      paidOrders: breakdown.paid.orders,
+      paidUnits: breakdown.paid.units,
+      createdOrders: breakdown.created.orders,
+      createdUnits: breakdown.created.units,
+      unpaidOrders: breakdown.unpaid.orders,
+      unpaidUnits: breakdown.unpaid.units,
+      cancelledOrders: breakdown.cancelled.orders,
+      cancelledUnits: breakdown.cancelled.units,
+      returnedOrders: breakdown.returned.orders,
+      returnedUnits: breakdown.returned.units,
       margin: totalGmv > 0 ? r2((totalProfit / totalGmv) * 100) : 0,
-      returns: periodReturns,
+      returns: breakdown.returned.orders + breakdown.cancelled.orders + breakdown.unpaid.orders,
+      orderBreakdown: breakdown,
     },
     yearGmv,
     today: {
       gmv:     r2(todayGmv),
       profit:  r2(todayProfit),
       orders:  uniqueOrderIdsToday.size, // pedidos únicos hoje
-      items:   todayItems,               // itens hoje
-      returns: periodReturns,
+      items:   todayItems,               // linhas hoje
+      returns: breakdown.returned.orders + breakdown.cancelled.orders + breakdown.unpaid.orders,
     },
     projection: {
       gmv: projectedGmv, profit: projectedProfit,
@@ -475,18 +520,23 @@ async function getAppProducts(req, res) {
     totalProfit += calc.profit;
   }
 
-  const metricRows = await prisma.productMetricDaily.findMany({
-    where: {
-      storeId: { in: storeIds },
-      metricDate: { gte: range.start, lte: range.end },
-    },
-    select: {
-      productId: true, externalId: true, marketplace: true, visits: true, clicks: true,
-      impressions: true, conversion: true, adSpend: true, adRevenue: true, adOrders: true,
-      product: { select: { id: true, parentId: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true, parent: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true } } } },
-      store: { select: { name: true, marketplace: true } },
-    },
-  });
+  let metricRows = [];
+  try {
+    metricRows = await prisma.productMetricDaily.findMany({
+      where: {
+        storeId: { in: storeIds },
+        metricDate: { gte: range.start, lte: range.end },
+      },
+      select: {
+        productId: true, externalId: true, marketplace: true, visits: true, clicks: true,
+        impressions: true, conversion: true, adSpend: true, adRevenue: true, adOrders: true,
+        product: { select: { id: true, parentId: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true, parent: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true } } } },
+        store: { select: { name: true, marketplace: true } },
+      },
+    });
+  } catch (err) {
+    console.warn('[AppProducts] métricas indisponíveis:', err.message);
+  }
 
   for (const metric of metricRows) {
     const baseProduct = metric.product?.parent ?? metric.product;
@@ -643,20 +693,25 @@ async function getAppProductMetrics(req, res) {
   });
   const storeIds = stores.map((store) => store.id);
 
-  const rows = await prisma.productMetricDaily.findMany({
-    where: {
-      storeId: { in: storeIds },
-      metricDate: { gte: range.start, lte: range.end },
-    },
-    select: {
-      storeId: true, productId: true, externalId: true, marketplace: true, metricDate: true,
-      visits: true, clicks: true, impressions: true, conversion: true,
-      adSpend: true, adRevenue: true, adOrders: true, source: true,
-      product: { select: { id: true, parentId: true, name: true, sku: true, parent: { select: { id: true, name: true, sku: true } } } },
-      store: { select: { name: true, marketplace: true } },
-    },
-    orderBy: [{ metricDate: 'desc' }, { visits: 'desc' }],
-  });
+  let rows = [];
+  try {
+    rows = await prisma.productMetricDaily.findMany({
+      where: {
+        storeId: { in: storeIds },
+        metricDate: { gte: range.start, lte: range.end },
+      },
+      select: {
+        storeId: true, productId: true, externalId: true, marketplace: true, metricDate: true,
+        visits: true, clicks: true, impressions: true, conversion: true,
+        adSpend: true, adRevenue: true, adOrders: true, source: true,
+        product: { select: { id: true, parentId: true, name: true, sku: true, parent: { select: { id: true, name: true, sku: true } } } },
+        store: { select: { name: true, marketplace: true } },
+      },
+      orderBy: [{ metricDate: 'desc' }, { visits: 'desc' }],
+    });
+  } catch (err) {
+    console.warn('[AppProductMetrics] métricas indisponíveis:', err.message);
+  }
 
   const byProduct = new Map();
   for (const row of rows) {
