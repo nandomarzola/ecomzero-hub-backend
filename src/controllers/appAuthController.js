@@ -130,6 +130,7 @@ function getPeriodRange(period = 'today') {
 
   if (period === 'month' || period === 'mes') {
     startParts = { ...today, day: 1 };
+    endParts = today.day === 1 ? { ...today } : addDaysToParts(today, -1);
     return {
       start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
       end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
