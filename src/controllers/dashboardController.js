@@ -64,7 +64,7 @@ async function getSummary(req, res) {
   sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
   // Busca paralela: todos os dados de uma vez
-  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups] = await Promise.all([
+  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups, allPeriodRaw] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
       select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true, orderCategory: true, buyerUsername: true },
@@ -72,7 +72,7 @@ async function getSummary(req, res) {
     prevFilter
       ? prisma.order.findMany({
           where:  { storeId: { in: storeIds }, status: 'paid', soldAt: prevFilter },
-          select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, orderId: true, orderCategory: true, buyerUsername: true },
+          select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, orderId: true, orderCategory: true, buyerUsername: true, globalTotal: true },
         })
       : Promise.resolve([]),
     prisma.order.findMany({
@@ -110,6 +110,11 @@ async function getSummary(req, res) {
       where:  { storeId: { in: storeIds }, ...(dateFilter ? { soldAt: dateFilter } : {}) },
       _count: { _all: true },
     }),
+    // Todos os pedidos do período (sem filtro de status) — para métricas Upseller-style
+    prisma.order.findMany({
+      where:  { storeId: { in: storeIds }, ...(dateFilter ? { soldAt: dateFilter } : {}) },
+      select: { orderId: true, orderCategory: true, globalTotal: true, buyerUsername: true },
+    }),
   ]);
 
   // Lucro robusto por pedido: calcGrossProfit é a fonte da verdade (recomputado do raw
@@ -133,8 +138,17 @@ async function getSummary(req, res) {
   // Valor de vendas válidas = GMV apenas de pedidos COMPLETED
   const validRevenue  = orders.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + o.salePrice, 0);
 
-  // Clientes únicos (buyerUsername distinto)
-  const clientsSet    = new Set(orders.map(o => o.buyerUsername).filter(Boolean));
+  // ── Métricas "estilo Upseller" — baseadas em TODOS os pedidos, usando globalTotal ──
+  // globalTotal = detail.total_amount da Shopee (valor original, mesmo para cancelados)
+  const allUniqueIds   = new Set(allPeriodRaw.map(o => o.orderId).filter(Boolean));
+  const allValidIds    = new Set(allPeriodRaw.filter(o => o.orderCategory === 'valid').map(o => o.orderId).filter(Boolean));
+  const allClientsSet  = new Set(allPeriodRaw.map(o => o.buyerUsername).filter(Boolean));
+  const totalSales     = allPeriodRaw.reduce((s, o) => s + (o.globalTotal ?? 0), 0);
+  const validSales     = allPeriodRaw.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + (o.globalTotal ?? 0), 0);
+  const allClientsCount = allClientsSet.size;
+
+  // Clientes únicos (buyerUsername distinto) — fallback para orders (status=paid) se allPeriodRaw vazio
+  const clientsSet    = allClientsCount > 0 ? allClientsSet : new Set(orders.map(o => o.buyerUsername).filter(Boolean));
   const clientsCount  = clientsSet.size;
 
   const totalItems    = orders.length; // itens totais (linhas)
@@ -178,6 +192,9 @@ async function getSummary(req, res) {
       validRevenue:  parseFloat(prevValidRev.toFixed(2)),
       clientsCount:  prevClientsCount,
       salesPerClient: prevClientsCount > 0 ? parseFloat((prevRevenue / prevClientsCount).toFixed(2)) : 0,
+      totalSales:    parseFloat(prevOrdersRaw.reduce((s, o) => s + (o.globalTotal ?? 0), 0).toFixed(2)),
+      validRevenue:  parseFloat(prevOrdersRaw.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + (o.globalTotal ?? 0), 0).toFixed(2)),
+      totalPeriodOrders: new Set(prevOrdersRaw.map(o => o.orderId).filter(Boolean)).size,
       avgTicket:     prevPaidCount ? parseFloat((prevRevenue / prevPaidCount).toFixed(2)) : 0,
     };
   }
@@ -369,11 +386,13 @@ async function getSummary(req, res) {
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
     totalOrders,   // todos os pedidos com receita (valid+pending+returned_partial)
-    paidOrders,    // valid + pending — alinha com dashboard Shopee Seller
-    validOrders,   // apenas COMPLETED — "Pedidos Válidos" do Upseller
-    validRevenue:   parseFloat(validRevenue.toFixed(2)),
-    clientsCount,  // compradores únicos (buyerUsername) — "Clientes" do Upseller
-    salesPerClient: parseFloat(salesPerClient.toFixed(2)),
+    paidOrders,           // valid + pending — "pedidos" do dashboard principal
+    validOrders:   allValidIds.size,               // "Pedidos Válidos" Upseller
+    totalSales:    parseFloat(totalSales.toFixed(2)),  // "Valor Total de Vendas" Upseller
+    validRevenue:  parseFloat(validSales.toFixed(2)),  // "Valor de Vendas Válidas" Upseller
+    totalPeriodOrders: allUniqueIds.size,          // "Total de Pedidos" Upseller (ALL categorias)
+    clientsCount,         // "Clientes" Upseller (buyerUsername únicos)
+    salesPerClient: allClientsCount > 0 ? parseFloat((totalSales / allClientsCount).toFixed(2)) : parseFloat(salesPerClient.toFixed(2)),
     totalItems,    // itens totais (linhas — inclui multi-produto)
     avgTicket:      parseFloat(avgTicket.toFixed(2)),
     negativeMargin,
