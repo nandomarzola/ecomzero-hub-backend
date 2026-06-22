@@ -442,6 +442,22 @@ async function syncOrders(req, res) {
       saved += result.count;
     }
 
+    // createMany com skipDuplicates não atualiza pedido que já existia. Como a
+    // Shopee altera status, pagamento e quantidade/itens depois da criação, nós
+    // atualizamos todas as linhas importadas pela chave única do marketplace.
+    for (const batch of chunkArr(ordersData, 100)) {
+      await Promise.all(batch.map((order) => prisma.order.update({
+        where: {
+          storeId_orderId_lineItemKey: {
+            storeId: order.storeId,
+            orderId: order.orderId,
+            lineItemKey: order.lineItemKey,
+          },
+        },
+        data: order,
+      }).catch(() => null)));
+    }
+
     // 6b. Ajuste de estoque — busca pedidos do import que precisam de decremento/restauro
     // Roda APÓS createMany (que não retorna ids individuais) consultando por importId.
     // Só processa valid+!stockDeducted e returned_full+stockDeducted para garantir idempotência.

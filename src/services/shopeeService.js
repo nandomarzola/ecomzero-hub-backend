@@ -50,7 +50,7 @@ async function fetchOrderDetails(accessToken, shopId, orderSnList) {
     const batch = orderSnList.slice(i, i + 50);
     const res = await shopApiGet('/api/v2/order/get_order_detail', accessToken, shopId, {
       order_sn_list:            batch.join(','),
-      response_optional_fields: 'item_list,total_amount,actual_shipping_fee,payment_method,buyer_username',
+      response_optional_fields: 'item_list,total_amount,actual_shipping_fee,payment_method,buyer_username,pay_time,cancel_reason,shipping_carrier,create_time,update_time',
     });
 
     if (res.error) {
@@ -88,7 +88,12 @@ async function fetchEscrowDetails(accessToken, shopId, orderSnList, onProgress) 
 }
 
 // ── Mapeamento de status Shopee → nosso modelo ────────────────────────────────
-function classifyShopeeOrder(status) {
+function classifyShopeeOrder(status, cancelReason = '') {
+  const reason = String(cancelReason ?? '').toLowerCase();
+  if (status === 'CANCELLED' && (reason.includes('não pago') || reason.includes('nao pago') || reason.includes('unpaid'))) {
+    return 'cancelled_unpaid';
+  }
+
   const map = {
     UNPAID:             'cancelled_unpaid',
     READY_TO_SHIP:      'pending',
@@ -141,7 +146,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     ? r2(allItems.reduce((s, it) => s + r2(it.model_original_price ?? 0) * (it.model_quantity_purchased ?? 1), 0) / quantity)
     : agreedPrice;
 
-  const orderCategory = isReturnCompensation ? 'returned_partial' : classifyShopeeOrder(detail.order_status);
+  const orderCategory = isReturnCompensation ? 'returned_partial' : classifyShopeeOrder(detail.order_status, detail.cancel_reason);
   const isRevenue     = ['valid', 'pending', 'returned_partial'].includes(orderCategory);
   const taxRate       = store.taxRate ?? 0;
 
@@ -176,6 +181,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
   const margin      = gmv > 0 ? r2((grossProfit / gmv) * 100) : 0;
 
   const createdAt = detail.create_time ? new Date(detail.create_time * 1000) : null;
+  const paidAt    = detail.pay_time ? new Date(detail.pay_time * 1000) : null;
   const updatedAt = detail.update_time ? new Date(detail.update_time * 1000) : null;
   const soldAt    = createdAt ?? new Date();
 
@@ -212,7 +218,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     trackingNumber: null,
     shippingOption: detail.shipping_carrier ?? null,
     orderCreatedAt:   createdAt,
-    orderPaidAt:      createdAt,
+    orderPaidAt:      paidAt,
     orderDeliveredAt: orderCategory === 'valid' ? updatedAt : null,
     mlShippingCost:   0,
     mlInstallmentFee: 0,

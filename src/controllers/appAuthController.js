@@ -235,12 +235,17 @@ function summarizeOrderBreakdown(orders) {
   };
 
   for (const order of orders) {
+    const hasPayment = !!order.orderPaidAt || (order.orderCategory !== 'cancelled_unpaid' && REVENUE_ORDER_CATEGORIES.includes(order.orderCategory));
+    const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+    const isOpenUnpaid = !hasPayment && rawStatus === 'UNPAID';
+    const isCancelledWithoutPayment = !hasPayment && (order.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED');
+
     addUnique(buckets.created, order);
-    if (REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) addUnique(buckets.paid, order);
+    if (hasPayment) addUnique(buckets.paid, order);
     if (order.orderCategory === 'valid') addUnique(buckets.valid, order);
     if (order.orderCategory === 'pending') addUnique(buckets.pending, order);
-    if (order.orderCategory === 'cancelled_unpaid') addUnique(buckets.unpaid, order);
-    if (order.orderCategory === 'cancelled_other') addUnique(buckets.cancelled, order);
+    if (isOpenUnpaid) addUnique(buckets.unpaid, order);
+    if (isCancelledWithoutPayment) addUnique(buckets.cancelled, order);
     if (['returned_full', 'returned_partial'].includes(order.orderCategory)) addUnique(buckets.returned, order);
   }
 
@@ -296,6 +301,7 @@ async function getAppDashboard(req, res) {
       calcGmv: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
+      orderStatus: true, orderPaidAt: true, cancelReason: true,
       productId: true,
     },
   });
