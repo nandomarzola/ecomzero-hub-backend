@@ -272,6 +272,7 @@ model Order {
   shopeeShippingCost  Float @default(0)  // Frete pago pelo seller fora do escrow Shopee (envio não integrado)
   trackingNumber   String?
   shippingOption   String?
+  buyerUsername    String?
   orderCreatedAt   DateTime?
   orderPaidAt      DateTime?
   orderDeliveredAt DateTime?

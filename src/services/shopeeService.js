@@ -217,6 +217,7 @@ function convertShopeeOrder(detail, escrow, storeId, importId, store, productId 
     listingType:   null,
     trackingNumber: null,
     shippingOption: detail.shipping_carrier ?? null,
+    buyerUsername:  detail.buyer_username ?? null,
     orderCreatedAt:   createdAt,
     orderPaidAt:      paidAt,
     orderDeliveredAt: orderCategory === 'valid' ? updatedAt : null,

@@ -67,12 +67,12 @@ async function getSummary(req, res) {
   const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
-      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true, orderCategory: true },
+      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true, orderCategory: true, buyerUsername: true },
     }),
     prevFilter
       ? prisma.order.findMany({
           where:  { storeId: { in: storeIds }, status: 'paid', soldAt: prevFilter },
-          select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true },
+          select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, orderId: true, orderCategory: true, buyerUsername: true },
         })
       : Promise.resolve([]),
     prisma.order.findMany({
@@ -133,11 +133,16 @@ async function getSummary(req, res) {
   // Valor de vendas válidas = GMV apenas de pedidos COMPLETED
   const validRevenue  = orders.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + o.salePrice, 0);
 
+  // Clientes únicos (buyerUsername distinto)
+  const clientsSet    = new Set(orders.map(o => o.buyerUsername).filter(Boolean));
+  const clientsCount  = clientsSet.size;
+
   const totalItems    = orders.length; // itens totais (linhas)
   const totalRevenue  = orders.reduce((s, o) => s + o.salePrice, 0);
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
   const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
+  const salesPerClient = clientsCount > 0 ? totalRevenue / clientsCount : 0;
   const negativeMargin = orders.filter((o) => orderProfit(o) < 0).length;
 
   // ── Faturamento consolidado (apenas meses fechados) ────────────────────────
@@ -155,15 +160,25 @@ async function getSummary(req, res) {
   // ── KPIs do período anterior ───────────────────────────────────────────────
   let prevKPIs = null;
   if (prevFilter) {
-    const prevCount   = prevOrdersRaw.length;
-    const prevRevenue = prevOrdersRaw.reduce((s, o) => s + o.salePrice, 0);
-    const prevProfit  = prevOrdersRaw.reduce((s, o) => s + orderProfit(o), 0);
+    const prevPaidIds    = new Set(prevOrdersRaw.filter(o => o.orderCategory === 'valid' || o.orderCategory === 'pending').map(o => o.orderId).filter(Boolean));
+    const prevValidIds   = new Set(prevOrdersRaw.filter(o => o.orderCategory === 'valid').map(o => o.orderId).filter(Boolean));
+    const prevClients    = new Set(prevOrdersRaw.map(o => o.buyerUsername).filter(Boolean));
+    const prevPaidCount  = prevPaidIds.size;
+    const prevRevenue    = prevOrdersRaw.reduce((s, o) => s + o.salePrice, 0);
+    const prevValidRev   = prevOrdersRaw.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + o.salePrice, 0);
+    const prevProfit     = prevOrdersRaw.reduce((s, o) => s + orderProfit(o), 0);
+    const prevClientsCount = prevClients.size;
     prevKPIs = {
-      totalRevenue: parseFloat(prevRevenue.toFixed(2)),
-      totalProfit:  parseFloat(prevProfit.toFixed(2)),
-      avgMargin:    prevRevenue > 0 ? parseFloat(((prevProfit / prevRevenue) * 100).toFixed(2)) : 0,
-      totalOrders:  prevCount,
-      avgTicket:    prevCount ? parseFloat((prevRevenue / prevCount).toFixed(2)) : 0,
+      totalRevenue:  parseFloat(prevRevenue.toFixed(2)),
+      totalProfit:   parseFloat(prevProfit.toFixed(2)),
+      avgMargin:     prevRevenue > 0 ? parseFloat(((prevProfit / prevRevenue) * 100).toFixed(2)) : 0,
+      totalOrders:   prevPaidCount,
+      paidOrders:    prevPaidCount,
+      validOrders:   prevValidIds.size,
+      validRevenue:  parseFloat(prevValidRev.toFixed(2)),
+      clientsCount:  prevClientsCount,
+      salesPerClient: prevClientsCount > 0 ? parseFloat((prevRevenue / prevClientsCount).toFixed(2)) : 0,
+      avgTicket:     prevPaidCount ? parseFloat((prevRevenue / prevPaidCount).toFixed(2)) : 0,
     };
   }
 
@@ -354,9 +369,11 @@ async function getSummary(req, res) {
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
     totalOrders,   // todos os pedidos com receita (valid+pending+returned_partial)
-    paidOrders,    // valid + pending — alinha com "pedidos" do Shopee Seller App
-    validOrders,   // apenas COMPLETED (valid)
+    paidOrders,    // valid + pending — alinha com dashboard Shopee Seller
+    validOrders,   // apenas COMPLETED — "Pedidos Válidos" do Upseller
     validRevenue:   parseFloat(validRevenue.toFixed(2)),
+    clientsCount,  // compradores únicos (buyerUsername) — "Clientes" do Upseller
+    salesPerClient: parseFloat(salesPerClient.toFixed(2)),
     totalItems,    // itens totais (linhas — inclui multi-produto)
     avgTicket:      parseFloat(avgTicket.toFixed(2)),
     negativeMargin,
