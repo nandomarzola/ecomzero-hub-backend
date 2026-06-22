@@ -1,5 +1,5 @@
 const prisma = require('../lib/prisma');
-const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchShippingCosts, listingTypeLabel } = require('../services/mlService');
+const { getAuthUrl, exchangeCode, refreshAccessToken, getSellerInfo, fetchOrders, convertMlOrder, fetchItemIds, fetchItemDetails, fetchItemVisits, fetchShippingCosts, listingTypeLabel } = require('../services/mlService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
 const { importProgress } = require('../lib/importProgress');
 const { applyStockFromOrder } = require('../lib/stockHelper');
@@ -396,4 +396,78 @@ async function syncItems(req, res) {
   }
 }
 
-module.exports = { getAuth, handleCallback, getStatus, disconnect, syncOrders, syncItems };
+async function syncTraffic(req, res) {
+  const { storeId, dateFrom, dateTo } = req.body;
+  if (!storeId || !dateFrom || !dateTo) {
+    return res.status(400).json({ error: 'storeId, dateFrom e dateTo são obrigatórios' });
+  }
+
+  const store = await prisma.store.findFirst({ where: { id: storeId, userId: req.userId } });
+  if (!store) return res.status(404).json({ error: 'Loja não encontrada' });
+  if (!store.mlAccessToken) return res.status(400).json({ error: 'Loja não conectada ao Mercado Livre' });
+
+  let accessToken = store.mlAccessToken;
+  if (store.mlTokenExpiresAt && new Date(store.mlTokenExpiresAt) < new Date()) {
+    const newTokens = await refreshAccessToken(store.mlRefreshToken);
+    accessToken = newTokens.access_token;
+    await prisma.store.update({
+      where: { id: storeId },
+      data: {
+        mlAccessToken: newTokens.access_token,
+        mlRefreshToken: newTokens.refresh_token ?? store.mlRefreshToken,
+        mlTokenExpiresAt: new Date(Date.now() + (newTokens.expires_in * 1000)),
+      },
+    });
+  }
+
+  const products = await prisma.product.findMany({
+    where: { storeId, externalId: { not: null } },
+    select: { id: true, externalId: true },
+  });
+  const itemIds = [...new Set(products.map((p) => p.externalId).filter(Boolean))];
+  if (itemIds.length === 0) {
+    return res.json({ synced: 0, totalItems: 0, message: 'Nenhum anúncio ML com externalId encontrado.' });
+  }
+
+  const byExternalId = new Map(products.map((p) => [String(p.externalId), p]));
+  const visits = await fetchItemVisits(accessToken, itemIds, dateFrom, dateTo);
+
+  let synced = 0;
+  for (const row of visits) {
+    const product = byExternalId.get(String(row.itemId));
+    if (!product) continue;
+    const metricDate = new Date(row.date);
+    metricDate.setUTCHours(0, 0, 0, 0);
+
+    await prisma.productMetricDaily.upsert({
+      where: {
+        storeId_externalId_metricDate: {
+          storeId,
+          externalId: String(row.itemId),
+          metricDate,
+        },
+      },
+      create: {
+        storeId,
+        productId: product.id,
+        marketplace: 'mercadolivre',
+        externalId: String(row.itemId),
+        metricDate,
+        visits: row.visits,
+        source: 'mercadolivre_api',
+        raw: row.raw,
+      },
+      update: {
+        productId: product.id,
+        visits: row.visits,
+        source: 'mercadolivre_api',
+        raw: row.raw,
+      },
+    });
+    synced++;
+  }
+
+  return res.json({ synced, totalItems: itemIds.length, rows: visits.length });
+}
+
+module.exports = { getAuth, handleCallback, getStatus, disconnect, syncOrders, syncItems, syncTraffic };

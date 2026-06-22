@@ -354,6 +354,66 @@ async function fetchItemFees(accessToken, itemIds) {
   return feesMap;
 }
 
+function parseVisitWindowBody(itemId, body, fallbackDate) {
+  const rows = [];
+  const details = body?.results ?? body?.visits_detail ?? body?.visits ?? [];
+
+  if (Array.isArray(details)) {
+    for (const row of details) {
+      const dateRaw = row.date ?? row.day ?? row.period ?? row.date_from ?? row.created_at;
+      const visits = row.total_visits ?? row.visits ?? row.quantity ?? row.value ?? 0;
+      if (!dateRaw) continue;
+      rows.push({
+        itemId,
+        date: new Date(String(dateRaw).substring(0, 10) + 'T00:00:00.000Z'),
+        visits: Number(visits) || 0,
+        raw: row,
+      });
+    }
+  }
+
+  if (rows.length === 0) {
+    const total = body?.total_visits ?? body?.visits ?? body?.total ?? 0;
+    if (total > 0) {
+      rows.push({
+        itemId,
+        date: new Date(new Date(fallbackDate).toISOString().substring(0, 10) + 'T00:00:00.000Z'),
+        visits: Number(total) || 0,
+        raw: body,
+      });
+    }
+  }
+
+  return rows;
+}
+
+// ── Visitas por anúncio ML ───────────────────────────────────────────────────
+// Endpoint usado de forma defensiva porque a API de visitas varia por país/conta.
+// Preferência: /items/{itemId}/visits/time_window?last=N&unit=day
+async function fetchItemVisits(accessToken, itemIds, dateFrom, dateTo) {
+  const out = [];
+  const from = new Date(dateFrom);
+  const to = new Date(dateTo);
+  const last = Math.max(1, Math.min(150, Math.ceil((to - from) / (24 * 60 * 60 * 1000)) + 1));
+
+  for (const itemId of itemIds) {
+    const attempts = [
+      `/items/${itemId}/visits/time_window?last=${last}&unit=day`,
+      `/items/${itemId}/visits?date_from=${from.toISOString()}&date_to=${to.toISOString()}`,
+    ];
+
+    for (const path of attempts) {
+      const res = await mlGet(path, accessToken).catch(() => null);
+      if (!res || res.status < 200 || res.status >= 300) continue;
+      const rows = parseVisitWindowBody(itemId, res.body, to);
+      out.push(...rows.filter((row) => row.date >= from && row.date <= to));
+      break;
+    }
+  }
+
+  return out;
+}
+
 // ── Label legível do tipo de anúncio ──────────────────────────────────────────
 function listingTypeLabel(id) {
   const map = {
@@ -376,6 +436,7 @@ module.exports = {
   fetchItemIds,
   fetchItemDetails,
   fetchItemFees,
+  fetchItemVisits,
   fetchShippingCosts,
   listingTypeLabel,
 };

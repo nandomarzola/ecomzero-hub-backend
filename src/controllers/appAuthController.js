@@ -110,6 +110,50 @@ function calcOrderProfit(order, taxRateMap) {
   return { fee, discount: disc, netRevenue: repasse, tax, profit };
 }
 
+function normalizeProductName(name = '') {
+  return String(name)
+    .replace(/\s+—\s+.+$/g, '')
+    .replace(/\s+-\s+.+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function estimateBreakRisk(product) {
+  const haystack = `${product?.name ?? ''} ${product?.category ?? ''}`.toLowerCase();
+  const highRisk = ['vidro', 'glass', 'ceram', 'porcel', 'espelho', 'fragil', 'frágil', 'quebra'];
+  const mediumRisk = ['liquido', 'líquido', 'aroma', 'difusor', 'refil', 'frasco', 'oleo', 'óleo'];
+  if (highRisk.some((term) => haystack.includes(term))) return 3;
+  if (mediumRisk.some((term) => haystack.includes(term))) return 2;
+  return 1;
+}
+
+function buildChampionScore(item) {
+  const riskScore = item.breakRisk ?? 1;
+  const reorderCost = item.costPrice != null && item.costPrice > 0 ? item.costPrice : item.avgUnitCost;
+  const reorderScore = reorderCost > 0 ? Math.max(0, 100 - reorderCost) : 50;
+
+  return {
+    score: r2(
+      (item.units * 1000) +
+      ((4 - riskScore) * 180) +
+      (reorderScore * 4) +
+      Math.max(0, item.profit)
+    ),
+    quantityWeight: item.units,
+    breakRisk: riskScore,
+    reorderCost: reorderCost ? r2(reorderCost) : null,
+    reorderScore: r2(reorderScore),
+    profitWeight: r2(item.profit),
+    source: 'units_then_estimated_risk_reorder_profit',
+    preciseSignals: {
+      quantity: true,
+      profit: true,
+      breakRisk: false,
+      reorderCost: item.costPrice != null && item.costPrice > 0,
+    },
+  };
+}
+
 async function getAppDashboard(req, res) {
   const { storeId, period = 'today' } = req.query;
   const userId = req.userId;
@@ -366,7 +410,13 @@ async function getAppProducts(req, res) {
       calcGmv: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
       calcPackaging: true, orderCategory: true,
-      product: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true } },
+      product: {
+        select: {
+          id: true, parentId: true, name: true, sku: true, stock: true, minStock: true,
+          listPrice: true, costPrice: true, category: true,
+          parent: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true } },
+        },
+      },
       store: { select: { name: true, marketplace: true } },
     },
   });
@@ -379,23 +429,30 @@ async function getAppProducts(req, res) {
 
   for (const order of orders) {
     const calc = calcOrderProfit(order, taxRateMap);
-    const key = order.productId ?? `name:${order.productName ?? 'Produto sem nome'}`;
+    const baseProduct = order.product?.parent ?? order.product;
+    const baseName = normalizeProductName(baseProduct?.name ?? order.productName ?? 'Produto sem nome');
+    const key = baseProduct?.id ?? `name:${baseName.toLowerCase()}`;
     if (!products.has(key)) {
       products.set(key, {
-        id: order.productId ?? key,
-        name: order.product?.name ?? order.productName ?? 'Produto sem nome',
-        sku: order.product?.sku ?? null,
+        id: key,
+        name: baseName,
+        sku: baseProduct?.sku ?? null,
         marketplace: order.store?.marketplace ?? null,
         storeName: order.store?.name ?? null,
-        stock: order.product?.stock ?? null,
-        minStock: order.product?.minStock ?? null,
-        listPrice: order.product?.listPrice ?? null,
+        stock: baseProduct?.stock ?? null,
+        minStock: baseProduct?.minStock ?? null,
+        listPrice: baseProduct?.listPrice ?? null,
+        costPrice: baseProduct?.costPrice ?? null,
+        category: baseProduct?.category ?? null,
+        breakRisk: estimateBreakRisk(baseProduct ?? { name: baseName }),
+        variants: new Set(),
         ordersSet: new Set(),
         orders: 0,
         units: 0,
         gmv: 0,
         netRevenue: 0,
         profit: 0,
+        productCost: 0,
         margin: 0,
         avgTicket: 0,
         visits: null,
@@ -405,10 +462,12 @@ async function getAppProducts(req, res) {
 
     const item = products.get(key);
     item.ordersSet.add(order.orderId);
+    if (order.product?.id && order.product.id !== key) item.variants.add(order.product.id);
     item.units += order.quantity ?? 0;
     item.gmv += order.calcGmv ?? 0;
     item.netRevenue += calc.netRevenue;
     item.profit += calc.profit;
+    item.productCost += order.calcProductCost ?? 0;
 
     uniqueOrders.add(order.orderId);
     totalUnits += order.quantity ?? 0;
@@ -416,38 +475,106 @@ async function getAppProducts(req, res) {
     totalProfit += calc.profit;
   }
 
+  const metricRows = await prisma.productMetricDaily.findMany({
+    where: {
+      storeId: { in: storeIds },
+      metricDate: { gte: range.start, lte: range.end },
+    },
+    select: {
+      productId: true, externalId: true, marketplace: true, visits: true, clicks: true,
+      impressions: true, conversion: true,
+      product: { select: { id: true, parentId: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true, parent: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true } } } },
+      store: { select: { name: true, marketplace: true } },
+    },
+  });
+
+  for (const metric of metricRows) {
+    const baseProduct = metric.product?.parent ?? metric.product;
+    const baseName = normalizeProductName(baseProduct?.name ?? `Anúncio ${metric.externalId ?? ''}`.trim());
+    const key = baseProduct?.id ?? `external:${metric.externalId}`;
+
+    if (!products.has(key)) {
+      products.set(key, {
+        id: key,
+        name: baseName || 'Produto sem nome',
+        sku: baseProduct?.sku ?? null,
+        marketplace: metric.store?.marketplace ?? metric.marketplace,
+        storeName: metric.store?.name ?? null,
+        stock: baseProduct?.stock ?? null,
+        minStock: baseProduct?.minStock ?? null,
+        listPrice: baseProduct?.listPrice ?? null,
+        costPrice: baseProduct?.costPrice ?? null,
+        category: baseProduct?.category ?? null,
+        breakRisk: estimateBreakRisk(baseProduct ?? { name: baseName }),
+        variants: new Set(),
+        ordersSet: new Set(),
+        orders: 0,
+        units: 0,
+        gmv: 0,
+        netRevenue: 0,
+        profit: 0,
+        productCost: 0,
+        margin: 0,
+        avgTicket: 0,
+        visits: 0,
+        clicks: 0,
+        impressions: 0,
+        conversion: null,
+      });
+    }
+
+    const item = products.get(key);
+    item.visits = (item.visits ?? 0) + (metric.visits ?? 0);
+    item.clicks = (item.clicks ?? 0) + (metric.clicks ?? 0);
+    item.impressions = (item.impressions ?? 0) + (metric.impressions ?? 0);
+    if (metric.conversion != null) item.conversion = metric.conversion;
+  }
+
   const productList = Array.from(products.values()).map((item) => {
     const ordersCount = item.ordersSet.size;
     const margin = item.gmv > 0 ? r2((item.profit / item.gmv) * 100) : 0;
     const avgTicket = ordersCount > 0 ? r2(item.gmv / ordersCount) : 0;
+    const conversion = item.visits > 0 ? r2((ordersCount / item.visits) * 100) : item.conversion;
     const stockRisk = item.stock != null && item.minStock != null && item.stock <= item.minStock;
+    const avgUnitCost = item.units > 0 ? r2((item.productCost ?? 0) / item.units) : 0;
+    item.avgUnitCost = avgUnitCost;
+    const championScore = buildChampionScore(item);
     const investScore = r2(
       Math.max(0, item.profit) * 0.55 +
       Math.max(0, margin) * 8 +
       Math.max(0, item.units) * 3
     );
 
-    const { ordersSet, ...clean } = item;
+    const { ordersSet, variants, ...clean } = item;
     return {
       ...clean,
       orders: ordersCount,
+      variantCount: variants.size,
       gmv: r2(item.gmv),
       netRevenue: r2(item.netRevenue),
       profit: r2(item.profit),
       margin,
       avgTicket,
+      visits: item.visits ?? 0,
+      clicks: item.clicks ?? null,
+      impressions: item.impressions ?? null,
+      conversion,
+      avgUnitCost,
       stockRisk,
+      championScore: championScore.score,
+      scoreBreakdown: championScore,
       investScore,
       recommendation:
         item.profit < 0 ? 'Rever preço/custo antes de escalar' :
         stockRisk ? 'Vende bem, mas estoque pede atenção' :
+        item.visits > 0 && conversion != null && conversion < 1 ? 'Tem visita, mas converte pouco' :
         margin >= 15 && item.units >= 2 ? 'Bom candidato para investir' :
         'Acompanhar desempenho',
     };
   });
 
   const champions = [...productList]
-    .sort((a, b) => b.profit - a.profit || b.gmv - a.gmv)
+    .sort((a, b) => b.championScore - a.championScore || b.units - a.units || b.profit - a.profit)
     .slice(0, 8);
 
   const opportunities = [...productList]
@@ -456,14 +583,23 @@ async function getAppProducts(req, res) {
     .slice(0, 8);
 
   const attention = [...productList]
-    .filter((item) => item.profit < 0 || item.margin < 5 || item.stockRisk)
+    .filter((item) => item.profit < 0 || item.margin < 5 || item.stockRisk || (item.visits > 0 && item.conversion != null && item.conversion < 1))
     .sort((a, b) => a.profit - b.profit || a.margin - b.margin)
     .slice(0, 8);
+
+  const traffic = [...productList]
+    .filter((item) => item.visits > 0 || item.clicks > 0 || item.impressions > 0)
+    .sort((a, b) => (b.visits ?? 0) - (a.visits ?? 0))
+    .slice(0, 12);
 
   return res.json({
     period,
     periodLabel: range.label,
-    trafficAvailable: false,
+    trafficAvailable: traffic.length > 0,
+    championFormula: {
+      label: 'Quantidade vendida, menor risco estimado, recompra/custo baixo e lucro',
+      preciseSignals: { quantity: true, profit: true, breakRisk: false, reorderCost: false },
+    },
     summary: {
       products: productList.length,
       orders: uniqueOrders.size,
@@ -475,7 +611,80 @@ async function getAppProducts(req, res) {
     champions,
     opportunities,
     attention,
-    traffic: [],
+    traffic,
+  });
+}
+
+async function getAppProductMetrics(req, res) {
+  const { storeId, period = 'today' } = req.query;
+  const userId = req.userId;
+  const range = getPeriodRange(period);
+
+  const stores = await prisma.store.findMany({
+    where: { userId, ...(storeId ? { id: storeId } : {}) },
+    select: { id: true },
+  });
+  const storeIds = stores.map((store) => store.id);
+
+  const rows = await prisma.productMetricDaily.findMany({
+    where: {
+      storeId: { in: storeIds },
+      metricDate: { gte: range.start, lte: range.end },
+    },
+    select: {
+      storeId: true, productId: true, externalId: true, marketplace: true, metricDate: true,
+      visits: true, clicks: true, impressions: true, conversion: true, source: true,
+      product: { select: { id: true, parentId: true, name: true, sku: true, parent: { select: { id: true, name: true, sku: true } } } },
+      store: { select: { name: true, marketplace: true } },
+    },
+    orderBy: [{ metricDate: 'desc' }, { visits: 'desc' }],
+  });
+
+  const byProduct = new Map();
+  for (const row of rows) {
+    const baseProduct = row.product?.parent ?? row.product;
+    const key = baseProduct?.id ?? `external:${row.externalId}`;
+    if (!byProduct.has(key)) {
+      byProduct.set(key, {
+        id: key,
+        name: baseProduct?.name ?? `Anúncio ${row.externalId}`,
+        sku: baseProduct?.sku ?? null,
+        marketplace: row.store?.marketplace ?? row.marketplace,
+        storeName: row.store?.name ?? null,
+        visits: 0,
+        clicks: 0,
+        impressions: 0,
+        conversion: null,
+        days: [],
+      });
+    }
+
+    const item = byProduct.get(key);
+    item.visits += row.visits ?? 0;
+    item.clicks += row.clicks ?? 0;
+    item.impressions += row.impressions ?? 0;
+    if (row.conversion != null) item.conversion = row.conversion;
+    item.days.push({
+      date: row.metricDate,
+      visits: row.visits,
+      clicks: row.clicks,
+      impressions: row.impressions,
+      conversion: row.conversion,
+      source: row.source,
+    });
+  }
+
+  const products = Array.from(byProduct.values()).sort((a, b) => b.visits - a.visits);
+  return res.json({
+    period,
+    periodLabel: range.label,
+    summary: {
+      products: products.length,
+      visits: products.reduce((sum, item) => sum + item.visits, 0),
+      clicks: products.reduce((sum, item) => sum + (item.clicks ?? 0), 0),
+      impressions: products.reduce((sum, item) => sum + (item.impressions ?? 0), 0),
+    },
+    products,
   });
 }
 
@@ -634,4 +843,4 @@ async function getAppOrderDetail(req, res) {
   });
 }
 
-module.exports = { generateCode, verifyCode, getAppDashboard, getAppTrends, getAppProducts, getAppAlerts, getAppOrderDetail };
+module.exports = { generateCode, verifyCode, getAppDashboard, getAppTrends, getAppProducts, getAppProductMetrics, getAppAlerts, getAppOrderDetail };

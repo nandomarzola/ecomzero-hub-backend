@@ -77,6 +77,7 @@ model Store {
   shopeeSummaries  ShopeePeriodSummary[]
   monthlyClosings  MonthlyClosing[]
   storeRates       StoreRate[]
+  productMetrics   ProductMetricDaily[]
 }
 
 model Product {
@@ -106,6 +107,7 @@ model Product {
   createdAt  DateTime    @default(now())
   orders             Order[]
   purchaseOrderItems PurchaseOrderItem[]
+  metrics            ProductMetricDaily[]
   updatedAt          DateTime @default(now()) @updatedAt
 
   // ── Estoque composto (kit/variação de anúncio) ────────────────────────────
@@ -117,6 +119,29 @@ model Product {
   @@index([storeId])
   @@index([storeId, sku])
   @@index([storeId, externalId])   // ML/TikTok sync — findFirst por externalId em loop
+}
+
+model ProductMetricDaily {
+  id          String   @id @default(uuid())
+  storeId     String
+  store       Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  productId   String?
+  product     Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  marketplace String
+  externalId  String?
+  metricDate  DateTime
+  visits      Int      @default(0)
+  clicks      Int?
+  impressions Int?
+  conversion  Float?
+  source      String   @default("api")
+  raw         Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([storeId, externalId, metricDate])
+  @@index([storeId, metricDate])
+  @@index([productId, metricDate])
 }
 
 // ── Variações de anúncio (Shopee model_id) com custo independente ───────────

@@ -620,4 +620,28 @@ async function syncItems(req, res) {
   }
 }
 
-module.exports = { getAuth, handleCallback, getStatus, disconnect, refreshToken, syncOrders, syncItems };
+// POST /api/shopee/sync-traffic
+// A integração atual da Shopee cobre pedidos, repasses e catálogo. Tráfego de
+// produto depende de endpoints/escopos de insights que não estão ligados neste
+// backend ainda; retornar 501 impede que o app trate estimativa como dado real.
+async function syncTraffic(req, res) {
+  const { storeId } = req.body;
+  if (!storeId) return res.status(400).json({ error: 'storeId obrigatório' });
+
+  const store = await prisma.store.findFirst({
+    where: { id: storeId, userId: req.userId },
+    select: { id: true, spAccessToken: true, spShopId: true },
+  });
+  if (!store) return res.status(404).json({ error: 'Loja não encontrada' });
+  if (!store.spAccessToken || !store.spShopId) {
+    return res.status(400).json({ error: 'Loja não conectada à Shopee' });
+  }
+
+  return res.status(501).json({
+    error: 'Tráfego Shopee ainda não implementado.',
+    message: 'Pedidos, produtos e repasses já são sincronizados. Visitas/conversão de produto precisam do endpoint oficial de insights/ads habilitado para esta conta antes de gravar ProductMetricDaily.',
+    synced: 0,
+  });
+}
+
+module.exports = { getAuth, handleCallback, getStatus, disconnect, refreshToken, syncOrders, syncItems, syncTraffic };

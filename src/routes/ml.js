@@ -2,7 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const rateLimit = require('express-rate-limit');
 const { authMiddleware } = require('../middleware/auth');
-const { getAuth, handleCallback, getStatus, disconnect, syncOrders, syncItems } = require('../controllers/mlController');
+const { getAuth, handleCallback, getStatus, disconnect, syncOrders, syncItems, syncTraffic } = require('../controllers/mlController');
 
 const syncLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -23,5 +23,6 @@ router.get('/status',      getStatus);
 router.post('/disconnect',  disconnect);
 router.post('/sync',        syncLimiter, syncOrders);
 router.post('/sync-items',  syncLimiter, syncItems);
+router.post('/sync-traffic', syncLimiter, syncTraffic);
 
 module.exports = router;
