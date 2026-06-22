@@ -107,7 +107,8 @@ function getPeriodRange(period = 'today') {
   }
 
   if (period === '7d') {
-    startParts = addDaysToParts(today, -6);
+    startParts = addDaysToParts(today, -7);
+    endParts   = addDaysToParts(today, -1);
     return {
       start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
       end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
@@ -117,7 +118,8 @@ function getPeriodRange(period = 'today') {
   }
 
   if (period === '30d') {
-    startParts = addDaysToParts(today, -29);
+    startParts = addDaysToParts(today, -30);
+    endParts   = addDaysToParts(today, -1);
     return {
       start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
       end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
