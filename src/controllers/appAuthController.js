@@ -372,6 +372,7 @@ async function getAppDashboard(req, res) {
     month,
     period,
     periodLabel: range.label,
+    periodRange: { start: range.start, end: range.end, timezone: range.timezone },
     summary: {
       gmv:    r2(totalGmv),
       netRevenue: r2(totalNetRevenue),
@@ -474,6 +475,7 @@ async function getAppTrends(req, res) {
   return res.json({
     period,
     periodLabel: range.label,
+    periodRange: { start: range.start, end: range.end, timezone: range.timezone },
     chart, // [{ date, gmv, profit, orders }]
     summary: { gmv: totalGmv, profit: totalProfit, orders: totalOrders, margin: avgMargin, avgTicket },
   });
@@ -722,6 +724,7 @@ async function getAppProducts(req, res) {
   return res.json({
     period,
     periodLabel: range.label,
+    periodRange: { start: range.start, end: range.end, timezone: range.timezone },
     trafficAvailable: traffic.length > 0,
     championFormula: {
       label: 'Quantidade vendida, menor risco estimado, recompra/custo baixo e lucro',
@@ -820,6 +823,7 @@ async function getAppProductMetrics(req, res) {
   return res.json({
     period,
     periodLabel: range.label,
+    periodRange: { start: range.start, end: range.end, timezone: range.timezone },
     summary: {
       products: products.length,
       visits: products.reduce((sum, item) => sum + item.visits, 0),
