@@ -62,40 +62,100 @@ async function verifyCode(req, res) {
   });
 }
 
+const APP_TIMEZONE = 'America/Sao_Paulo';
+
+function getZonedParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const out = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') out[part.type] = Number(part.value);
+  }
+  return out;
+}
+
+function saoPauloDateToUtc(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
+  // Brasil não usa horário de verão desde 2019. A Shopee BR e o export diário
+  // seguem o dia local; no Render o Node roda em UTC, então fixamos UTC-03.
+  return new Date(Date.UTC(year, month - 1, day, hour + 3, minute, second, millisecond));
+}
+
+function addDaysToParts(parts, days) {
+  const date = saoPauloDateToUtc(parts.year, parts.month, parts.day + days);
+  return getZonedParts(date);
+}
+
 function getPeriodRange(period = 'today') {
   const now = new Date();
-  const start = new Date(now);
-  const end = new Date(now);
-  end.setMilliseconds(999);
+  const today = getZonedParts(now);
+  let startParts = { ...today };
+  let endParts = { ...today };
 
   if (period === 'yesterday' || period === 'ontem') {
-    start.setDate(start.getDate() - 1);
-    start.setHours(0, 0, 0, 0);
-    end.setDate(end.getDate() - 1);
-    end.setHours(23, 59, 59, 999);
-    return { start, end, label: 'Ontem' };
+    startParts = addDaysToParts(today, -1);
+    endParts = { ...startParts };
+    return {
+      start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+      end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+      label: 'Ontem',
+      timezone: APP_TIMEZONE,
+    };
   }
 
   if (period === '7d') {
-    start.setDate(start.getDate() - 6);
-    start.setHours(0, 0, 0, 0);
-    return { start, end, label: '7 dias' };
+    startParts = addDaysToParts(today, -6);
+    return {
+      start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+      end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+      label: '7 dias',
+      timezone: APP_TIMEZONE,
+    };
   }
 
   if (period === '30d') {
-    start.setDate(start.getDate() - 29);
-    start.setHours(0, 0, 0, 0);
-    return { start, end, label: '30 dias' };
+    startParts = addDaysToParts(today, -29);
+    return {
+      start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+      end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+      label: '30 dias',
+      timezone: APP_TIMEZONE,
+    };
   }
 
   if (period === 'month' || period === 'mes') {
-    start.setDate(1);
-    start.setHours(0, 0, 0, 0);
-    return { start, end, label: 'Mês' };
+    startParts = { ...today, day: 1 };
+    return {
+      start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+      end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+      label: 'Mês',
+      timezone: APP_TIMEZONE,
+    };
   }
 
-  start.setHours(0, 0, 0, 0);
-  return { start, end, label: 'Hoje' };
+  return {
+    start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+    end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+    label: 'Hoje',
+    timezone: APP_TIMEZONE,
+  };
+}
+
+function orderPeriodWhere(range) {
+  return {
+    OR: [
+      { orderCreatedAt: { gte: range.start, lte: range.end } },
+      { orderCreatedAt: null, soldAt: { gte: range.start, lte: range.end } },
+    ],
+  };
+}
+
+function formatSaoPauloDay(date) {
+  const parts = getZonedParts(date);
+  return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
 }
 
 function calcOrderProfit(order, taxRateMap) {
@@ -195,10 +255,12 @@ async function getAppDashboard(req, res) {
   const userId = req.userId;
 
   const now   = new Date();
-  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startOfDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const range = getPeriodRange(period);
+  const todayRange = getPeriodRange('today');
+  const monthRange = getPeriodRange('month');
+  const nowParts = getZonedParts(now);
+  const month = `${nowParts.year}-${String(nowParts.month).padStart(2, '0')}`;
+  const startOfYear = saoPauloDateToUtc(nowParts.year, 1, 1);
 
   // Buscar lojas do usuário
   const stores = await prisma.store.findMany({
@@ -210,12 +272,10 @@ async function getAppDashboard(req, res) {
 
   if (storeIds.length === 0) return res.json({ stores: [], summary: null });
 
-  // GMV do ano (1° de janeiro até agora)
-  const startOfYear = new Date(now.getFullYear(), 0, 1);
   const yearOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: startOfYear },
+      ...orderPeriodWhere({ start: startOfYear, end: now }),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
       calcGmv: { gt: 0 },
     },
@@ -228,10 +288,10 @@ async function getAppDashboard(req, res) {
   const allPeriodOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: range.start, lte: range.end },
+      ...orderPeriodWhere(range),
     },
     select: {
-      id: true, storeId: true, soldAt: true, quantity: true,
+      id: true, storeId: true, soldAt: true, orderCreatedAt: true, quantity: true,
       orderId: true, // para contar pedidos únicos (1 pedido multi-item = N linhas com mesmo orderId)
       calcGmv: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
@@ -245,7 +305,7 @@ async function getAppDashboard(req, res) {
   const monthOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: startOfMonth },
+      ...orderPeriodWhere(monthRange),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -285,8 +345,8 @@ async function getAppDashboard(req, res) {
     totalItems  += 1;
     uniqueOrderIds.add(o.orderId);
 
-    const orderDate = new Date(o.soldAt);
-    if (orderDate >= startOfDay) {
+    const orderDate = new Date(o.orderCreatedAt ?? o.soldAt);
+    if (orderDate >= todayRange.start && orderDate <= todayRange.end) {
       todayGmv    += o.calcGmv;
       todayProfit += calc.profit;
       todayItems  += 1;
@@ -301,8 +361,8 @@ async function getAppDashboard(req, res) {
   }
 
   // Projeção do mês
-  const daysElapsed = now.getDate();
-  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const daysElapsed = nowParts.day;
+  const daysInMonth = new Date(Date.UTC(nowParts.year, nowParts.month, 0)).getUTCDate();
   const monthGmv = r2(monthOrders.reduce((sum, order) => sum + (order.calcGmv ?? 0), 0));
   const monthProfit = r2(monthOrders.reduce((sum, order) => sum + calcOrderProfit(order, taxRateMap).profit, 0));
   const projectedGmv    = daysElapsed > 0 ? r2(monthGmv    / daysElapsed * daysInMonth) : 0;
@@ -370,11 +430,11 @@ async function getAppTrends(req, res) {
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: range.start, lte: range.end },
+      ...orderPeriodWhere(range),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
-      storeId: true, soldAt: true, calcGmv: true,
+      storeId: true, soldAt: true, orderCreatedAt: true, calcGmv: true,
       platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
@@ -388,7 +448,7 @@ async function getAppTrends(req, res) {
   const uniqueOrders = new Set();
 
   for (const o of orders) {
-    const day = o.soldAt.toISOString().substring(0, 10);
+    const day = formatSaoPauloDay(o.orderCreatedAt ?? o.soldAt);
     if (!byDay[day]) byDay[day] = { date: day, gmv: 0, profit: 0, orders: 0 };
 
     const taxRate = taxRateMap[o.storeId] ?? 0;
@@ -447,7 +507,7 @@ async function getAppProducts(req, res) {
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: range.start, lte: range.end },
+      ...orderPeriodWhere(range),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -785,17 +845,16 @@ async function getAppAlerts(req, res) {
   const storeIds = stores.map(s => s.id);
   const taxRateMap = Object.fromEntries(stores.map(s => [s.id, s.taxRate ?? 0]));
 
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const week  = new Date(today); week.setDate(week.getDate() - 7);
+  const todayRange = getPeriodRange('today');
+  const weekRange = getPeriodRange('7d');
 
   const [todayOrders, weekOrders, noCostCount] = await Promise.all([
     prisma.order.findMany({
-      where: { storeId: { in: storeIds }, soldAt: { gte: today }, orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      where: { storeId: { in: storeIds }, ...orderPeriodWhere(todayRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
       select: { calcGmv: true, platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true, calcPackaging: true, orderCategory: true, storeId: true, productName: true, orderId: true },
     }),
     prisma.order.findMany({
-      where: { storeId: { in: storeIds }, soldAt: { gte: week }, orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      where: { storeId: { in: storeIds }, ...orderPeriodWhere(weekRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
       select: { calcGmv: true, platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true, calcPackaging: true, orderCategory: true, storeId: true },
     }),
     prisma.product.count({ where: { storeId: { in: storeIds }, costPrice: 0 } }),
@@ -819,7 +878,7 @@ async function getAppAlerts(req, res) {
   }
 
   // Devoluções aguardando
-  const returns = await prisma.order.count({ where: { storeId: { in: storeIds }, soldAt: { gte: today }, orderCategory: { in: ['returned_full', 'returned_partial'] } } });
+  const returns = await prisma.order.count({ where: { storeId: { in: storeIds }, ...orderPeriodWhere(todayRange), orderCategory: { in: ['returned_full', 'returned_partial'] } } });
   if (returns > 0) {
     alerts.push({ type: 'return', priority: 'high', title: `${returns} devolução${returns > 1 ? 'ões' : ''} aguardando`, subtitle: `Verifique os pedidos devolvidos hoje`, time: new Date().toISOString() });
   }
