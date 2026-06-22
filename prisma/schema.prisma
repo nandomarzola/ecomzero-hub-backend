@@ -134,6 +134,9 @@ model ProductMetricDaily {
   clicks      Int?
   impressions Int?
   conversion  Float?
+  adSpend     Float?
+  adRevenue   Float?
+  adOrders    Int?
   source      String   @default("api")
   raw         Json?
   createdAt   DateTime @default(now())

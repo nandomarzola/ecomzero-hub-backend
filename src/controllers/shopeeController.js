@@ -15,6 +15,7 @@ const {
   fetchItemList,
   fetchItemBaseInfo,
   fetchModelList,
+  fetchShopeeAdsProductMetrics,
 } = require('../services/shopeeService');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
 const { importProgress } = require('../lib/importProgress');
@@ -620,27 +621,126 @@ async function syncItems(req, res) {
   }
 }
 
-// POST /api/shopee/sync-traffic
-// A integração atual da Shopee cobre pedidos, repasses e catálogo. Tráfego de
-// produto depende de endpoints/escopos de insights que não estão ligados neste
-// backend ainda; retornar 501 impede que o app trate estimativa como dado real.
+// POST /api/shopee/sync-traffic — sincroniza performance de Ads por produto.
+// A Open API lista performance em Ads/GMS; isso não é tráfego orgânico puro,
+// mas já dá cliques, impressões, gasto e vendas atribuídas quando a conta tem
+// escopo liberado.
 async function syncTraffic(req, res) {
-  const { storeId } = req.body;
-  if (!storeId) return res.status(400).json({ error: 'storeId obrigatório' });
+  const { storeId, dateFrom, dateTo } = req.body;
+  if (!storeId || !dateFrom || !dateTo) {
+    return res.status(400).json({ error: 'storeId, dateFrom e dateTo são obrigatórios' });
+  }
 
-  const store = await prisma.store.findFirst({
-    where: { id: storeId, userId: req.userId },
-    select: { id: true, spAccessToken: true, spShopId: true },
-  });
+  const store = await prisma.store.findFirst({ where: { id: storeId, userId: req.userId } });
   if (!store) return res.status(404).json({ error: 'Loja não encontrada' });
   if (!store.spAccessToken || !store.spShopId) {
     return res.status(400).json({ error: 'Loja não conectada à Shopee' });
   }
 
-  return res.status(501).json({
-    error: 'Tráfego Shopee ainda não implementado.',
-    message: 'Pedidos, produtos e repasses já são sincronizados. Visitas/conversão de produto precisam do endpoint oficial de insights/ads habilitado para esta conta antes de gravar ProductMetricDaily.',
-    synced: 0,
+  let accessToken;
+  try {
+    accessToken = await ensureFreshToken(store);
+  } catch {
+    return res.status(401).json({ error: 'Token expirado — reconecte a Shopee' });
+  }
+
+  const products = await prisma.product.findMany({
+    where: { storeId, externalId: { not: null } },
+    select: { id: true, externalId: true },
+  });
+  const byExternalId = new Map(products.map((p) => [String(p.externalId), p]));
+
+  let result;
+  try {
+    result = await fetchShopeeAdsProductMetrics(accessToken, store.spShopId, dateFrom, dateTo);
+  } catch (err) {
+    return res.status(502).json({ error: 'Erro ao consultar Shopee Ads: ' + err.message });
+  }
+
+  const metricsByDay = new Map();
+  for (const row of result.rows) {
+    const metricDate = new Date(row.date);
+    metricDate.setUTCHours(0, 0, 0, 0);
+    const key = `${row.itemId}:${metricDate.toISOString()}`;
+    if (!metricsByDay.has(key)) {
+      metricsByDay.set(key, {
+        itemId: String(row.itemId),
+        metricDate,
+        visits: 0,
+        clicks: 0,
+        impressions: 0,
+        adSpend: 0,
+        adRevenue: 0,
+        adOrders: 0,
+        conversion: null,
+        sources: new Set(),
+        raw: [],
+      });
+    }
+    const metric = metricsByDay.get(key);
+    metric.visits += row.visits ?? 0;
+    metric.clicks += row.clicks ?? 0;
+    metric.impressions += row.impressions ?? 0;
+    metric.adSpend += row.adSpend ?? 0;
+    metric.adRevenue += row.adRevenue ?? 0;
+    metric.adOrders += row.adOrders ?? 0;
+    if (row.conversion != null) metric.conversion = row.conversion;
+    metric.sources.add(row.source);
+    metric.raw.push(row.raw);
+  }
+
+  let synced = 0;
+  for (const row of metricsByDay.values()) {
+    const product = byExternalId.get(String(row.itemId));
+    if (!product) continue;
+
+    await prisma.productMetricDaily.upsert({
+      where: {
+        storeId_externalId_metricDate: {
+          storeId,
+          externalId: String(row.itemId),
+          metricDate: row.metricDate,
+        },
+      },
+      create: {
+        storeId,
+        productId: product.id,
+        marketplace: 'shopee',
+        externalId: String(row.itemId),
+        metricDate: row.metricDate,
+        visits: row.visits ?? 0,
+        clicks: row.clicks,
+        impressions: row.impressions,
+        conversion: row.conversion,
+        adSpend: row.adSpend,
+        adRevenue: row.adRevenue,
+        adOrders: row.adOrders != null ? Math.round(row.adOrders) : null,
+        source: Array.from(row.sources).join('+'),
+        raw: row.raw,
+      },
+      update: {
+        productId: product.id,
+        visits: row.visits ?? 0,
+        clicks: row.clicks,
+        impressions: row.impressions,
+        conversion: row.conversion,
+        adSpend: row.adSpend,
+        adRevenue: row.adRevenue,
+        adOrders: row.adOrders != null ? Math.round(row.adOrders) : null,
+        source: Array.from(row.sources).join('+'),
+        raw: row.raw,
+      },
+    });
+    synced++;
+  }
+
+  return res.json({
+    synced,
+    totalProducts: products.length,
+    rows: result.rows.length,
+    errors: result.errors,
+    metricType: 'ads_performance',
+    note: 'Métricas Shopee vindas de Ads/GMS; não representam tráfego orgânico total do produto.',
   });
 }
 

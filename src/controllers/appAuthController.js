@@ -482,7 +482,7 @@ async function getAppProducts(req, res) {
     },
     select: {
       productId: true, externalId: true, marketplace: true, visits: true, clicks: true,
-      impressions: true, conversion: true,
+      impressions: true, conversion: true, adSpend: true, adRevenue: true, adOrders: true,
       product: { select: { id: true, parentId: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true, parent: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true, costPrice: true, category: true } } } },
       store: { select: { name: true, marketplace: true } },
     },
@@ -519,6 +519,9 @@ async function getAppProducts(req, res) {
         visits: 0,
         clicks: 0,
         impressions: 0,
+        adSpend: 0,
+        adRevenue: 0,
+        adOrders: 0,
         conversion: null,
       });
     }
@@ -527,6 +530,9 @@ async function getAppProducts(req, res) {
     item.visits = (item.visits ?? 0) + (metric.visits ?? 0);
     item.clicks = (item.clicks ?? 0) + (metric.clicks ?? 0);
     item.impressions = (item.impressions ?? 0) + (metric.impressions ?? 0);
+    item.adSpend = (item.adSpend ?? 0) + (metric.adSpend ?? 0);
+    item.adRevenue = (item.adRevenue ?? 0) + (metric.adRevenue ?? 0);
+    item.adOrders = (item.adOrders ?? 0) + (metric.adOrders ?? 0);
     if (metric.conversion != null) item.conversion = metric.conversion;
   }
 
@@ -535,6 +541,8 @@ async function getAppProducts(req, res) {
     const margin = item.gmv > 0 ? r2((item.profit / item.gmv) * 100) : 0;
     const avgTicket = ordersCount > 0 ? r2(item.gmv / ordersCount) : 0;
     const conversion = item.visits > 0 ? r2((ordersCount / item.visits) * 100) : item.conversion;
+    const adsRoi = item.adSpend > 0 ? r2((item.adRevenue ?? 0) / item.adSpend) : null;
+    const acos = item.adRevenue > 0 ? r2(((item.adSpend ?? 0) / item.adRevenue) * 100) : null;
     const stockRisk = item.stock != null && item.minStock != null && item.stock <= item.minStock;
     const avgUnitCost = item.units > 0 ? r2((item.productCost ?? 0) / item.units) : 0;
     item.avgUnitCost = avgUnitCost;
@@ -542,7 +550,9 @@ async function getAppProducts(req, res) {
     const investScore = r2(
       Math.max(0, item.profit) * 0.55 +
       Math.max(0, margin) * 8 +
-      Math.max(0, item.units) * 3
+      Math.max(0, item.units) * 3 +
+      (adsRoi != null && adsRoi > 1 ? adsRoi * 25 : 0) -
+      (item.adSpend > 0 && (!item.adRevenue || item.adRevenue <= item.adSpend) ? item.adSpend * 0.2 : 0)
     );
 
     const { ordersSet, variants, ...clean } = item;
@@ -558,6 +568,11 @@ async function getAppProducts(req, res) {
       visits: item.visits ?? 0,
       clicks: item.clicks ?? null,
       impressions: item.impressions ?? null,
+      adSpend: r2(item.adSpend ?? 0),
+      adRevenue: r2(item.adRevenue ?? 0),
+      adOrders: item.adOrders ?? 0,
+      adsRoi,
+      acos,
       conversion,
       avgUnitCost,
       stockRisk,
@@ -567,6 +582,8 @@ async function getAppProducts(req, res) {
       recommendation:
         item.profit < 0 ? 'Rever preço/custo antes de escalar' :
         stockRisk ? 'Vende bem, mas estoque pede atenção' :
+        item.adSpend > 0 && item.adRevenue > item.adSpend ? 'Ads com retorno: bom candidato para investir' :
+        item.adSpend > 0 && (!item.adRevenue || item.adRevenue <= item.adSpend) ? 'Ads consome verba sem retorno suficiente' :
         item.visits > 0 && conversion != null && conversion < 1 ? 'Tem visita, mas converte pouco' :
         margin >= 15 && item.units >= 2 ? 'Bom candidato para investir' :
         'Acompanhar desempenho',
@@ -588,8 +605,8 @@ async function getAppProducts(req, res) {
     .slice(0, 8);
 
   const traffic = [...productList]
-    .filter((item) => item.visits > 0 || item.clicks > 0 || item.impressions > 0)
-    .sort((a, b) => (b.visits ?? 0) - (a.visits ?? 0))
+    .filter((item) => item.visits > 0 || item.clicks > 0 || item.impressions > 0 || item.adSpend > 0)
+    .sort((a, b) => (b.visits ?? 0) - (a.visits ?? 0) || (b.clicks ?? 0) - (a.clicks ?? 0))
     .slice(0, 12);
 
   return res.json({
@@ -633,7 +650,8 @@ async function getAppProductMetrics(req, res) {
     },
     select: {
       storeId: true, productId: true, externalId: true, marketplace: true, metricDate: true,
-      visits: true, clicks: true, impressions: true, conversion: true, source: true,
+      visits: true, clicks: true, impressions: true, conversion: true,
+      adSpend: true, adRevenue: true, adOrders: true, source: true,
       product: { select: { id: true, parentId: true, name: true, sku: true, parent: { select: { id: true, name: true, sku: true } } } },
       store: { select: { name: true, marketplace: true } },
     },
@@ -654,6 +672,9 @@ async function getAppProductMetrics(req, res) {
         visits: 0,
         clicks: 0,
         impressions: 0,
+        adSpend: 0,
+        adRevenue: 0,
+        adOrders: 0,
         conversion: null,
         days: [],
       });
@@ -663,6 +684,9 @@ async function getAppProductMetrics(req, res) {
     item.visits += row.visits ?? 0;
     item.clicks += row.clicks ?? 0;
     item.impressions += row.impressions ?? 0;
+    item.adSpend += row.adSpend ?? 0;
+    item.adRevenue += row.adRevenue ?? 0;
+    item.adOrders += row.adOrders ?? 0;
     if (row.conversion != null) item.conversion = row.conversion;
     item.days.push({
       date: row.metricDate,
@@ -670,6 +694,9 @@ async function getAppProductMetrics(req, res) {
       clicks: row.clicks,
       impressions: row.impressions,
       conversion: row.conversion,
+      adSpend: row.adSpend,
+      adRevenue: row.adRevenue,
+      adOrders: row.adOrders,
       source: row.source,
     });
   }
@@ -683,6 +710,9 @@ async function getAppProductMetrics(req, res) {
       visits: products.reduce((sum, item) => sum + item.visits, 0),
       clicks: products.reduce((sum, item) => sum + (item.clicks ?? 0), 0),
       impressions: products.reduce((sum, item) => sum + (item.impressions ?? 0), 0),
+      adSpend: r2(products.reduce((sum, item) => sum + (item.adSpend ?? 0), 0)),
+      adRevenue: r2(products.reduce((sum, item) => sum + (item.adRevenue ?? 0), 0)),
+      adOrders: products.reduce((sum, item) => sum + (item.adOrders ?? 0), 0),
     },
     products,
   });

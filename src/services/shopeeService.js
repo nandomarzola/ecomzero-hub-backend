@@ -1,4 +1,4 @@
-const { shopApiGet } = require('./shopeeAuthService');
+const { shopApiGet, shopApiPost } = require('./shopeeAuthService');
 const { calcOrderProfit } = require('./calculatorService');
 const { r2 } = require('../lib/utils');
 
@@ -358,6 +358,140 @@ async function fetchModelList(accessToken, shopId, itemId) {
   });
 }
 
+function toNumber(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const num = Number(String(value).replace(',', '.'));
+  return Number.isFinite(num) ? num : null;
+}
+
+function firstNumber(row, keys) {
+  for (const key of keys) {
+    const value = toNumber(row?.[key]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
+function firstValue(row, keys) {
+  for (const key of keys) {
+    const value = row?.[key];
+    if (value != null && value !== '') return value;
+  }
+  return null;
+}
+
+function findMetricArrays(node, out = []) {
+  if (!node || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    if (node.some((item) => item && typeof item === 'object')) out.push(node);
+    for (const item of node) findMetricArrays(item, out);
+    return out;
+  }
+  for (const value of Object.values(node)) findMetricArrays(value, out);
+  return out;
+}
+
+function normalizeShopeeAdsDate(value, fallbackDate) {
+  if (!value) return new Date(`${String(fallbackDate).substring(0, 10)}T00:00:00.000Z`);
+  if (typeof value === 'number') {
+    const millis = value > 100000000000 ? value : value * 1000;
+    const date = new Date(millis);
+    date.setUTCHours(0, 0, 0, 0);
+    return date;
+  }
+  const text = String(value);
+  const normalized = /^\d{8}$/.test(text)
+    ? `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`
+    : text.substring(0, 10);
+  return new Date(`${normalized}T00:00:00.000Z`);
+}
+
+function normalizeShopeeAdsRow(row, source, fallbackDate) {
+  const nestedProduct = row.product ?? row.item ?? row.product_info ?? {};
+  const externalId = firstValue(row, ['item_id', 'product_id', 'itemid', 'itemId', 'ads_item_id', 'campaign_item_id'])
+    ?? firstValue(nestedProduct, ['item_id', 'product_id', 'itemid', 'itemId']);
+  if (!externalId) return null;
+
+  const clicks = firstNumber(row, ['clicks', 'click', 'total_clicks', 'ad_clicks']);
+  const visits = firstNumber(row, ['visits', 'view_count', 'visitor_count', 'product_visits']);
+  const impressions = firstNumber(row, ['impressions', 'impression', 'views', 'total_impressions', 'ad_impressions']);
+  const adSpend = firstNumber(row, ['expense', 'spend', 'cost', 'ads_spend', 'ad_spend', 'total_expense']);
+  const adRevenue = firstNumber(row, ['gmv', 'sales', 'revenue', 'direct_sales', 'broad_sales', 'ads_gmv', 'order_amount']);
+  const adOrders = firstNumber(row, ['orders', 'order_count', 'checkout_count', 'sales_count', 'direct_order_count']);
+  const conversion = firstNumber(row, ['conversion', 'conversion_rate', 'cr', 'order_rate']);
+  const dateRaw = firstValue(row, ['date', 'report_date', 'statistic_date', 'performance_date', 'day']);
+
+  return {
+    itemId: String(externalId),
+    date: normalizeShopeeAdsDate(dateRaw, fallbackDate),
+    visits: visits ?? 0,
+    clicks,
+    impressions,
+    conversion,
+    adSpend,
+    adRevenue,
+    adOrders,
+    source,
+    raw: row,
+  };
+}
+
+async function callShopeeAdsEndpoint(accessToken, shopId, endpoint, request) {
+  const path = `/api/v2/ads/${endpoint}`;
+  const getRes = await shopApiGet(path, accessToken, shopId, request).catch((err) => ({ error: 'request_error', message: err.message }));
+  if (!getRes?.error) return getRes;
+
+  const postRes = await shopApiPost(path, accessToken, shopId, request).catch((err) => ({ error: 'request_error', message: err.message }));
+  return postRes?.error ? { ...postRes, getError: getRes } : postRes;
+}
+
+async function fetchShopeeAdsProductMetrics(accessToken, shopId, dateFrom, dateTo) {
+  const from = new Date(dateFrom);
+  const to = new Date(dateTo);
+  const startDate = from.toISOString().substring(0, 10);
+  const endDate = to.toISOString().substring(0, 10);
+  const startTime = Math.floor(from.getTime() / 1000);
+  const endTime = Math.floor(to.getTime() / 1000);
+  const attempts = [
+    {
+      endpoint: 'get_product_campaign_daily_performance',
+      source: 'shopee_ads_product_campaign_daily',
+      request: { start_date: startDate, end_date: endDate, start_time: startTime, end_time: endTime, page_size: 100 },
+    },
+    {
+      endpoint: 'get_gms_item_performance',
+      source: 'shopee_ads_gms_item',
+      request: { start_date: startDate, end_date: endDate, start_time: startTime, end_time: endTime, page_size: 100 },
+    },
+    {
+      endpoint: 'get_all_cpc_ads_daily_performance',
+      source: 'shopee_ads_cpc_daily',
+      request: { start_date: startDate, end_date: endDate, start_time: startTime, end_time: endTime, page_size: 100 },
+    },
+  ];
+
+  const rows = [];
+  const errors = [];
+  for (const attempt of attempts) {
+    const response = await callShopeeAdsEndpoint(accessToken, shopId, attempt.endpoint, attempt.request);
+    if (response?.error) {
+      errors.push({ endpoint: attempt.endpoint, error: response.error, message: response.message, getError: response.getError });
+      continue;
+    }
+
+    const arrays = findMetricArrays(response?.response ?? response);
+    for (const list of arrays) {
+      for (const row of list) {
+        const normalized = normalizeShopeeAdsRow(row, attempt.source, endDate);
+        if (normalized && normalized.date >= from && normalized.date <= to) rows.push(normalized);
+      }
+    }
+  }
+
+  return { rows, errors };
+}
+
 module.exports = {
   fetchOrderList,
   fetchOrderDetails,
@@ -368,4 +502,5 @@ module.exports = {
   fetchItemList,
   fetchItemBaseInfo,
   fetchModelList,
+  fetchShopeeAdsProductMetrics,
 };

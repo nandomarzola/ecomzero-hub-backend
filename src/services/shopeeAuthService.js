@@ -165,4 +165,26 @@ async function shopApiGet(path, accessToken, shopId, extraParams = {}) {
   return data;
 }
 
-module.exports = { isConfigured, getAuthUrl, exchangeToken, refreshShopeeToken, getShopInfo, shopApiGet };
+// ── Helper genérico para chamadas autenticadas de loja (POST) ─────────────────
+async function shopApiPost(path, accessToken, shopId, body = {}, extraParams = {}) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const sid       = parseInt(shopId, 10);
+  const sig       = makeShopSign(path, timestamp, accessToken, sid);
+
+  const data = await httpsPost(
+    path,
+    {
+      partner_id:   PARTNER_ID,
+      timestamp,
+      sign:         sig,
+      access_token: accessToken,
+      shop_id:      sid,
+      ...extraParams,
+    },
+    body,
+  );
+
+  return data;
+}
+
+module.exports = { isConfigured, getAuthUrl, exchangeToken, refreshShopeeToken, getShopInfo, shopApiGet, shopApiPost };
