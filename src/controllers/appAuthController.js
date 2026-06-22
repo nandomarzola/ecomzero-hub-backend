@@ -62,14 +62,63 @@ async function verifyCode(req, res) {
   });
 }
 
+function getPeriodRange(period = 'today') {
+  const now = new Date();
+  const start = new Date(now);
+  const end = new Date(now);
+  end.setMilliseconds(999);
+
+  if (period === 'yesterday' || period === 'ontem') {
+    start.setDate(start.getDate() - 1);
+    start.setHours(0, 0, 0, 0);
+    end.setDate(end.getDate() - 1);
+    end.setHours(23, 59, 59, 999);
+    return { start, end, label: 'Ontem' };
+  }
+
+  if (period === '7d') {
+    start.setDate(start.getDate() - 6);
+    start.setHours(0, 0, 0, 0);
+    return { start, end, label: '7 dias' };
+  }
+
+  if (period === '30d') {
+    start.setDate(start.getDate() - 29);
+    start.setHours(0, 0, 0, 0);
+    return { start, end, label: '30 dias' };
+  }
+
+  if (period === 'month' || period === 'mes') {
+    start.setDate(1);
+    start.setHours(0, 0, 0, 0);
+    return { start, end, label: 'Mês' };
+  }
+
+  start.setHours(0, 0, 0, 0);
+  return { start, end, label: 'Hoje' };
+}
+
+function calcOrderProfit(order, taxRateMap) {
+  const taxRate = taxRateMap[order.storeId] ?? 0;
+  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const disc = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const repasse = order.orderCategory === 'valid' && order.escrowAmount != null
+    ? r2(order.escrowAmount)
+    : r2((order.calcGmv ?? 0) - fee - disc);
+  const tax = r2((order.calcGmv ?? 0) * (taxRate / 100));
+  const profit = r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
+  return { fee, discount: disc, netRevenue: repasse, tax, profit };
+}
+
 async function getAppDashboard(req, res) {
-  const { storeId } = req.query;
+  const { storeId, period = 'today' } = req.query;
   const userId = req.userId;
 
   const now   = new Date();
   const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
   const startOfDay   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const range = getPeriodRange(period);
 
   // Buscar lojas do usuário
   const stores = await prisma.store.findMany({
@@ -94,20 +143,20 @@ async function getAppDashboard(req, res) {
   });
   const yearGmv = r2(yearOrders.reduce((s, o) => s + (o.calcGmv ?? 0), 0));
 
-  // Devoluções e cancelamentos do dia
-  const todayReturns = await prisma.order.count({
+  // Devoluções e cancelamentos no período selecionado
+  const periodReturns = await prisma.order.count({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: startOfDay },
+      soldAt: { gte: range.start, lte: range.end },
       orderCategory: { in: ['returned_full', 'returned_partial', 'cancelled_other', 'cancelled_unpaid'] },
     },
   });
 
-  // Pedidos do mês com receita
+  // Pedidos do período selecionado com receita
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: startOfMonth },
+      soldAt: { gte: range.start, lte: range.end },
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -120,11 +169,24 @@ async function getAppDashboard(req, res) {
     },
   });
 
+  const monthOrders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      soldAt: { gte: startOfMonth },
+      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+    },
+    select: {
+      storeId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+      sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
+      calcPackaging: true, orderCategory: true,
+    },
+  });
+
   // Calcular por loja (recompute do raw)
   const byStore = {};
-  for (const s of stores) byStore[s.id] = { storeId: s.id, name: s.name, marketplace: s.marketplace, gmv: 0, profit: 0, orders: 0, items: 0 };
+  for (const s of stores) byStore[s.id] = { storeId: s.id, name: s.name, marketplace: s.marketplace, gmv: 0, netRevenue: 0, profit: 0, orders: 0, items: 0 };
 
-  let totalGmv = 0, totalProfit = 0, totalItems = 0;
+  let totalGmv = 0, totalNetRevenue = 0, totalProfit = 0, totalItems = 0;
   let todayGmv = 0, todayProfit = 0, todayItems = 0;
 
   // Sets para contar pedidos únicos por orderId
@@ -134,28 +196,23 @@ async function getAppDashboard(req, res) {
   for (const s of stores) uniqueByStore[s.id] = new Set();
 
   for (const o of orders) {
-    const taxRate = taxRateMap[o.storeId] ?? 0;
-    const fee   = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-    const disc  = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-    const repasse = o.orderCategory === 'valid' && o.escrowAmount != null
-      ? r2(o.escrowAmount)
-      : r2(o.calcGmv - fee - disc);
-    const tax    = r2(o.calcGmv * (taxRate / 100));
-    const profit = r2(repasse - tax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+    const calc = calcOrderProfit(o, taxRateMap);
 
     byStore[o.storeId].gmv    += o.calcGmv;
-    byStore[o.storeId].profit += profit;
+    byStore[o.storeId].netRevenue += calc.netRevenue;
+    byStore[o.storeId].profit += calc.profit;
     byStore[o.storeId].items  += 1;
     uniqueByStore[o.storeId].add(o.orderId);
     totalGmv    += o.calcGmv;
-    totalProfit += profit;
+    totalNetRevenue += calc.netRevenue;
+    totalProfit += calc.profit;
     totalItems  += 1;
     uniqueOrderIds.add(o.orderId);
 
     const orderDate = new Date(o.soldAt);
     if (orderDate >= startOfDay) {
       todayGmv    += o.calcGmv;
-      todayProfit += profit;
+      todayProfit += calc.profit;
       todayItems  += 1;
       uniqueOrderIdsToday.add(o.orderId);
     }
@@ -169,17 +226,23 @@ async function getAppDashboard(req, res) {
   // Projeção do mês
   const daysElapsed = now.getDate();
   const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const projectedGmv    = daysElapsed > 0 ? r2(totalGmv    / daysElapsed * daysInMonth) : 0;
-  const projectedProfit = daysElapsed > 0 ? r2(totalProfit / daysElapsed * daysInMonth) : 0;
+  const monthGmv = r2(monthOrders.reduce((sum, order) => sum + (order.calcGmv ?? 0), 0));
+  const monthProfit = r2(monthOrders.reduce((sum, order) => sum + calcOrderProfit(order, taxRateMap).profit, 0));
+  const projectedGmv    = daysElapsed > 0 ? r2(monthGmv    / daysElapsed * daysInMonth) : 0;
+  const projectedProfit = daysElapsed > 0 ? r2(monthProfit / daysElapsed * daysInMonth) : 0;
 
   return res.json({
     month,
+    period,
+    periodLabel: range.label,
     summary: {
       gmv:    r2(totalGmv),
+      netRevenue: r2(totalNetRevenue),
       profit: r2(totalProfit),
       orders: uniqueOrderIds.size,  // pedidos únicos (order_sn distintos)
       items:  totalItems,           // linhas totais (itens — 1 pedido multi-produto = N itens)
       margin: totalGmv > 0 ? r2((totalProfit / totalGmv) * 100) : 0,
+      returns: periodReturns,
     },
     yearGmv,
     today: {
@@ -187,7 +250,7 @@ async function getAppDashboard(req, res) {
       profit:  r2(todayProfit),
       orders:  uniqueOrderIdsToday.size, // pedidos únicos hoje
       items:   todayItems,               // itens hoje
-      returns: todayReturns,
+      returns: periodReturns,
     },
     projection: {
       gmv: projectedGmv, profit: projectedProfit,
@@ -196,6 +259,7 @@ async function getAppDashboard(req, res) {
     stores: Object.values(byStore).map(s => ({
       ...s,
       gmv: r2(s.gmv),
+      netRevenue: r2(s.netRevenue),
       profit: r2(s.profit),
       margin: s.gmv > 0 ? r2((s.profit / s.gmv) * 100) : 0,
     })).sort((a, b) => b.gmv - a.gmv),
@@ -205,7 +269,7 @@ async function getAppDashboard(req, res) {
 async function getAppTrends(req, res) {
   const { storeId, period = '7d' } = req.query;
   const userId = req.userId;
-  const { r2 } = require('../lib/utils');
+  const range = getPeriodRange(period);
 
   const stores = await prisma.store.findMany({
     where: { userId, ...(storeId ? { id: storeId } : {}) },
@@ -214,15 +278,10 @@ async function getAppTrends(req, res) {
   const storeIds = stores.map(s => s.id);
   const taxRateMap = Object.fromEntries(stores.map(s => [s.id, s.taxRate ?? 0]));
 
-  const now = new Date();
-  const days = period === '30d' ? 30 : period === 'mes' ? now.getDate() : 7;
-  const since = new Date(now); since.setDate(since.getDate() - days);
-  since.setHours(0, 0, 0, 0);
-
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt: { gte: since },
+      soldAt: { gte: range.start, lte: range.end },
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -265,8 +324,158 @@ async function getAppTrends(req, res) {
 
   return res.json({
     period,
+    periodLabel: range.label,
     chart, // [{ date, gmv, profit, orders }]
     summary: { gmv: totalGmv, profit: totalProfit, orders: totalOrders, margin: avgMargin, avgTicket },
+  });
+}
+
+async function getAppProducts(req, res) {
+  const { storeId, period = 'today' } = req.query;
+  const userId = req.userId;
+  const range = getPeriodRange(period);
+
+  const stores = await prisma.store.findMany({
+    where: { userId, ...(storeId ? { id: storeId } : {}) },
+    select: { id: true, taxRate: true, name: true, marketplace: true },
+  });
+  const storeIds = stores.map(s => s.id);
+  const taxRateMap = Object.fromEntries(stores.map(s => [s.id, s.taxRate ?? 0]));
+
+  if (!storeIds.length) {
+    return res.json({
+      period,
+      periodLabel: range.label,
+      trafficAvailable: false,
+      summary: { products: 0, units: 0, gmv: 0, profit: 0, margin: 0 },
+      champions: [],
+      opportunities: [],
+      attention: [],
+      traffic: [],
+    });
+  }
+
+  const orders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      soldAt: { gte: range.start, lte: range.end },
+      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
+    },
+    select: {
+      storeId: true, orderId: true, productId: true, productName: true, quantity: true,
+      calcGmv: true, platformCommission: true, platformServiceFee: true,
+      sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
+      calcPackaging: true, orderCategory: true,
+      product: { select: { id: true, name: true, sku: true, stock: true, minStock: true, listPrice: true } },
+      store: { select: { name: true, marketplace: true } },
+    },
+  });
+
+  const products = new Map();
+  const uniqueOrders = new Set();
+  let totalGmv = 0;
+  let totalProfit = 0;
+  let totalUnits = 0;
+
+  for (const order of orders) {
+    const calc = calcOrderProfit(order, taxRateMap);
+    const key = order.productId ?? `name:${order.productName ?? 'Produto sem nome'}`;
+    if (!products.has(key)) {
+      products.set(key, {
+        id: order.productId ?? key,
+        name: order.product?.name ?? order.productName ?? 'Produto sem nome',
+        sku: order.product?.sku ?? null,
+        marketplace: order.store?.marketplace ?? null,
+        storeName: order.store?.name ?? null,
+        stock: order.product?.stock ?? null,
+        minStock: order.product?.minStock ?? null,
+        listPrice: order.product?.listPrice ?? null,
+        ordersSet: new Set(),
+        orders: 0,
+        units: 0,
+        gmv: 0,
+        netRevenue: 0,
+        profit: 0,
+        margin: 0,
+        avgTicket: 0,
+        visits: null,
+        conversion: null,
+      });
+    }
+
+    const item = products.get(key);
+    item.ordersSet.add(order.orderId);
+    item.units += order.quantity ?? 0;
+    item.gmv += order.calcGmv ?? 0;
+    item.netRevenue += calc.netRevenue;
+    item.profit += calc.profit;
+
+    uniqueOrders.add(order.orderId);
+    totalUnits += order.quantity ?? 0;
+    totalGmv += order.calcGmv ?? 0;
+    totalProfit += calc.profit;
+  }
+
+  const productList = Array.from(products.values()).map((item) => {
+    const ordersCount = item.ordersSet.size;
+    const margin = item.gmv > 0 ? r2((item.profit / item.gmv) * 100) : 0;
+    const avgTicket = ordersCount > 0 ? r2(item.gmv / ordersCount) : 0;
+    const stockRisk = item.stock != null && item.minStock != null && item.stock <= item.minStock;
+    const investScore = r2(
+      Math.max(0, item.profit) * 0.55 +
+      Math.max(0, margin) * 8 +
+      Math.max(0, item.units) * 3
+    );
+
+    const { ordersSet, ...clean } = item;
+    return {
+      ...clean,
+      orders: ordersCount,
+      gmv: r2(item.gmv),
+      netRevenue: r2(item.netRevenue),
+      profit: r2(item.profit),
+      margin,
+      avgTicket,
+      stockRisk,
+      investScore,
+      recommendation:
+        item.profit < 0 ? 'Rever preço/custo antes de escalar' :
+        stockRisk ? 'Vende bem, mas estoque pede atenção' :
+        margin >= 15 && item.units >= 2 ? 'Bom candidato para investir' :
+        'Acompanhar desempenho',
+    };
+  });
+
+  const champions = [...productList]
+    .sort((a, b) => b.profit - a.profit || b.gmv - a.gmv)
+    .slice(0, 8);
+
+  const opportunities = [...productList]
+    .filter((item) => item.profit > 0 && item.margin > 0)
+    .sort((a, b) => b.investScore - a.investScore)
+    .slice(0, 8);
+
+  const attention = [...productList]
+    .filter((item) => item.profit < 0 || item.margin < 5 || item.stockRisk)
+    .sort((a, b) => a.profit - b.profit || a.margin - b.margin)
+    .slice(0, 8);
+
+  return res.json({
+    period,
+    periodLabel: range.label,
+    trafficAvailable: false,
+    summary: {
+      products: productList.length,
+      orders: uniqueOrders.size,
+      units: totalUnits,
+      gmv: r2(totalGmv),
+      profit: r2(totalProfit),
+      margin: totalGmv > 0 ? r2((totalProfit / totalGmv) * 100) : 0,
+    },
+    champions,
+    opportunities,
+    attention,
+    traffic: [],
   });
 }
 
@@ -425,4 +634,4 @@ async function getAppOrderDetail(req, res) {
   });
 }
 
-module.exports = { generateCode, verifyCode, getAppDashboard, getAppTrends, getAppAlerts, getAppOrderDetail };
+module.exports = { generateCode, verifyCode, getAppDashboard, getAppTrends, getAppProducts, getAppAlerts, getAppOrderDetail };
