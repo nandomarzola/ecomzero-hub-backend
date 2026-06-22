@@ -376,6 +376,65 @@ async function getAppDashboard(req, res) {
   const projectedGmv    = daysElapsed > 0 ? r2(monthGmv    / daysElapsed * daysInMonth) : 0;
   const projectedProfit = daysElapsed > 0 ? r2(monthProfit / daysElapsed * daysInMonth) : 0;
 
+  // ── Comparação com período anterior ─────────────────────────────────────────
+  const periodMs = range.end.getTime() - range.start.getTime();
+  const prevRange = {
+    start: new Date(range.start.getTime() - periodMs - 1000),
+    end:   new Date(range.start.getTime() - 1000),
+  };
+  const prevOrds = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      orderPaidAt: { gte: prevRange.start, lte: prevRange.end },
+      orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+    },
+    select: {
+      orderId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+      sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+      calcProductCost: true, calcPackaging: true, orderCategory: true,
+    },
+  });
+  let prevGmv = 0, prevProfit = 0;
+  const prevIds = new Set();
+  for (const o of prevOrds) {
+    const c = calcOrderProfit(o, taxRateMap);
+    prevGmv   += o.calcGmv ?? 0;
+    prevProfit += c.profit;
+    prevIds.add(o.orderId);
+  }
+
+  // "Mesmo período de Ontem" — só para today: ontem 00:00 até exatamente 24h atrás
+  let spGmv = null, spProfit = null, spOrders = null;
+  if (period === 'today') {
+    const spRange = {
+      start: new Date(todayRange.start.getTime() - 86400000),
+      end:   new Date(now.getTime()           - 86400000),
+    };
+    const spOrds = await prisma.order.findMany({
+      where: {
+        storeId: { in: storeIds },
+        orderPaidAt: { gte: spRange.start, lte: spRange.end },
+        orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+      },
+      select: {
+        orderId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+        sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+        calcProductCost: true, calcPackaging: true, orderCategory: true,
+      },
+    });
+    let _g = 0, _p = 0;
+    const spIds = new Set();
+    for (const o of spOrds) {
+      const c = calcOrderProfit(o, taxRateMap);
+      _g += o.calcGmv ?? 0;
+      _p += c.profit;
+      spIds.add(o.orderId);
+    }
+    spGmv    = r2(_g);
+    spProfit = r2(_p);
+    spOrders = spIds.size;
+  }
+
   return res.json({
     month,
     period,
@@ -421,6 +480,16 @@ async function getAppDashboard(req, res) {
       profit: r2(s.profit),
       margin: s.gmv > 0 ? r2((s.profit / s.gmv) * 100) : 0,
     })).sort((a, b) => b.gmv - a.gmv),
+    comparison: {
+      previousPeriod: {
+        gmv:    r2(prevGmv),
+        orders: prevIds.size,
+        profit: r2(prevProfit),
+      },
+      samePeriodYesterday: period === 'today'
+        ? { gmv: spGmv, orders: spOrders, profit: spProfit }
+        : null,
+    },
   });
 }
 

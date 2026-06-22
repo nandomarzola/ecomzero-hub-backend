@@ -67,7 +67,7 @@ async function getSummary(req, res) {
   const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, categoryGroups] = await Promise.all([
     prisma.order.findMany({
       where:  orderWhere,
-      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true },
+      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, storeId: true, orderId: true, orderCategory: true },
     }),
     prevFilter
       ? prisma.order.findMany({
@@ -120,12 +120,24 @@ async function getSummary(req, res) {
   // ── KPIs do período atual ──────────────────────────────────────────────────
   // Pedidos únicos: conta orderId distintos (1 pedido multi-produto = N linhas, 1 order_sn)
   const uniqueOrderIds = new Set(orders.map(o => o.orderId).filter(Boolean));
-  const totalOrders   = uniqueOrderIds.size || orders.length; // fallback se orderId ausente
+  const totalOrders   = uniqueOrderIds.size || orders.length; // inclui valid+pending+returned_partial
+
+  // Pedidos pagos = valid + pending (exclui returned_partial — alinha com Shopee Seller)
+  const paidOrderIds  = new Set(orders.filter(o => o.orderCategory === 'valid' || o.orderCategory === 'pending').map(o => o.orderId).filter(Boolean));
+  const paidOrders    = paidOrderIds.size;
+
+  // Pedidos válidos = apenas COMPLETED (valid)
+  const validOrderIds = new Set(orders.filter(o => o.orderCategory === 'valid').map(o => o.orderId).filter(Boolean));
+  const validOrders   = validOrderIds.size;
+
+  // Valor de vendas válidas = GMV apenas de pedidos COMPLETED
+  const validRevenue  = orders.filter(o => o.orderCategory === 'valid').reduce((s, o) => s + o.salePrice, 0);
+
   const totalItems    = orders.length; // itens totais (linhas)
   const totalRevenue  = orders.reduce((s, o) => s + o.salePrice, 0);
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
-  const avgTicket     = totalOrders ? totalRevenue / totalOrders : 0;
+  const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
   const negativeMargin = orders.filter((o) => orderProfit(o) < 0).length;
 
   // ── Faturamento consolidado (apenas meses fechados) ────────────────────────
@@ -341,7 +353,10 @@ async function getSummary(req, res) {
     totalRevenue:   parseFloat(totalRevenue.toFixed(2)),
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
-    totalOrders,   // pedidos únicos (order_sn distintos)
+    totalOrders,   // todos os pedidos com receita (valid+pending+returned_partial)
+    paidOrders,    // valid + pending — alinha com "pedidos" do Shopee Seller App
+    validOrders,   // apenas COMPLETED (valid)
+    validRevenue:   parseFloat(validRevenue.toFixed(2)),
     totalItems,    // itens totais (linhas — inclui multi-produto)
     avgTicket:      parseFloat(avgTicket.toFixed(2)),
     negativeMargin,
