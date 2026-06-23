@@ -4,7 +4,7 @@ const { parseYearMonth, r2 } = require('../lib/utils');
 
 const APP_TIMEZONE = 'America/Sao_Paulo';
 const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
-const UPSELLER_VALID_CATEGORIES = ['valid', 'pending'];
+const UPSELLER_VALID_CATEGORIES = ['valid', 'pending', 'returned_partial'];
 
 function getZonedParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
