@@ -64,14 +64,18 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
         // Pedido confirmado: usa o repasse real depositado pela Shopee
         platformNetRevenue = r2(order.escrowAmount);
       } else {
-        // Pedido pendente ou sem escrow: estima a partir dos campos de taxa
-        platformNetRevenue = r2(
-          (order.calcGmv ?? 0)
-          - (order.platformCommission ?? 0)
-          - (order.platformServiceFee ?? 0)
-          - (order.sellerCoupon ?? 0)
-          - (order.lmmDiscount ?? 0)
-        );
+        // Pedido pendente ou sem escrow: usa taxa real quando a API/export trouxe
+        // comissão/serviço. Quando esses campos vêm zerados, deixa o calculator
+        // estimar a taxa Shopee pela categoria/preço em vez de assumir taxa zero.
+        const rawShopeeFee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+        platformNetRevenue = rawShopeeFee > 0
+          ? r2(
+              (order.calcGmv ?? 0)
+              - rawShopeeFee
+              - (order.sellerCoupon ?? 0)
+              - (order.lmmDiscount ?? 0)
+            )
+          : null;
       }
     } else if (marketplace === 'shein' && (order.orderTotal ?? 0) > 0) {
       platformNetRevenue = r2(order.orderTotal);

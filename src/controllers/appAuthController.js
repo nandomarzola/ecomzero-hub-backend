@@ -162,14 +162,16 @@ function formatSaoPauloDay(date) {
 }
 
 function calcOrderProfit(order, taxRateMap) {
-  const taxRate = taxRateMap[order.storeId] ?? 0;
-  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const disc = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-  const repasse = order.orderCategory === 'valid' && order.escrowAmount != null
-    ? r2(order.escrowAmount)
-    : r2((order.calcGmv ?? 0) - fee - disc);
-  const tax = r2((order.calcGmv ?? 0) * (taxRate / 100));
-  const profit = r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
+  // Cadeia canônica — idêntica ao closingController. Nunca lê calcGrossProfit,
+  // calcNetRevenue ou calcTax como entrada (campos snapshot, podem estar desatualizados).
+  const taxRate   = taxRateMap[order.storeId] ?? 0;
+  const fee       = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const disc      = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const net       = r2((order.calcGmv ?? 0) - fee - disc);
+  const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
+  const repasse   = hasEscrow ? r2(order.escrowAmount) : net;
+  const tax       = r2((order.calcGmv ?? 0) * (taxRate / 100));
+  const profit    = r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
   return { fee, discount: disc, netRevenue: repasse, tax, profit };
 }
 
@@ -219,6 +221,14 @@ function buildChampionScore(item) {
 
 const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
 const APP_VALID_ORDER_CATEGORIES = ['valid', 'pending'];
+const SHIPPING_ORDER_STATUSES = new Set([
+  'READY_TO_SHIP',
+  'PROCESSED',
+  'RETRY_SHIP',
+  'INVOICE_PENDING',
+  'AWAITING_SHIPMENT',
+  'AWAITING_COLLECTION',
+]);
 
 function isAppValidOrder(order) {
   const rawStatus = String(order.orderStatus ?? '').toUpperCase();
@@ -263,6 +273,7 @@ function summarizeOrderBreakdown(orders) {
     paid: makeBucket(),
     valid: makeBucket(),
     pending: makeBucket(),
+    shipping: makeBucket(),
     unpaid: makeBucket(),
     cancelled: makeBucket(),
     returned: makeBucket(),
@@ -273,11 +284,13 @@ function summarizeOrderBreakdown(orders) {
     const rawStatus = String(order.orderStatus ?? '').toUpperCase();
     const isOpenUnpaid = !hasPayment && rawStatus === 'UNPAID';
     const isCancelledWithoutPayment = !hasPayment && (order.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED');
+    const isWaitingShipment = SHIPPING_ORDER_STATUSES.has(rawStatus);
 
     addUnique(buckets.created, order);
     if (hasPayment) addUnique(buckets.paid, order);
     if (order.orderCategory === 'valid') addUnique(buckets.valid, order);
     if (order.orderCategory === 'pending') addUnique(buckets.pending, order);
+    if (isWaitingShipment) addUnique(buckets.shipping, order);
     if (isOpenUnpaid) addUnique(buckets.unpaid, order);
     if (isCancelledWithoutPayment) addUnique(buckets.cancelled, order);
     if (['returned_full', 'returned_partial'].includes(order.orderCategory)) addUnique(buckets.returned, order);
@@ -308,6 +321,7 @@ async function getAppDashboard(req, res) {
   });
   const storeIds = stores.map(s => s.id);
   const taxRateMap = Object.fromEntries(stores.map(s => [s.id, s.taxRate ?? 0]));
+  const marketplaceMap = Object.fromEntries(stores.map(s => [s.id, String(s.marketplace ?? '').toLowerCase()]));
 
   if (storeIds.length === 0) return res.json({ stores: [], summary: null });
 
@@ -333,7 +347,8 @@ async function getAppDashboard(req, res) {
       orderId: true, // para contar pedidos únicos (1 pedido multi-item = N linhas com mesmo orderId)
       calcGmv: true, globalTotal: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
-      calcProductCost: true, calcPackaging: true, orderCategory: true,
+      calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+      calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
       orderStatus: true, orderPaidAt: true, cancelReason: true,
       productId: true,
     },
@@ -351,7 +366,8 @@ async function getAppDashboard(req, res) {
       storeId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
       globalTotal: true, orderId: true, quantity: true, orderStatus: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
-      calcPackaging: true, orderCategory: true,
+      calcPackaging: true, calcGrossProfit: true, calcNetRevenue: true,
+      calcTax: true, calcShopeeFee: true, orderCategory: true,
     },
   });
 
@@ -361,11 +377,14 @@ async function getAppDashboard(req, res) {
 
   let totalNetRevenue = 0, totalProfit = 0, totalItems = 0;
   let todayProfit = 0, todayItems = 0;
+  let confirmedNetRevenue = 0, confirmedProfit = 0, estimatedNetRevenue = 0, estimatedProfit = 0;
 
   // Sets para contar pedidos únicos por orderId
   const validOrderValues = new Map();
   const validOrderUnits = new Map();
   const validOrderValuesToday = new Map();
+  const confirmedRepasseIds = new Set();
+  const awaitingRepasseIds = new Set();
   const uniqueByStore       = {}; // storeId → Set de orderIds únicos
   const valueByStoreOrder   = {};
   const unitsByStore        = {};
@@ -386,6 +405,21 @@ async function getAppDashboard(req, res) {
     totalItems  += 1;
 
     if (isValidForRevenue && orderKey) {
+      const marketplace = marketplaceMap[o.storeId] ?? '';
+      const hasRealRepasse = marketplace === 'shopee'
+        ? (o.orderCategory === 'valid' && o.escrowAmount != null)
+        : o.orderCategory === 'valid';
+
+      if (hasRealRepasse) {
+        confirmedRepasseIds.add(orderKey);
+        confirmedNetRevenue += calc.netRevenue;
+        confirmedProfit += calc.profit;
+      } else {
+        awaitingRepasseIds.add(orderKey);
+        estimatedNetRevenue += calc.netRevenue;
+        estimatedProfit += calc.profit;
+      }
+
       const value = orderRevenueValue(o);
       validOrderValues.set(orderKey, Math.max(validOrderValues.get(orderKey) ?? 0, value));
       validOrderUnits.set(orderKey, (validOrderUnits.get(orderKey) ?? 0) + (o.quantity ?? 0));
@@ -433,7 +467,8 @@ async function getAppDashboard(req, res) {
       id: true, storeId: true, orderId: true, quantity: true, calcGmv: true, globalTotal: true,
       orderStatus: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
-      calcProductCost: true, calcPackaging: true, orderCategory: true,
+      calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+      calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
     },
   });
   let prevProfit = 0;
@@ -466,7 +501,8 @@ async function getAppDashboard(req, res) {
         id: true, storeId: true, orderId: true, quantity: true, calcGmv: true, globalTotal: true,
         orderStatus: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
-        calcProductCost: true, calcPackaging: true, orderCategory: true,
+        calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+        calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
       },
     });
     let _p = 0;
@@ -501,6 +537,12 @@ async function getAppDashboard(req, res) {
       gmv:    r2(totalGmv),
       netRevenue: r2(totalNetRevenue),
       profit: r2(totalProfit),
+      confirmedNetRevenue: r2(confirmedNetRevenue),
+      confirmedProfit: r2(confirmedProfit),
+      estimatedNetRevenue: r2(estimatedNetRevenue),
+      estimatedProfit: r2(estimatedProfit),
+      confirmedRepasseOrders: confirmedRepasseIds.size,
+      awaitingRepasseOrders: awaitingRepasseIds.size,
       orders: uniqueOrderIdsSize,  // pedidos válidos únicos (order_sn distintos)
       items:  totalItems,           // linhas totais com receita
       units:  paidUnits,
@@ -510,6 +552,8 @@ async function getAppDashboard(req, res) {
       createdUnits: breakdown.created.units,
       unpaidOrders: breakdown.unpaid.orders,
       unpaidUnits: breakdown.unpaid.units,
+      shippingOrders: breakdown.shipping.orders,
+      shippingUnits: breakdown.shipping.units,
       cancelledOrders: breakdown.cancelled.orders,
       cancelledUnits: breakdown.cancelled.units,
       returnedOrders: breakdown.returned.orders,
@@ -573,7 +617,8 @@ async function getAppTrends(req, res) {
       globalTotal: true, orderStatus: true,
       platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
-      calcProductCost: true, calcPackaging: true, orderCategory: true,
+      calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+      calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
       orderId: true,
     },
     orderBy: { soldAt: 'asc' },
@@ -587,13 +632,7 @@ async function getAppTrends(req, res) {
     const day = formatSaoPauloDay(o.orderCreatedAt ?? o.soldAt);
     if (!byDay[day]) byDay[day] = { date: day, gmv: 0, profit: 0, orders: 0 };
 
-    const taxRate = taxRateMap[o.storeId] ?? 0;
-    const fee = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-    const disc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-    const repasse = o.orderCategory === 'valid' && o.escrowAmount != null
-      ? r2(o.escrowAmount) : r2(o.calcGmv - fee - disc);
-    const tax = r2(o.calcGmv * (taxRate / 100));
-    const profit = r2(repasse - tax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+    const { profit } = calcOrderProfit(o, taxRateMap);
 
     byDay[day].profit += profit;
     const key = o.orderId ?? `${day}:${o.storeId}:${uniqueOrders.size}`;
@@ -659,7 +698,8 @@ async function getAppProducts(req, res) {
       storeId: true, orderId: true, productId: true, productName: true, quantity: true,
       calcGmv: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
-      calcPackaging: true, orderCategory: true,
+      calcPackaging: true, calcGrossProfit: true, calcNetRevenue: true,
+      calcTax: true, calcShopeeFee: true, orderCategory: true,
       product: {
         select: {
           id: true, parentId: true, name: true, sku: true, stock: true, minStock: true,
@@ -998,22 +1038,28 @@ async function getAppAlerts(req, res) {
   const [todayOrders, weekOrders, noCostCount] = await Promise.all([
     prisma.order.findMany({
       where: { storeId: { in: storeIds }, ...orderPeriodWhere(todayRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
-      select: { calcGmv: true, platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true, calcPackaging: true, orderCategory: true, storeId: true, productName: true, orderId: true },
+      select: {
+        calcGmv: true, platformCommission: true, platformServiceFee: true,
+        sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+        calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+        calcNetRevenue: true, calcTax: true, calcShopeeFee: true,
+        orderCategory: true, storeId: true, productName: true, orderId: true,
+      },
     }),
     prisma.order.findMany({
       where: { storeId: { in: storeIds }, ...orderPeriodWhere(weekRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
-      select: { calcGmv: true, platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true, calcPackaging: true, orderCategory: true, storeId: true },
+      select: {
+        calcGmv: true, platformCommission: true, platformServiceFee: true,
+        sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+        calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+        calcNetRevenue: true, calcTax: true, calcShopeeFee: true,
+        orderCategory: true, storeId: true,
+      },
     }),
     prisma.product.count({ where: { storeId: { in: storeIds }, costPrice: 0 } }),
   ]);
 
-  const calcProfit = (o) => {
-    const taxRate = taxRateMap[o.storeId] ?? 0;
-    const fee = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-    const disc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-    const repasse = o.orderCategory === 'valid' && o.escrowAmount != null ? r2(o.escrowAmount) : r2(o.calcGmv - fee - disc);
-    return r2(repasse - r2(o.calcGmv * (taxRate / 100)) - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
-  };
+  const calcProfit = (o) => calcOrderProfit(o, taxRateMap).profit;
 
   const alerts = [];
 
