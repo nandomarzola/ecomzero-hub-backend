@@ -93,6 +93,12 @@ function addUnique(bucket, order) {
 
 function summarizeOrderBreakdown(orders) {
   const makeBucket = () => ({ orderIds: new Set(), lines: 0, units: 0 });
+  const cancelledUnpaidOrderIds = new Set(
+    orders
+      .filter((order) => order.orderCategory === 'cancelled_unpaid')
+      .map(getOrderUniqueKey)
+      .filter(Boolean)
+  );
   const buckets = {
     created: makeBucket(),
     paid: makeBucket(),
@@ -112,6 +118,9 @@ function summarizeOrderBreakdown(orders) {
     const isOpenUnpaid = !hasPayment && rawStatus === 'UNPAID';
     const isCancelled = order.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED';
     const isCancelledWithoutPayment = !hasPayment && isCancelled;
+    const orderKey = getOrderUniqueKey(order);
+    const hasUnpaidCancellationLine = orderKey && cancelledUnpaidOrderIds.has(orderKey);
+    const hasRealBuyer = !!order.buyerUsername && order.buyerUsername !== '-';
 
     addUnique(buckets.created, order);
     if (hasPayment) addUnique(buckets.paid, order);
@@ -119,7 +128,7 @@ function summarizeOrderBreakdown(orders) {
     if (order.orderCategory === 'pending') addUnique(buckets.pending, order);
     if (isOpenUnpaid) addUnique(buckets.unpaid, order);
     if (isCancelledWithoutPayment) addUnique(buckets.cancelled, order);
-    if (hasPayment && isCancelled) addUnique(buckets.paidCancelled, order);
+    if (hasPayment && isCancelled && hasRealBuyer && !hasUnpaidCancellationLine) addUnique(buckets.paidCancelled, order);
     if (['returned_full', 'returned_partial'].includes(order.orderCategory)) addUnique(buckets.returned, order);
   }
 

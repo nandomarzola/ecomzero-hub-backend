@@ -208,6 +208,13 @@ async function listOrders(req, res) {
 
   const createdBaseWhere = { ...storeFilter, ...createdDateFilter };
   const revenueBaseWhere = { ...storeFilter, ...paidDateFilter };
+  const realBuyerFilter = { NOT: [{ buyerUsername: null }, { buyerUsername: '-' }] };
+  const paidCancelledWhere = {
+    ...revenueBaseWhere,
+    ...realBuyerFilter,
+    status: 'cancelled',
+    orderCategory: 'cancelled_other',
+  };
 
   let where = { ...createdBaseWhere };
   if (['valid', 'pending'].includes(orderCategory)) {
@@ -215,7 +222,7 @@ async function listOrders(req, res) {
   } else if (orderCategory === 'returned') {
     where = { ...revenueBaseWhere, status: 'returned' };
   } else if (orderCategory === 'cancelled') {
-    where = { ...createdBaseWhere, status: 'cancelled' };
+    where = paidCancelledWhere;
   } else if (orderCategory) {
     where = { ...revenueBaseWhere, orderCategory };
   }
@@ -243,7 +250,7 @@ async function listOrders(req, res) {
   const taxRateMap = new Map(taxStores.map((s) => [s.id, s.taxRate ?? 0]));
   const marketplaceMap = new Map(taxStores.map((s) => [s.id, s.marketplace ?? 'shopee']));
 
-  const [orders, total, tabAll, tabValid, tabPending, tabCancelled, tabReturned, revenueOrders, aggCancelled, orphanCount] = await Promise.all([
+  const [orders, totalRows, tabAll, tabValid, tabPending, tabCancelledRows, tabReturned, revenueOrders, aggCancelled, orphanCount] = await Promise.all([
     prisma.order.findMany({
       where,
       include: { product: { select: { name: true, sku: true } } },
@@ -255,7 +262,7 @@ async function listOrders(req, res) {
     prisma.order.count({ where: createdBaseWhere }),
     prisma.order.count({ where: { ...revenueBaseWhere, orderCategory: 'valid' } }),
     prisma.order.count({ where: { ...revenueBaseWhere, orderCategory: 'pending' } }),
-    prisma.order.count({ where: { ...createdBaseWhere, status: 'cancelled' } }),
+    prisma.order.findMany({ where: paidCancelledWhere, distinct: ['orderId'], select: { orderId: true } }),
     prisma.order.count({ where: { ...revenueBaseWhere, status: 'returned' } }),
     // Totais financeiros pela lógica Upseller: vendas válidas entram pelo pagamento/validação.
     prisma.order.findMany({
@@ -270,7 +277,7 @@ async function listOrders(req, res) {
     }),
     // Totais de cancelados
     prisma.order.aggregate({
-      where: { ...createdBaseWhere, status: 'cancelled' },
+      where: paidCancelledWhere,
       _sum:  { calcGmv: true },
       _count: { _all: true },
     }),
@@ -279,6 +286,8 @@ async function listOrders(req, res) {
       where: { ...revenueBaseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] }, hasCost: false },
     }),
   ]);
+  const tabCancelled = tabCancelledRows.length;
+  const total = orderCategory === 'cancelled' ? tabCancelled : totalRows;
 
   const tabCounts = {
     all: tabAll,
