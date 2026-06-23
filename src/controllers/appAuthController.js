@@ -218,6 +218,37 @@ function buildChampionScore(item) {
 }
 
 const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
+const APP_VALID_ORDER_CATEGORIES = ['valid', 'pending'];
+
+function isAppValidOrder(order) {
+  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+  return APP_VALID_ORDER_CATEGORIES.includes(order.orderCategory) && rawStatus !== 'CANCELLED';
+}
+
+function orderRevenueValue(order) {
+  return order.globalTotal ?? order.calcGmv ?? 0;
+}
+
+function summarizeUniqueValidOrders(orders) {
+  const byOrder = new Map();
+
+  for (const order of orders) {
+    if (!isAppValidOrder(order)) continue;
+    const key = order.orderId ?? order.id;
+    if (!key) continue;
+    if (!byOrder.has(key)) byOrder.set(key, { value: 0, units: 0 });
+    const bucket = byOrder.get(key);
+    bucket.value = Math.max(bucket.value, orderRevenueValue(order));
+    bucket.units += order.quantity ?? 0;
+  }
+
+  const rows = [...byOrder.values()];
+  return {
+    orders: byOrder.size,
+    units: rows.reduce((sum, item) => sum + item.units, 0),
+    value: rows.reduce((sum, item) => sum + item.value, 0),
+  };
+}
 
 function addUnique(bucket, order) {
   bucket.orderIds.add(order.orderId);
@@ -284,12 +315,11 @@ async function getAppDashboard(req, res) {
     where: {
       storeId: { in: storeIds },
       ...orderPeriodWhere({ start: startOfYear, end: now }),
-      orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
-      calcGmv: { gt: 0 },
+      orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
     },
-    select: { calcGmv: true },
+    select: { id: true, orderId: true, orderCategory: true, orderStatus: true, quantity: true, calcGmv: true, globalTotal: true },
   });
-  const yearGmv = r2(yearOrders.reduce((s, o) => s + (o.calcGmv ?? 0), 0));
+  const yearGmv = r2(summarizeUniqueValidOrders(yearOrders).value);
 
   // Todos os pedidos do período, incluindo não pagos/cancelados. O financeiro
   // usa só categorias com receita, mas os contadores precisam bater com a Shopee.
@@ -301,7 +331,7 @@ async function getAppDashboard(req, res) {
     select: {
       id: true, storeId: true, soldAt: true, orderCreatedAt: true, quantity: true,
       orderId: true, // para contar pedidos únicos (1 pedido multi-item = N linhas com mesmo orderId)
-      calcGmv: true, platformCommission: true, platformServiceFee: true,
+      calcGmv: true, globalTotal: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
       orderStatus: true, orderPaidAt: true, cancelReason: true,
@@ -319,6 +349,7 @@ async function getAppDashboard(req, res) {
     },
     select: {
       storeId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+      globalTotal: true, orderId: true, quantity: true, orderStatus: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true, calcProductCost: true,
       calcPackaging: true, orderCategory: true,
     },
@@ -328,38 +359,46 @@ async function getAppDashboard(req, res) {
   const byStore = {};
   for (const s of stores) byStore[s.id] = { storeId: s.id, name: s.name, marketplace: s.marketplace, gmv: 0, netRevenue: 0, profit: 0, orders: 0, items: 0 };
 
-  let totalGmv = 0, totalNetRevenue = 0, totalProfit = 0, totalItems = 0;
-  let todayGmv = 0, todayProfit = 0, todayItems = 0;
+  let totalNetRevenue = 0, totalProfit = 0, totalItems = 0;
+  let todayProfit = 0, todayItems = 0;
 
   // Sets para contar pedidos únicos por orderId
-  const uniqueOrderIds      = new Set();
-  const uniqueOrderIdsToday = new Set();
+  const validOrderValues = new Map();
+  const validOrderUnits = new Map();
+  const validOrderValuesToday = new Map();
   const uniqueByStore       = {}; // storeId → Set de orderIds únicos
+  const valueByStoreOrder   = {};
   const unitsByStore        = {};
   for (const s of stores) uniqueByStore[s.id] = new Set();
+  for (const s of stores) valueByStoreOrder[s.id] = new Map();
   for (const s of stores) unitsByStore[s.id] = 0;
 
   for (const o of orders) {
     const calc = calcOrderProfit(o, taxRateMap);
+    const isValidForRevenue = isAppValidOrder(o);
+    const orderKey = o.orderId ?? o.id;
 
-    byStore[o.storeId].gmv    += o.calcGmv;
     byStore[o.storeId].netRevenue += calc.netRevenue;
     byStore[o.storeId].profit += calc.profit;
     byStore[o.storeId].items  += 1;
-    unitsByStore[o.storeId] += o.quantity ?? 0;
-    uniqueByStore[o.storeId].add(o.orderId);
-    totalGmv    += o.calcGmv;
     totalNetRevenue += calc.netRevenue;
     totalProfit += calc.profit;
     totalItems  += 1;
-    uniqueOrderIds.add(o.orderId);
+
+    if (isValidForRevenue && orderKey) {
+      const value = orderRevenueValue(o);
+      validOrderValues.set(orderKey, Math.max(validOrderValues.get(orderKey) ?? 0, value));
+      validOrderUnits.set(orderKey, (validOrderUnits.get(orderKey) ?? 0) + (o.quantity ?? 0));
+      uniqueByStore[o.storeId].add(orderKey);
+      unitsByStore[o.storeId] += o.quantity ?? 0;
+      valueByStoreOrder[o.storeId].set(orderKey, Math.max(valueByStoreOrder[o.storeId].get(orderKey) ?? 0, value));
+    }
 
     const orderDate = new Date(o.orderCreatedAt ?? o.soldAt);
-    if (orderDate >= todayRange.start && orderDate <= todayRange.end) {
-      todayGmv    += o.calcGmv;
+    if (orderDate >= todayRange.start && orderDate <= todayRange.end && isValidForRevenue && orderKey) {
+      validOrderValuesToday.set(orderKey, Math.max(validOrderValuesToday.get(orderKey) ?? 0, orderRevenueValue(o)));
       todayProfit += calc.profit;
       todayItems  += 1;
-      uniqueOrderIdsToday.add(o.orderId);
     }
   }
 
@@ -367,12 +406,13 @@ async function getAppDashboard(req, res) {
   for (const s of stores) {
     byStore[s.id].orders = uniqueByStore[s.id].size;
     byStore[s.id].units = unitsByStore[s.id] ?? 0;
+    byStore[s.id].gmv = [...valueByStoreOrder[s.id].values()].reduce((sum, value) => sum + value, 0);
   }
 
   // Projeção do mês
   const daysElapsed = nowParts.day;
   const daysInMonth = new Date(Date.UTC(nowParts.year, nowParts.month, 0)).getUTCDate();
-  const monthGmv = r2(monthOrders.reduce((sum, order) => sum + (order.calcGmv ?? 0), 0));
+  const monthGmv = r2(summarizeUniqueValidOrders(monthOrders).value);
   const monthProfit = r2(monthOrders.reduce((sum, order) => sum + calcOrderProfit(order, taxRateMap).profit, 0));
   const projectedGmv    = daysElapsed > 0 ? r2(monthGmv    / daysElapsed * daysInMonth) : 0;
   const projectedProfit = daysElapsed > 0 ? r2(monthProfit / daysElapsed * daysInMonth) : 0;
@@ -386,22 +426,27 @@ async function getAppDashboard(req, res) {
   const prevOrds = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      orderPaidAt: { gte: prevRange.start, lte: prevRange.end },
-      orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+      ...orderPeriodWhere(prevRange),
+      orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
     },
     select: {
-      orderId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+      id: true, storeId: true, orderId: true, quantity: true, calcGmv: true, globalTotal: true,
+      orderStatus: true, platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
     },
   });
-  let prevGmv = 0, prevProfit = 0;
+  let prevProfit = 0;
   const prevIds = new Set();
+  const prevValues = new Map();
   for (const o of prevOrds) {
     const c = calcOrderProfit(o, taxRateMap);
-    prevGmv   += o.calcGmv ?? 0;
     prevProfit += c.profit;
-    prevIds.add(o.orderId);
+    const key = o.orderId ?? o.id;
+    if (key) {
+      prevIds.add(key);
+      prevValues.set(key, Math.max(prevValues.get(key) ?? 0, orderRevenueValue(o)));
+    }
   }
 
   // "Mesmo período de Ontem" — só para today: ontem 00:00 até exatamente 24h atrás
@@ -414,27 +459,38 @@ async function getAppDashboard(req, res) {
     const spOrds = await prisma.order.findMany({
       where: {
         storeId: { in: storeIds },
-        orderPaidAt: { gte: spRange.start, lte: spRange.end },
-        orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+        ...orderPeriodWhere(spRange),
+        orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
       },
       select: {
-        orderId: true, calcGmv: true, platformCommission: true, platformServiceFee: true,
+        id: true, storeId: true, orderId: true, quantity: true, calcGmv: true, globalTotal: true,
+        orderStatus: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
         calcProductCost: true, calcPackaging: true, orderCategory: true,
       },
     });
-    let _g = 0, _p = 0;
+    let _p = 0;
     const spIds = new Set();
+    const spValues = new Map();
     for (const o of spOrds) {
       const c = calcOrderProfit(o, taxRateMap);
-      _g += o.calcGmv ?? 0;
       _p += c.profit;
-      spIds.add(o.orderId);
+      const key = o.orderId ?? o.id;
+      if (key) {
+        spIds.add(key);
+        spValues.set(key, Math.max(spValues.get(key) ?? 0, orderRevenueValue(o)));
+      }
     }
-    spGmv    = r2(_g);
+    spGmv    = r2([...spValues.values()].reduce((sum, value) => sum + value, 0));
     spProfit = r2(_p);
     spOrders = spIds.size;
   }
+
+  const totalGmv = [...validOrderValues.values()].reduce((sum, value) => sum + value, 0);
+  const todayGmv = [...validOrderValuesToday.values()].reduce((sum, value) => sum + value, 0);
+  const uniqueOrderIdsSize = validOrderValues.size;
+  const todayOrderIdsSize = validOrderValuesToday.size;
+  const paidUnits = [...validOrderUnits.values()].reduce((sum, value) => sum + value, 0);
 
   return res.json({
     month,
@@ -445,11 +501,11 @@ async function getAppDashboard(req, res) {
       gmv:    r2(totalGmv),
       netRevenue: r2(totalNetRevenue),
       profit: r2(totalProfit),
-      orders: uniqueOrderIds.size,  // pedidos únicos (order_sn distintos)
+      orders: uniqueOrderIdsSize,  // pedidos válidos únicos (order_sn distintos)
       items:  totalItems,           // linhas totais com receita
-      units:  breakdown.paid.units, // unidades pagas/vendidas
-      paidOrders: breakdown.paid.orders,
-      paidUnits: breakdown.paid.units,
+      units:  paidUnits,
+      paidOrders: uniqueOrderIdsSize,
+      paidUnits,
       createdOrders: breakdown.created.orders,
       createdUnits: breakdown.created.units,
       unpaidOrders: breakdown.unpaid.orders,
@@ -466,7 +522,7 @@ async function getAppDashboard(req, res) {
     today: {
       gmv:     r2(todayGmv),
       profit:  r2(todayProfit),
-      orders:  uniqueOrderIdsToday.size, // pedidos únicos hoje
+      orders:  todayOrderIdsSize, // pedidos válidos únicos hoje
       items:   todayItems,               // linhas hoje
       returns: breakdown.returned.orders + breakdown.cancelled.orders + breakdown.unpaid.orders,
     },
@@ -483,7 +539,7 @@ async function getAppDashboard(req, res) {
     })).sort((a, b) => b.gmv - a.gmv),
     comparison: {
       previousPeriod: {
-        gmv:    r2(prevGmv),
+        gmv:    r2([...prevValues.values()].reduce((sum, value) => sum + value, 0)),
         orders: prevIds.size,
         profit: r2(prevProfit),
       },
@@ -514,6 +570,7 @@ async function getAppTrends(req, res) {
     },
     select: {
       storeId: true, soldAt: true, orderCreatedAt: true, calcGmv: true,
+      globalTotal: true, orderStatus: true,
       platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
       calcProductCost: true, calcPackaging: true, orderCategory: true,
@@ -538,12 +595,20 @@ async function getAppTrends(req, res) {
     const tax = r2(o.calcGmv * (taxRate / 100));
     const profit = r2(repasse - tax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
 
-    byDay[day].gmv    += o.calcGmv;
     byDay[day].profit += profit;
-    if (!uniqueOrders.has(o.orderId)) { byDay[day].orders += 1; uniqueOrders.add(o.orderId); }
+    const key = o.orderId ?? `${day}:${o.storeId}:${uniqueOrders.size}`;
+    if (!uniqueOrders.has(key)) {
+      byDay[day].orders += 1;
+      byDay[day].gmv += orderRevenueValue(o);
+      uniqueOrders.add(key);
+    }
   }
 
-  const chart = Object.values(byDay);
+  const chart = Object.values(byDay).map((day) => ({
+    ...day,
+    gmv: r2(day.gmv),
+    profit: r2(day.profit),
+  }));
   const totalGmv    = r2(chart.reduce((s, d) => s + d.gmv, 0));
   const totalProfit = r2(chart.reduce((s, d) => s + d.profit, 0));
   const totalOrders = uniqueOrders.size;

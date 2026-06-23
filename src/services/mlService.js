@@ -221,12 +221,18 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
     agreedPrice,
     quantity,
     platformCommission: saleFee,
-    platformServiceFee: 0,
+    // platformServiceFee recebe frete + parcelamento para que
+    // platformCommission + platformServiceFee = taxa total ML em todas as queries
+    platformServiceFee: r2(freight + installmentFee),
     sellerCoupon:     0,
     sellerDiscount:   0,
     lmmDiscount:      0,
     globalTotal:      r2(mlOrder.total_amount ?? 0),
     orderTotal:       r2(mlOrder.paid_amount ?? 0),
+    // escrowAmount = paid_amount do ML (repasse real creditado ao vendedor)
+    // equivalente ao escrowAmount da Shopee — usado pelo closingController como fonte da verdade
+    escrowAmount:     isRevenue && paidAmount > 0 ? paidAmount : null,
+    buyerUsername:    mlOrder.buyer?.nickname ?? null,
     listingType:      listingType,
     trackingNumber:   String(shipping?.id ?? '') || null,
     shippingOption:   shipping?.shipping_mode ?? null,
