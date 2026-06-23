@@ -158,13 +158,17 @@ function isConfirmedPaidOrder(order, marketplace) {
   return !!order.orderPaidAt || order.status === 'paid';
 }
 
-function confirmedProfit(order, marketplace) {
+function confirmedProfit(order, marketplace, taxRate = 0) {
   if (!isConfirmedPaidOrder(order, marketplace)) return 0;
-  const mp = String(marketplace ?? '').toLowerCase();
-  const repasse = mp === 'shopee'
-    ? (order.escrowAmount ?? 0)
-    : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
-  return repasse - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
+  // Cadeia canônica — idêntica ao closingController.buildClosingData linhas 180-192.
+  // Nunca lê calcShopeeFee, calcNetRevenue ou calcTax como entrada do cálculo.
+  const fee     = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const disc    = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const net     = r2((order.calcGmv ?? 0) - fee - disc);
+  const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
+  const repasse = hasEscrow ? r2(order.escrowAmount) : net;
+  const tax     = r2((order.calcGmv ?? 0) * taxRate / 100);
+  return r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
 }
 
 function expectedRepasse(order, marketplace) {
@@ -195,6 +199,7 @@ async function getSummary(req, res) {
   const storeIds           = stores.map((s) => s.id);
   const marketplaceByStore = Object.fromEntries(stores.map((s) => [s.id, s.marketplace]));
   const storeNameByStore   = Object.fromEntries(stores.map((s) => [s.id, s.name]));
+  const taxRateByStore     = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
 
   if (!storeIds.length) {
     return res.json({
@@ -234,6 +239,7 @@ async function getSummary(req, res) {
         orderCreatedAt: true, orderPaidAt: true, orderStatus: true, quantity: true, calcGmv: true,
         storeId: true, orderId: true, orderCategory: true, buyerUsername: true, globalTotal: true,
         status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true,
+        platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, calcPackaging: true,
       },
     }),
     prevRange
@@ -244,6 +250,7 @@ async function getSummary(req, res) {
             orderCategory: true, buyerUsername: true, globalTotal: true, quantity: true,
             orderStatus: true, orderPaidAt: true, orderCreatedAt: true, soldAt: true,
             status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true, storeId: true,
+            platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, calcPackaging: true,
           },
         })
       : Promise.resolve([]),
@@ -299,7 +306,7 @@ async function getSummary(req, res) {
     }),
   ]);
 
-  const orderProfit = (o) => confirmedProfit(o, marketplaceByStore[o.storeId]);
+  const orderProfit = (o) => confirmedProfit(o, marketplaceByStore[o.storeId], taxRateByStore[o.storeId]);
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
   const breakdown = summarizeOrderBreakdown(allPeriodRaw);
@@ -911,8 +918,9 @@ async function getShopeeSummary(req, res) {
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
 
-  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true } });
-  const storeIds = stores.map((s) => s.id);
+  const stores          = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true, taxRate: true } });
+  const storeIds        = stores.map((s) => s.id);
+  const taxRateByStoreSP = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
   if (!storeIds.length) return res.json({ summaries: [], totals: null });
 
   const where = { storeId: { in: storeIds } };
@@ -936,9 +944,10 @@ async function getShopeeSummary(req, res) {
       ...orderPeriodWhere(monthRange),
     },
     select: {
-      id: true, orderId: true, orderCategory: true, orderStatus: true, orderPaidAt: true,
+      id: true, orderId: true, orderCategory: true, orderStatus: true, orderPaidAt: true, storeId: true,
       status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true,
       calcTax: true, calcGmv: true, salePrice: true, quantity: true, cancelReason: true,
+      platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, calcPackaging: true,
     },
   });
 
@@ -952,7 +961,7 @@ async function getShopeeSummary(req, res) {
     gmv: confirmed.reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
     netRevenue: confirmed.reduce((s, o) => s + (o.escrowAmount ?? 0), 0),
     tax: confirmed.reduce((s, o) => s + (o.calcTax ?? 0), 0),
-    grossProfit: confirmed.reduce((s, o) => s + confirmedProfit(o, 'shopee'), 0),
+    grossProfit: confirmed.reduce((s, o) => s + confirmedProfit(o, 'shopee', taxRateByStoreSP[o.storeId]), 0),
     validCount: breakdown.valid.orders,
     unitCount: breakdown.valid.units,
     cancelledCount: breakdown.cancelled.orders,
