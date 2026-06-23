@@ -174,12 +174,14 @@ function expectedRepasse(order, marketplace) {
       : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
   }
   if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
-  return order.calcNetRevenue ?? order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0;
+  return order.calcNetRevenue > 0 ? order.calcNetRevenue : null;
 }
 
 function expectedProfit(order, marketplace) {
   if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
-  return expectedRepasse(order, marketplace) - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
+  const repasse = expectedRepasse(order, marketplace);
+  if (repasse === null || repasse === undefined) return null;
+  return repasse - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
 }
 
 // GET /api/dashboard/summary
@@ -347,11 +349,14 @@ async function getSummary(req, res) {
     REVENUE_ORDER_CATEGORIES.includes(o.orderCategory)
     && !isConfirmedPaidOrder(o, marketplaceByStore[o.storeId])
   ));
-  const estimatedRepasse = estimatedOrders.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
-  const estimatedProfit = estimatedOrders.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId]), 0);
+  const estimatedOrdersReliable = estimatedOrders.filter((o) => expectedRepasse(o, marketplaceByStore[o.storeId]) !== null);
+  const estimatedOrdersUnreliable = estimatedOrders.length - estimatedOrdersReliable.length;
+  const estimatedRepasse = estimatedOrdersReliable.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
+  const estimatedProfit = estimatedOrdersReliable.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId]), 0);
   const projectedProfit = totalProfit + estimatedProfit;
+  const estimatedReliableIds = new Set(estimatedOrdersReliable.map((o) => o.id));
   const projectedGmv = orders
-    .filter((o) => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory))
+    .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]) || estimatedReliableIds.has(o.id))
     .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
   const projectedMargin = projectedGmv > 0 ? (projectedProfit / projectedGmv) * 100 : 0;
   const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
@@ -630,7 +635,8 @@ async function getSummary(req, res) {
     projectedProfit:  parseFloat(projectedProfit.toFixed(2)),
     projectedMargin:  parseFloat(projectedMargin.toFixed(2)),
     projectedGmv:     parseFloat(projectedGmv.toFixed(2)),
-    estimatedProfitOrders: estimatedOrders.length,
+    estimatedProfitOrders: estimatedOrdersReliable.length,
+    estimatedProfitOrdersUnreliable: estimatedOrdersUnreliable,
     totalOrders,
     paidOrders,
     paidUnits,
