@@ -235,7 +235,7 @@ async function refreshToken(req, res) {
 
 // POST /api/shopee/sync — importa pedidos da Shopee via API para o período
 async function syncOrders(req, res) {
-  const { storeId, dateFrom, dateTo } = req.body;
+  const { storeId, dateFrom, dateTo, mode = 'full' } = req.body;
   if (!storeId || !dateFrom || !dateTo) return res.status(400).json({ error: 'storeId, dateFrom e dateTo são obrigatórios' });
 
   const store = await prisma.store.findFirst({ where: { id: storeId, userId: req.userId } });
@@ -269,17 +269,19 @@ async function syncOrders(req, res) {
       return;
     }
 
-    // 2-3. Detalhes dos pedidos + repasses (escrow) em paralelo — get_escrow_detail
-    // não depende dos detalhes do pedido, então buscamos para todos os order_sn e
-    // descartamos UNPAID depois (Shopee não retorna escrow para eles de qualquer forma)
-    importProgress.set(imp.id, { pct: 25, message: 'Buscando detalhes e repasses...' });
-    const [details, escrowMapRaw] = await Promise.all([
-      fetchOrderDetails(accessToken, store.spShopId, orderSns),
-      fetchEscrowDetails(accessToken, store.spShopId, orderSns,
-        (done, total) => importProgress.set(imp.id, { pct: 25 + Math.round((done / total) * 40), message: `Buscando repasses (${done}/${total})...` })),
-    ]);
-    const unpaidSns = new Set(details.filter(d => d.order_status === 'UNPAID').map(d => d.order_sn));
-    const escrowMap = Object.fromEntries(Object.entries(escrowMapRaw).filter(([sn]) => !unpaidSns.has(sn)));
+    // 2-3. Detalhes dos pedidos. No modo rápido, usado por app/topbar, não
+    // busca escrow pedido por pedido; isso derruba syncs grandes para vários
+    // minutos e não é necessário para atualizar contagem/GMV do dia.
+    importProgress.set(imp.id, { pct: 25, message: mode === 'quick' ? 'Buscando detalhes...' : 'Buscando detalhes e repasses...' });
+    const details = await fetchOrderDetails(accessToken, store.spShopId, orderSns);
+    let escrowMap = {};
+    if (mode !== 'quick') {
+      const escrowOrderSns = details
+        .filter(d => ['COMPLETED'].includes(d.order_status))
+        .map(d => d.order_sn);
+      escrowMap = await fetchEscrowDetails(accessToken, store.spShopId, escrowOrderSns,
+        (done, total) => importProgress.set(imp.id, { pct: 25 + Math.round((done / Math.max(total, 1)) * 40), message: `Buscando repasses (${done}/${total})...` }));
+    }
 
     // 4. Upsert produtos a partir dos itens dos pedidos
     importProgress.set(imp.id, { pct: 65, message: 'Vinculando produtos...' });
@@ -478,7 +480,11 @@ async function syncOrders(req, res) {
 
     // Aplica costPrice dos produtos vinculados nos pedidos recém-importados
     importProgress.set(imp.id, { pct: 95, message: 'Recalculando custos...' });
-    await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
+    if (mode === 'quick') {
+      await recalculateOrdersForStore(storeId, periodMonth, { importId: imp.id }).catch(() => {});
+    } else {
+      await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
+    }
 
     // 7. Totais
     const valid     = ordersData.filter(o => o.orderCategory === 'valid').length;

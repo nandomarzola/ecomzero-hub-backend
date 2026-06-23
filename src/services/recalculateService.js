@@ -13,10 +13,12 @@ const { r2, parseYearMonth } = require('../lib/utils');
 // resultado; não há acúmulo nem double-count. O único efeito colateral mutável do
 // sistema (estoque) NÃO ocorre aqui — fica isolado em stockHelper::applyStockFromOrder,
 // protegido pela flag Order.stockDeducted contra dedução dupla em re-sync.
-async function recalculateOrdersForStore(storeId, periodMonth = null) {
+async function recalculateOrdersForStore(storeId, periodMonth = null, options = {}) {
   const where = { storeId };
 
-  if (periodMonth) {
+  if (options.importId) where.importId = options.importId;
+
+  if (periodMonth && !options.importId) {
     const { year: y, month: mo } = parseYearMonth(periodMonth);
     where.soldAt = {
       gte: new Date(Date.UTC(y, mo - 1, 1)),

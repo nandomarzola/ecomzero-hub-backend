@@ -8,6 +8,8 @@ const { importTiktokOrderAll } = require('../services/importTiktokService');
 const { importProgress } = require('../lib/importProgress');
 const { r2, parsePage, parseYearMonth } = require('../lib/utils');
 
+const PROCESSING_STALE_MS = 12 * 60 * 1000;
+
 // POST /api/orders/import — dispara import em background, responde imediatamente
 async function importOrders(req, res) {
   if (!req.file) return res.status(400).json({ error: 'Arquivo .xlsx obrigatório' });
@@ -57,6 +59,13 @@ async function importStatus(req, res) {
   if (!imp) return res.status(404).json({ error: 'Import não encontrado' });
 
   const progress = importProgress.get(importId);
+  if (imp.status === 'processing' && !progress && imp.importedAt && Date.now() - new Date(imp.importedAt).getTime() > PROCESSING_STALE_MS) {
+    await prisma.import.update({
+      where: { id: importId },
+      data: { status: 'error', errorMessage: 'Sincronização interrompida antes de concluir. Tente novamente.' },
+    }).catch(() => {});
+    return res.json({ jobId: importId, status: 'error', error: 'Sincronização interrompida antes de concluir. Tente novamente.' });
+  }
 
   if (imp.status === 'done') {
     return res.json({
