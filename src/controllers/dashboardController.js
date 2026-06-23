@@ -70,6 +70,11 @@ function orderPeriodWhere(range) {
   };
 }
 
+function paidPeriodWhere(range) {
+  if (!range) return {};
+  return { orderPaidAt: { gte: range.start, lte: range.end } };
+}
+
 function formatSaoPauloDay(date) {
   const parts = getZonedParts(date);
   return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
@@ -219,12 +224,14 @@ async function getSummary(req, res) {
 
   const dateRange = buildDateRange(startDate, endDate);
   const periodWhere = orderPeriodWhere(dateRange);
+  const paidWhere = paidPeriodWhere(dateRange);
   const allOrderWhere = {
     storeId: { in: storeIds },
     ...periodWhere,
   };
   const revenueOrderWhere = {
-    ...allOrderWhere,
+    storeId: { in: storeIds },
+    ...paidWhere,
     orderCategory: { in: REVENUE_ORDER_CATEGORIES },
   };
 
@@ -238,7 +245,7 @@ async function getSummary(req, res) {
   sixMonthsAgo.setUTCHours(0, 0, 0, 0);
 
   // Busca paralela: todos os dados de uma vez
-  const [orders, prevOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, allPeriodRaw] = await Promise.all([
+  const [orders, prevOrdersRaw, prevRevenueOrdersRaw, sparkOrdersRaw, itemsRaw, singleStore, closedClosingsRaw, allPeriodRaw] = await Promise.all([
     prisma.order.findMany({
       where:  revenueOrderWhere,
       select: {
@@ -261,8 +268,20 @@ async function getSummary(req, res) {
           },
         })
       : Promise.resolve([]),
+    prevRange
+      ? prisma.order.findMany({
+          where:  { storeId: { in: storeIds }, ...paidPeriodWhere(prevRange), orderCategory: { in: REVENUE_ORDER_CATEGORIES } },
+          select: {
+            id: true, salePrice: true, profit: true, calcGrossProfit: true, calcGmv: true, margin: true, orderId: true,
+            orderCategory: true, buyerUsername: true, globalTotal: true, quantity: true,
+            orderStatus: true, orderPaidAt: true, orderCreatedAt: true, soldAt: true,
+            status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true, storeId: true,
+            platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true, calcPackaging: true,
+          },
+        })
+      : Promise.resolve([]),
     prisma.order.findMany({
-      where:  { storeId: { in: storeIds }, orderCategory: { in: REVENUE_ORDER_CATEGORIES }, soldAt: { gte: sixMonthsAgo } },
+      where:  { storeId: { in: storeIds }, orderCategory: { in: REVENUE_ORDER_CATEGORIES }, orderPaidAt: { gte: sixMonthsAgo } },
       select: {
         salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, orderCreatedAt: true, orderId: true,
         storeId: true, orderCategory: true, orderStatus: true, orderPaidAt: true, status: true,
@@ -318,7 +337,7 @@ async function getSummary(req, res) {
   // ── KPIs do período atual ──────────────────────────────────────────────────
   const breakdown = summarizeOrderBreakdown(allPeriodRaw);
   const upsellerValid = summarizeUniqueOrders(
-    allPeriodRaw,
+    orders,
     isUpsellerValidOrder,
     (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
   );
@@ -396,7 +415,7 @@ async function getSummary(req, res) {
   if (prevRange) {
     const prevBreakdown = summarizeOrderBreakdown(prevOrdersRaw);
     const prevUpsellerValid = summarizeUniqueOrders(
-      prevOrdersRaw,
+      prevRevenueOrdersRaw,
       isUpsellerValidOrder,
       (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
     );
@@ -405,7 +424,7 @@ async function getSummary(req, res) {
       null,
       (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
     );
-    const prevRevenueOrders = prevOrdersRaw.filter(o => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory));
+    const prevRevenueOrders = prevRevenueOrdersRaw.filter(o => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory));
     const prevProfitRevenueBase = prevRevenueOrders
       .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
       .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
@@ -441,7 +460,8 @@ async function getSummary(req, res) {
   // ── Sparkline últimos 6 meses ──────────────────────────────────────────────
   const sparkMap = {};
   for (const o of sparkOrdersRaw) {
-    const key = o.soldAt.toISOString().substring(0, 7);
+    if (!o.orderPaidAt) continue;
+    const key = o.orderPaidAt.toISOString().substring(0, 7);
     if (!sparkMap[key]) sparkMap[key] = { revenue: 0, profit: 0, margin: 0, count: 0 };
     sparkMap[key].revenue += o.salePrice;
     sparkMap[key].profit  += orderProfit(o);
@@ -519,7 +539,7 @@ async function getSummary(req, res) {
   // ── Gráfico mensal ─────────────────────────────────────────────────────────
   const monthlyMap = {};
   for (const o of orders) {
-    const sourceDate = o.orderCreatedAt ?? o.soldAt;
+    const sourceDate = o.orderPaidAt;
     if (!sourceDate) continue;
     const key = formatSaoPauloDay(sourceDate).substring(0, 7);
     if (!monthlyMap[key]) monthlyMap[key] = { month: key, revenue: 0, profit: 0 };
@@ -533,7 +553,7 @@ async function getSummary(req, res) {
   // ── Breakdown por canal ────────────────────────────────────────────────────
   const channelMap = {};
   const channelOrderIds = {};
-  for (const o of allPeriodRaw) {
+  for (const o of orders) {
     if (!isUpsellerValidOrder(o)) continue;
     const ch = marketplaceByStore[o.storeId] ?? 'outros';
     if (!channelMap[ch]) channelMap[ch] = { channel: ch, revenue: 0, profit: 0, orders: 0 };
@@ -562,9 +582,9 @@ async function getSummary(req, res) {
   const dailyStoreOrderIds = {};
   const storeNameMap  = Object.fromEntries(stores.map((s) => [s.id, { name: s.name, marketplace: s.marketplace }]));
 
-  for (const o of allPeriodRaw) {
+  for (const o of orders) {
     if (!isUpsellerValidOrder(o)) continue;
-    const sourceDate = o.orderCreatedAt ?? o.soldAt;
+    const sourceDate = o.orderPaidAt;
     if (!sourceDate) continue;
     const day = formatSaoPauloDay(sourceDate);
     const orderKey = getOrderUniqueKey(o);

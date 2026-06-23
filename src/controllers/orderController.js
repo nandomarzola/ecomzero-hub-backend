@@ -172,30 +172,54 @@ async function listOrders(req, res) {
   const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
   const storeIds = stores.map((s) => s.id);
 
-  const baseWhere = { storeId: { in: storeIds } };
+  const storeFilter = { storeId: { in: storeIds } };
 
   const dateRange = buildDateRange(startDate, endDate);
+  let createdDateFilter = {};
+  let paidDateFilter = {};
   if (dateRange) {
-    baseWhere.soldAt = {
-      gte: dateRange.start,
-      lte: dateRange.end,
+    createdDateFilter = {
+      soldAt: {
+        gte: dateRange.start,
+        lte: dateRange.end,
+      },
+    };
+    paidDateFilter = {
+      orderPaidAt: {
+        gte: dateRange.start,
+        lte: dateRange.end,
+      },
     };
   } else if (month) {
     const { year: y, month: mo } = parseYearMonth(month);
-    baseWhere.soldAt = {
-      gte: new Date(Date.UTC(y, mo - 1, 1)),
-      lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+    createdDateFilter = {
+      soldAt: {
+        gte: new Date(Date.UTC(y, mo - 1, 1)),
+        lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+      },
+    };
+    paidDateFilter = {
+      orderPaidAt: {
+        gte: new Date(Date.UTC(y, mo - 1, 1)),
+        lte: new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999)),
+      },
     };
   }
 
-  const where = { ...baseWhere };
-  if (orderCategory === 'cancelled') {
-    where.status = 'cancelled';
+  const createdBaseWhere = { ...storeFilter, ...createdDateFilter };
+  const revenueBaseWhere = { ...storeFilter, ...paidDateFilter };
+
+  let where = { ...createdBaseWhere };
+  if (['valid', 'pending'].includes(orderCategory)) {
+    where = { ...revenueBaseWhere, orderCategory };
   } else if (orderCategory === 'returned') {
-    where.status = 'returned';
+    where = { ...revenueBaseWhere, status: 'returned' };
+  } else if (orderCategory === 'cancelled') {
+    where = { ...createdBaseWhere, status: 'cancelled' };
   } else if (orderCategory) {
-    where.orderCategory = orderCategory;
+    where = { ...revenueBaseWhere, orderCategory };
   }
+
   if (status) where.status = status;
 
   if (search && search.trim()) {
@@ -219,7 +243,7 @@ async function listOrders(req, res) {
   const taxRateMap = new Map(taxStores.map((s) => [s.id, s.taxRate ?? 0]));
   const marketplaceMap = new Map(taxStores.map((s) => [s.id, s.marketplace ?? 'shopee']));
 
-  const [orders, total, tabGroups, revenueOrders, aggCancelled, orphanCount] = await Promise.all([
+  const [orders, total, tabAll, tabValid, tabPending, tabCancelled, tabReturned, revenueOrders, aggCancelled, orphanCount] = await Promise.all([
     prisma.order.findMany({
       where,
       include: { product: { select: { name: true, sku: true } } },
@@ -228,15 +252,14 @@ async function listOrders(req, res) {
       take,
     }),
     prisma.order.count({ where }),
-    prisma.order.groupBy({
-      by:    ['orderCategory', 'status'],
-      where: baseWhere,
-      _count: { _all: true },
-    }),
-    // Totais financeiros recomputados do RAW (igual ao Fechamento Mensal) —
-    // nunca confiar em calcShopeeFee/calcNetRevenue/calcGrossProfit armazenados (podem estar desatualizados)
+    prisma.order.count({ where: createdBaseWhere }),
+    prisma.order.count({ where: { ...revenueBaseWhere, orderCategory: 'valid' } }),
+    prisma.order.count({ where: { ...revenueBaseWhere, orderCategory: 'pending' } }),
+    prisma.order.count({ where: { ...createdBaseWhere, status: 'cancelled' } }),
+    prisma.order.count({ where: { ...revenueBaseWhere, status: 'returned' } }),
+    // Totais financeiros pela lógica Upseller: vendas válidas entram pelo pagamento/validação.
     prisma.order.findMany({
-      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending'] } },
+      where: { ...revenueBaseWhere, orderCategory: { in: ['valid', 'pending'] } },
       select: {
         id: true, storeId: true, orderId: true, orderCategory: true, calcGmv: true, salePrice: true, quantity: true,
         platformCommission: true, platformServiceFee: true,
@@ -247,24 +270,23 @@ async function listOrders(req, res) {
     }),
     // Totais de cancelados
     prisma.order.aggregate({
-      where: { ...baseWhere, status: 'cancelled' },
+      where: { ...createdBaseWhere, status: 'cancelled' },
       _sum:  { calcGmv: true },
       _count: { _all: true },
     }),
     // Pedidos com receita mas sem custo de produto cadastrado
     prisma.order.count({
-      where: { ...baseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] }, hasCost: false },
+      where: { ...revenueBaseWhere, orderCategory: { in: ['valid', 'pending', 'returned_partial'] }, hasCost: false },
     }),
   ]);
 
-  const tabCounts = { all: 0, valid: 0, cancelled: 0, returned: 0, pending: 0 };
-  for (const g of tabGroups) {
-    tabCounts.all += g._count._all;
-    if (g.orderCategory === 'valid')   tabCounts.valid     += g._count._all;
-    if (g.status === 'cancelled')      tabCounts.cancelled += g._count._all;
-    if (g.status === 'returned')       tabCounts.returned  += g._count._all;
-    if (g.orderCategory === 'pending') tabCounts.pending   += g._count._all;
-  }
+  const tabCounts = {
+    all: tabAll,
+    valid: tabValid,
+    cancelled: tabCancelled,
+    returned: tabReturned,
+    pending: tabPending,
+  };
 
   // Recompute financeiro com a cadeia canônica:
   // repasse confirmado quando existe escrow; enquanto não existe, usa calc* recalculado.
