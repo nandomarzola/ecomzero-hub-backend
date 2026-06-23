@@ -2,6 +2,11 @@ const prisma      = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 const { r2, parseYearMonth } = require('../lib/utils');
 
+// São Paulo é UTC-3 fixo (sem horário de verão desde 2019)
+function spToUtc(year, month, day, h = 0, min = 0, sec = 0, ms = 0) {
+  return new Date(Date.UTC(year, month - 1, day, h + 3, min, sec, ms));
+}
+
 function fmtBRL(n) {
   const abs = Math.abs(n ?? 0).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
   return 'R$ ' + abs;
@@ -130,8 +135,12 @@ function makeH(doc, ML = 42, MR = 553) {
 // ── Core: compute monthly data ─────────────────────────────────────────────────
 async function buildClosingData(storeIds, month) {
   const { year: y, month: mo } = parseYearMonth(month);
-  const start = new Date(Date.UTC(y, mo - 1, 1));
-  const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
+  // Range em horário de São Paulo (UTC-3) — mesmo critério do dashboard/appAuthController.
+  // spToUtc(y, mo, 1) = dia 1 às 00:00 SP = 03:00 UTC
+  // Último dia do mês: new Date(y, mo, 0) dá o último dia de mo-1; passamos dia 0 do mês seguinte
+  const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate(); // nº do último dia
+  const start = spToUtc(y, mo, 1);
+  const end   = spToUtc(y, mo, lastDay, 23, 59, 59, 999);
 
   const stores = await prisma.store.findMany({
     where:  { id: { in: storeIds } },
@@ -693,9 +702,10 @@ async function reopenMonth(req, res) {
     if (storeId) storeWhere.id = storeId;
     const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
     if (!stores.length) return res.status(404).json({ error: 'Loja nao encontrada' });
-    const sid = stores[0].id;
+    const storeIds = stores.map(s => s.id);
 
-    await prisma.monthlyClosing.deleteMany({ where: { storeId: sid, periodMonth: month } });
+    // Deleta para TODAS as lojas filtradas (não só a primeira)
+    await prisma.monthlyClosing.deleteMany({ where: { storeId: { in: storeIds }, periodMonth: month } });
     return res.json({ success: true, message: `Mes ${month} reaberto` });
   } catch (err) {
     console.error(err);
