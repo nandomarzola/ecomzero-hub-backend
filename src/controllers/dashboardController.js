@@ -143,6 +143,10 @@ function summarizeUniqueOrders(orders, predicate, valueSelector) {
   };
 }
 
+function countUniqueOrders(orders) {
+  return new Set(orders.map(getOrderUniqueKey).filter(Boolean)).size;
+}
+
 function isUpsellerValidOrder(order) {
   const rawStatus = String(order.orderStatus ?? '').toUpperCase();
   return UPSELLER_VALID_CATEGORIES.includes(order.orderCategory) && rawStatus !== 'CANCELLED';
@@ -204,6 +208,9 @@ async function getSummary(req, res) {
   if (!storeIds.length) {
     return res.json({
       totalRevenue: 0, totalProfit: 0, avgMargin: 0, totalOrders: 0, avgTicket: 0,
+      confirmedRepasse: 0, confirmedNetRevenue: 0, confirmedProfit: 0, confirmedRepasseOrders: 0,
+      estimatedRepasse: 0, estimatedNetRevenue: 0, estimatedProfit: 0, awaitingRepasseOrders: 0,
+      projectedRepasse: 0, projectedProfit: 0, projectedMargin: 0, projectedGmv: 0,
       negativeMargin: 0, topProducts: [], worstProducts: [], monthlyChart: [],
       costsBreakdown: {}, prevKPIs: null, sparkline: [], channelBreakdown: [], dailyHeatmap: [],
       closedRevenue: { total: 0, months: [] },
@@ -344,20 +351,22 @@ async function getSummary(req, res) {
 
   const totalItems    = paidUnits;
   const totalRevenue  = validSales;
-  const profitRevenueBase = orders
-    .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
+  const confirmedOrders = orders.filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]));
+  const profitRevenueBase = confirmedOrders
     .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
-  const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
+  const totalProfit   = confirmedOrders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = profitRevenueBase > 0 ? (totalProfit / profitRevenueBase) * 100 : 0;
-  const confirmedRepasse = orders
-    .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
-    .reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
+  const confirmedRepasse = confirmedOrders.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
+  const confirmedRepasseOrders = countUniqueOrders(confirmedOrders);
   const estimatedOrders = orders.filter((o) => (
     REVENUE_ORDER_CATEGORIES.includes(o.orderCategory)
     && !isConfirmedPaidOrder(o, marketplaceByStore[o.storeId])
   ));
   const estimatedOrdersReliable = estimatedOrders.filter((o) => expectedRepasse(o, marketplaceByStore[o.storeId]) !== null);
   const estimatedOrdersUnreliable = estimatedOrders.length - estimatedOrdersReliable.length;
+  const awaitingRepasseOrders = countUniqueOrders(estimatedOrders);
+  const estimatedProfitOrders = countUniqueOrders(estimatedOrdersReliable);
+  const estimatedProfitOrdersUnreliable = Math.max(0, awaitingRepasseOrders - estimatedProfitOrders);
   const estimatedRepasse = estimatedOrdersReliable.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
   const estimatedProfit = estimatedOrdersReliable.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId]), 0);
   const projectedProfit = totalProfit + estimatedProfit;
@@ -604,7 +613,9 @@ async function getSummary(req, res) {
         const factor = daysInMonth / dayOfMonth;
         projection = {
           revenue:     parseFloat((totalRevenue * factor).toFixed(2)),
-          profit:      parseFloat((totalProfit  * factor).toFixed(2)),
+          profit:      parseFloat((projectedProfit * factor).toFixed(2)),
+          confirmedProfit: parseFloat((totalProfit * factor).toFixed(2)),
+          estimatedProfit: parseFloat((estimatedProfit * factor).toFixed(2)),
           daysElapsed: dayOfMonth,
           daysInMonth,
         };
@@ -636,14 +647,21 @@ async function getSummary(req, res) {
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
     confirmedRepasse: parseFloat(confirmedRepasse.toFixed(2)),
+    confirmedNetRevenue: parseFloat(confirmedRepasse.toFixed(2)),
+    confirmedProfit: parseFloat(totalProfit.toFixed(2)),
+    confirmedRepasseOrders,
     estimatedRepasse: parseFloat(estimatedRepasse.toFixed(2)),
+    estimatedNetRevenue: parseFloat(estimatedRepasse.toFixed(2)),
     projectedRepasse: parseFloat((confirmedRepasse + estimatedRepasse).toFixed(2)),
     estimatedProfit:  parseFloat(estimatedProfit.toFixed(2)),
     projectedProfit:  parseFloat(projectedProfit.toFixed(2)),
     projectedMargin:  parseFloat(projectedMargin.toFixed(2)),
     projectedGmv:     parseFloat(projectedGmv.toFixed(2)),
-    estimatedProfitOrders: estimatedOrdersReliable.length,
-    estimatedProfitOrdersUnreliable: estimatedOrdersUnreliable,
+    awaitingRepasseOrders,
+    estimatedProfitOrders,
+    estimatedProfitOrderLines: estimatedOrdersReliable.length,
+    estimatedProfitOrdersUnreliable,
+    estimatedProfitOrderLinesUnreliable: estimatedOrdersUnreliable,
     totalOrders,
     paidOrders,
     paidUnits,
