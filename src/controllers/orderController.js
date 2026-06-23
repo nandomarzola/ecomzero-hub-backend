@@ -10,6 +10,29 @@ const { r2, parsePage, parseYearMonth } = require('../lib/utils');
 
 const PROCESSING_STALE_MS = 12 * 60 * 1000;
 const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
+const APP_TIMEZONE = 'America/Sao_Paulo';
+
+function saoPauloDateToUtc(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
+  return new Date(Date.UTC(year, month - 1, day, hour + 3, minute, second, millisecond));
+}
+
+function parseYmd(value) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return null;
+  const [year, month, day] = String(value).split('-').map(Number);
+  return { year, month, day };
+}
+
+function buildDateRange(startDate, endDate) {
+  if (!startDate && !endDate) return null;
+  const startParts = parseYmd(startDate) ?? parseYmd(endDate);
+  const endParts = parseYmd(endDate) ?? parseYmd(startDate);
+  if (!startParts || !endParts) return null;
+  return {
+    start: saoPauloDateToUtc(startParts.year, startParts.month, startParts.day),
+    end: saoPauloDateToUtc(endParts.year, endParts.month, endParts.day, 23, 59, 59, 999),
+    timezone: APP_TIMEZONE,
+  };
+}
 
 function getOrderUniqueKey(order) {
   return order.orderId || order.id;
@@ -142,7 +165,7 @@ async function importStatus(req, res) {
 
 // GET /api/orders — lista paginada com contagem por aba
 async function listOrders(req, res) {
-  const { storeId, month, orderCategory, status, search, page = 1, limit = 30 } = req.query;
+  const { storeId, month, startDate, endDate, orderCategory, status, search, page = 1, limit = 30 } = req.query;
 
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
@@ -151,7 +174,13 @@ async function listOrders(req, res) {
 
   const baseWhere = { storeId: { in: storeIds } };
 
-  if (month) {
+  const dateRange = buildDateRange(startDate, endDate);
+  if (dateRange) {
+    baseWhere.soldAt = {
+      gte: dateRange.start,
+      lte: dateRange.end,
+    };
+  } else if (month) {
     const { year: y, month: mo } = parseYearMonth(month);
     baseWhere.soldAt = {
       gte: new Date(Date.UTC(y, mo - 1, 1)),
