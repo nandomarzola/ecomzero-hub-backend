@@ -167,6 +167,21 @@ function confirmedProfit(order, marketplace) {
   return repasse - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
 }
 
+function expectedRepasse(order, marketplace) {
+  if (isConfirmedPaidOrder(order, marketplace)) {
+    return String(marketplace ?? '').toLowerCase() === 'shopee'
+      ? (order.escrowAmount ?? 0)
+      : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
+  }
+  if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
+  return order.calcNetRevenue ?? order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0;
+}
+
+function expectedProfit(order, marketplace) {
+  if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
+  return expectedRepasse(order, marketplace) - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
+}
+
 // GET /api/dashboard/summary
 async function getSummary(req, res) {
   const { storeId, startDate, endDate } = req.query;
@@ -325,6 +340,20 @@ async function getSummary(req, res) {
     .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = profitRevenueBase > 0 ? (totalProfit / profitRevenueBase) * 100 : 0;
+  const confirmedRepasse = orders
+    .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
+    .reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
+  const estimatedOrders = orders.filter((o) => (
+    REVENUE_ORDER_CATEGORIES.includes(o.orderCategory)
+    && !isConfirmedPaidOrder(o, marketplaceByStore[o.storeId])
+  ));
+  const estimatedRepasse = estimatedOrders.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
+  const estimatedProfit = estimatedOrders.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId]), 0);
+  const projectedProfit = totalProfit + estimatedProfit;
+  const projectedGmv = orders
+    .filter((o) => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory))
+    .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
+  const projectedMargin = projectedGmv > 0 ? (projectedProfit / projectedGmv) * 100 : 0;
   const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
   const salesPerClient = clientsCount > 0 ? totalRevenue / clientsCount : 0;
   const negativeMargin = orders.filter((o) => orderProfit(o) < 0).length;
@@ -594,6 +623,14 @@ async function getSummary(req, res) {
     totalRevenue:   parseFloat(totalRevenue.toFixed(2)),
     totalProfit:    parseFloat(totalProfit.toFixed(2)),
     avgMargin:      parseFloat(avgMargin.toFixed(2)),
+    confirmedRepasse: parseFloat(confirmedRepasse.toFixed(2)),
+    estimatedRepasse: parseFloat(estimatedRepasse.toFixed(2)),
+    projectedRepasse: parseFloat((confirmedRepasse + estimatedRepasse).toFixed(2)),
+    estimatedProfit:  parseFloat(estimatedProfit.toFixed(2)),
+    projectedProfit:  parseFloat(projectedProfit.toFixed(2)),
+    projectedMargin:  parseFloat(projectedMargin.toFixed(2)),
+    projectedGmv:     parseFloat(projectedGmv.toFixed(2)),
+    estimatedProfitOrders: estimatedOrders.length,
     totalOrders,
     paidOrders,
     paidUnits,
