@@ -229,9 +229,9 @@ function convertMlOrder(mlOrder, storeId, importId, store, productId = null, sel
     lmmDiscount:      0,
     globalTotal:      r2(mlOrder.total_amount ?? 0),
     orderTotal:       r2(mlOrder.paid_amount ?? 0),
-    // escrowAmount = paid_amount do ML (repasse real creditado ao vendedor)
-    // equivalente ao escrowAmount da Shopee — usado pelo closingController como fonte da verdade
-    escrowAmount:     isRevenue && paidAmount > 0 ? paidAmount : null,
+    // ML não tem escrow. O repasse ao vendedor é inferido via orderNet
+    // (calcGmv - platformCommission - platformServiceFee). escrowAmount permanece null.
+    escrowAmount:     null,
     buyerUsername:    mlOrder.buyer?.nickname ?? null,
     listingType:      listingType,
     trackingNumber:   String(shipping?.id ?? '') || null,
