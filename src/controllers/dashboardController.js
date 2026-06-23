@@ -148,6 +148,25 @@ function isUpsellerValidOrder(order) {
   return UPSELLER_VALID_CATEGORIES.includes(order.orderCategory) && rawStatus !== 'CANCELLED';
 }
 
+function isConfirmedPaidOrder(order, marketplace) {
+  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+  if (rawStatus === 'CANCELLED') return false;
+  if (order.orderCategory !== 'valid') return false;
+  if (String(marketplace ?? '').toLowerCase() === 'shopee') {
+    return order.escrowAmount !== null && order.escrowAmount !== undefined;
+  }
+  return !!order.orderPaidAt || order.status === 'paid';
+}
+
+function confirmedProfit(order, marketplace) {
+  if (!isConfirmedPaidOrder(order, marketplace)) return 0;
+  const mp = String(marketplace ?? '').toLowerCase();
+  const repasse = mp === 'shopee'
+    ? (order.escrowAmount ?? 0)
+    : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
+  return repasse - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
+}
+
 // GET /api/dashboard/summary
 async function getSummary(req, res) {
   const { storeId, startDate, endDate } = req.query;
@@ -155,7 +174,7 @@ async function getSummary(req, res) {
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
 
-  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, name: true, marketplace: true } });
+  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, name: true, marketplace: true, taxRate: true } });
   const storeIds           = stores.map((s) => s.id);
   const marketplaceByStore = Object.fromEntries(stores.map((s) => [s.id, s.marketplace]));
   const storeNameByStore   = Object.fromEntries(stores.map((s) => [s.id, s.name]));
@@ -197,6 +216,7 @@ async function getSummary(req, res) {
         id: true, salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true,
         orderCreatedAt: true, orderPaidAt: true, orderStatus: true, quantity: true, calcGmv: true,
         storeId: true, orderId: true, orderCategory: true, buyerUsername: true, globalTotal: true,
+        status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true,
       },
     }),
     prevRange
@@ -206,12 +226,17 @@ async function getSummary(req, res) {
             id: true, salePrice: true, profit: true, calcGrossProfit: true, calcGmv: true, margin: true, orderId: true,
             orderCategory: true, buyerUsername: true, globalTotal: true, quantity: true,
             orderStatus: true, orderPaidAt: true, orderCreatedAt: true, soldAt: true,
+            status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true, storeId: true,
           },
         })
       : Promise.resolve([]),
     prisma.order.findMany({
       where:  { storeId: { in: storeIds }, orderCategory: { in: REVENUE_ORDER_CATEGORIES }, soldAt: { gte: sixMonthsAgo } },
-      select: { salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, orderCreatedAt: true, orderId: true },
+      select: {
+        salePrice: true, profit: true, calcGrossProfit: true, margin: true, soldAt: true, orderCreatedAt: true, orderId: true,
+        storeId: true, orderCategory: true, orderStatus: true, orderPaidAt: true, status: true,
+        escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcTax: true, calcGmv: true,
+      },
     }),
     prisma.order.findMany({
       where:   { ...revenueOrderWhere, productId: { not: null } },
@@ -228,6 +253,12 @@ async function getSummary(req, res) {
         shopeeShippingCost: true,
         profit:             true,
         margin:             true,
+        orderCategory:      true,
+        orderStatus:        true,
+        orderPaidAt:        true,
+        status:             true,
+        escrowAmount:       true,
+        calcNetRevenue:     true,
         product: { select: { id: true, name: true, costPrice: true, packaging: true } },
       },
     }),
@@ -244,16 +275,14 @@ async function getSummary(req, res) {
       select: {
         id: true, storeId: true, orderId: true, orderCategory: true, orderStatus: true,
         orderPaidAt: true, orderCreatedAt: true, soldAt: true, globalTotal: true,
-        calcGmv: true, salePrice: true,
+        calcGmv: true, salePrice: true, status: true, escrowAmount: true,
+        calcNetRevenue: true, calcProductCost: true, calcTax: true,
         buyerUsername: true, quantity: true,
       },
     }),
   ]);
 
-  // Lucro robusto por pedido: calcGrossProfit é a fonte da verdade (recomputado do raw
-  // no recalculateService). Fallback para o campo legado `profit` quando calc* ausente
-  // — assim o número não depende de o recalculate ter rodado.
-  const orderProfit = (o) => o.calcGrossProfit ?? o.profit ?? 0;
+  const orderProfit = (o) => confirmedProfit(o, marketplaceByStore[o.storeId]);
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
   const breakdown = summarizeOrderBreakdown(allPeriodRaw);
@@ -291,8 +320,11 @@ async function getSummary(req, res) {
 
   const totalItems    = paidUnits;
   const totalRevenue  = validSales;
+  const profitRevenueBase = orders
+    .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
+    .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
-  const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
+  const avgMargin     = profitRevenueBase > 0 ? (totalProfit / profitRevenueBase) * 100 : 0;
   const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
   const salesPerClient = clientsCount > 0 ? totalRevenue / clientsCount : 0;
   const negativeMargin = orders.filter((o) => orderProfit(o) < 0).length;
@@ -324,6 +356,9 @@ async function getSummary(req, res) {
       (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
     );
     const prevRevenueOrders = prevOrdersRaw.filter(o => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory));
+    const prevProfitRevenueBase = prevRevenueOrders
+      .filter((o) => isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]))
+      .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
     const prevClients    = new Set(prevOrdersRaw.map(o => o.buyerUsername).filter(Boolean));
     const prevPaidCount  = prevUpsellerValid.orders;
     const prevRevenue    = prevUpsellerValid.value;
@@ -332,7 +367,7 @@ async function getSummary(req, res) {
     prevKPIs = {
       totalRevenue:  parseFloat(prevRevenue.toFixed(2)),
       totalProfit:   parseFloat(prevProfit.toFixed(2)),
-      avgMargin:     prevRevenue > 0 ? parseFloat(((prevProfit / prevRevenue) * 100).toFixed(2)) : 0,
+      avgMargin:     prevProfitRevenueBase > 0 ? parseFloat(((prevProfit / prevProfitRevenueBase) * 100).toFixed(2)) : 0,
       totalOrders:   prevPaidCount,
       paidOrders:    prevPaidCount,
       paidUnits:     prevUpsellerValid.units,
@@ -833,7 +868,7 @@ async function getShopeeSummary(req, res) {
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
 
-  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true } });
   const storeIds = stores.map((s) => s.id);
   if (!storeIds.length) return res.json({ summaries: [], totals: null });
 
@@ -845,35 +880,65 @@ async function getShopeeSummary(req, res) {
     orderBy: { month: 'desc' },
   });
 
-  // Aggregate across stores/months if no filter
-  const totals = summaries.reduce(
-    (acc, s) => ({
-      gmv:                  acc.gmv              + s.gmv,
-      shopeeDeductions:     acc.shopeeDeductions + s.shopeeDeductions,
-      netRevenue:           acc.netRevenue        + s.netRevenue,
-      tax:                  acc.tax              + (s.tax ?? 0),
-      grossProfit:          acc.grossProfit       + s.grossProfit,
-      validCount:           acc.validCount        + s.validCount,
-      unitCount:            acc.unitCount         + s.unitCount,
-      cancelledCount:       acc.cancelledCount    + s.cancelledCount,
-      cancelledGmv:         acc.cancelledGmv      + s.cancelledGmv,
-      unpaidCount:          acc.unpaidCount       + s.unpaidCount,
-      unpaidGmv:            acc.unpaidGmv         + s.unpaidGmv,
-      returnedFullCount:    acc.returnedFullCount + s.returnedFullCount,
-      returnedFullValue:    acc.returnedFullValue + s.returnedFullValue,
-      returnedPartialCount: acc.returnedPartialCount + s.returnedPartialCount,
-      returnedPartialValue: acc.returnedPartialValue + s.returnedPartialValue,
-    }),
-    {
-      gmv: 0, shopeeDeductions: 0, netRevenue: 0, tax: 0, grossProfit: 0,
-      validCount: 0, unitCount: 0,
-      cancelledCount: 0, cancelledGmv: 0,
-      unpaidCount: 0, unpaidGmv: 0,
-      returnedFullCount: 0, returnedFullValue: 0,
-      returnedPartialCount: 0, returnedPartialValue: 0,
-    }
-  );
+  const monthRange = month && /^\d{4}-\d{2}$/.test(String(month))
+    ? buildDateRange(`${month}-01`, (() => {
+        const [y, m] = String(month).split('-').map(Number);
+        return `${month}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0')}`;
+      })())
+    : null;
 
+  const liveOrders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      ...orderPeriodWhere(monthRange),
+    },
+    select: {
+      id: true, orderId: true, orderCategory: true, orderStatus: true, orderPaidAt: true,
+      status: true, escrowAmount: true, calcNetRevenue: true, calcProductCost: true,
+      calcTax: true, calcGmv: true, salePrice: true, quantity: true, cancelReason: true,
+    },
+  });
+
+  const breakdown = summarizeOrderBreakdown(liveOrders);
+  const confirmed = liveOrders.filter((o) => isConfirmedPaidOrder(o, 'shopee'));
+  const uniqueCountBy = (orders, predicate) => orders
+    .filter(predicate)
+    .reduce((set, o) => set.add(getOrderUniqueKey(o)), new Set()).size;
+
+  const totals = {
+    gmv: confirmed.reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
+    netRevenue: confirmed.reduce((s, o) => s + (o.escrowAmount ?? 0), 0),
+    tax: confirmed.reduce((s, o) => s + (o.calcTax ?? 0), 0),
+    grossProfit: confirmed.reduce((s, o) => s + confirmedProfit(o, 'shopee'), 0),
+    validCount: breakdown.valid.orders,
+    unitCount: breakdown.valid.units,
+    cancelledCount: breakdown.cancelled.orders,
+    cancelledGmv: liveOrders
+      .filter((o) => o.orderCategory === 'cancelled_other')
+      .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
+    unpaidCount: breakdown.unpaid.orders,
+    unpaidGmv: liveOrders
+      .filter((o) => o.orderCategory === 'cancelled_unpaid' || String(o.orderStatus ?? '').toUpperCase() === 'UNPAID')
+      .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
+    returnedFullCount: uniqueCountBy(liveOrders, (o) => o.orderCategory === 'returned_full'),
+    returnedFullValue: liveOrders
+      .filter((o) => o.orderCategory === 'returned_full')
+      .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
+    returnedPartialCount: uniqueCountBy(liveOrders, (o) => o.orderCategory === 'returned_partial'),
+    returnedPartialValue: liveOrders
+      .filter((o) => o.orderCategory === 'returned_partial')
+      .reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0),
+  };
+
+  totals.gmv = r2(totals.gmv);
+  totals.netRevenue = r2(totals.netRevenue);
+  totals.tax = r2(totals.tax);
+  totals.grossProfit = r2(totals.grossProfit);
+  totals.cancelledGmv = r2(totals.cancelledGmv);
+  totals.unpaidGmv = r2(totals.unpaidGmv);
+  totals.returnedFullValue = r2(totals.returnedFullValue);
+  totals.returnedPartialValue = r2(totals.returnedPartialValue);
+  totals.shopeeDeductions = r2(totals.gmv - totals.netRevenue);
   totals.margin = totals.gmv > 0 ? parseFloat(((totals.grossProfit / totals.gmv) * 100).toFixed(2)) : 0;
   totals.returnedCount = totals.returnedFullCount + totals.returnedPartialCount;
   totals.returnedValue = parseFloat((totals.returnedFullValue + totals.returnedPartialValue).toFixed(2));
@@ -883,13 +948,14 @@ async function getShopeeSummary(req, res) {
 
   // Parse cancel reason breakdowns
   const cancelReasonMap = {};
-  for (const s of summaries) {
-    try {
-      const reasons = JSON.parse(s.cancelReasonBreakdown || '{}');
-      for (const [reason, count] of Object.entries(reasons)) {
-        cancelReasonMap[reason] = (cancelReasonMap[reason] || 0) + count;
-      }
-    } catch {}
+  const reasonOrderIds = new Set();
+  for (const o of liveOrders) {
+    if (!String(o.orderCategory ?? '').startsWith('cancelled')) continue;
+    const key = getOrderUniqueKey(o);
+    if (reasonOrderIds.has(key)) continue;
+    reasonOrderIds.add(key);
+    const reason = o.cancelReason || 'Motivo não informado';
+    cancelReasonMap[reason] = (cancelReasonMap[reason] || 0) + 1;
   }
 
   return res.json({
