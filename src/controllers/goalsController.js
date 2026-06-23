@@ -1,6 +1,59 @@
 const prisma = require('../lib/prisma');
 const { parseYearMonth } = require('../lib/utils');
 
+const APP_TIMEZONE = 'America/Sao_Paulo';
+const VALID_CATEGORIES = ['valid', 'pending'];
+
+function saoPauloDateToUtc(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
+  return new Date(Date.UTC(year, month - 1, day, hour + 3, minute, second, millisecond));
+}
+
+function getZonedParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const out = {};
+  for (const part of parts) if (part.type !== 'literal') out[part.type] = Number(part.value);
+  return out;
+}
+
+function formatSaoPauloMonth(date) {
+  const parts = getZonedParts(date);
+  return `${parts.year}-${String(parts.month).padStart(2, '0')}`;
+}
+
+function orderPeriodWhere(start, end) {
+  return {
+    OR: [
+      { orderCreatedAt: { gte: start, lte: end } },
+      { orderCreatedAt: null, soldAt: { gte: start, lte: end } },
+    ],
+  };
+}
+
+function summarizeValidOrders(orders) {
+  const byOrder = new Map();
+  for (const order of orders) {
+    if (!VALID_CATEGORIES.includes(order.orderCategory)) continue;
+    if (String(order.orderStatus ?? '').toUpperCase() === 'CANCELLED') continue;
+    const key = order.orderId || order.id;
+    if (!key) continue;
+    if (!byOrder.has(key)) byOrder.set(key, { revenue: 0, profit: 0 });
+    const bucket = byOrder.get(key);
+    bucket.revenue = Math.max(bucket.revenue, order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0);
+    bucket.profit += order.calcGrossProfit ?? order.profit ?? 0;
+  }
+  const values = [...byOrder.values()];
+  return {
+    revenue: values.reduce((sum, item) => sum + item.revenue, 0),
+    profit: values.reduce((sum, item) => sum + item.profit, 0),
+    orders: byOrder.size,
+  };
+}
+
 async function upsertGoal(req, res) {
   const { month, revenue = 0, profit = 0, orders = 0 } = req.body;
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
@@ -38,19 +91,22 @@ async function getGoalWithProgress(req, res) {
 
   const storeIds = stores.map((s) => s.id);
   const { year: y, month: mo } = parseYearMonth(month);
-  const startDate  = new Date(y, mo - 1, 1);
+  const startDate  = saoPauloDateToUtc(y, mo, 1);
   const today      = new Date();
-  const isCurrentMonth = today.getFullYear() === y && today.getMonth() + 1 === mo;
-  const endDate    = isCurrentMonth ? today : new Date(y, mo, 0, 23, 59, 59, 999);
+  const todayParts = getZonedParts(today);
+  const isCurrentMonth = todayParts.year === y && todayParts.month === mo;
+  const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  const endDate = isCurrentMonth ? today : saoPauloDateToUtc(y, mo, lastDay, 23, 59, 59, 999);
 
   const orders = await prisma.order.findMany({
-    where: { storeId: { in: storeIds }, status: 'paid', soldAt: { gte: startDate, lte: endDate } },
-    select: { salePrice: true, profit: true },
+    where: { storeId: { in: storeIds }, ...orderPeriodWhere(startDate, endDate) },
+    select: { id: true, orderId: true, orderStatus: true, orderCategory: true, salePrice: true, calcGmv: true, globalTotal: true, profit: true, calcGrossProfit: true },
   });
 
-  const actualRevenue = orders.reduce((s, o) => s + o.salePrice, 0);
-  const actualProfit  = orders.reduce((s, o) => s + (o.profit ?? 0), 0);
-  const actualOrders  = orders.length;
+  const actual = summarizeValidOrders(orders);
+  const actualRevenue = actual.revenue;
+  const actualProfit  = actual.profit;
+  const actualOrders  = actual.orders;
 
   let projection = null;
   if (isCurrentMonth) {
@@ -108,22 +164,20 @@ async function getGoalsHistory(req, res) {
     where: {
       storeId: { in: storeIds },
       status:  'paid',
-      soldAt:  { gte: new Date(oy, om - 1, 1) },
+      ...orderPeriodWhere({ start: saoPauloDateToUtc(oy, om, 1), end: new Date() }),
     },
-    select: { salePrice: true, profit: true, soldAt: true },
+    select: { id: true, orderId: true, orderStatus: true, orderCategory: true, salePrice: true, calcGmv: true, globalTotal: true, profit: true, calcGrossProfit: true, soldAt: true, orderCreatedAt: true },
   });
 
-  const ordersByMonth = {};
+  const ordersByMonthRows = {};
   for (const o of orders) {
-    const key = o.soldAt.toISOString().substring(0, 7);
-    if (!ordersByMonth[key]) ordersByMonth[key] = { revenue: 0, profit: 0, orders: 0 };
-    ordersByMonth[key].revenue += o.salePrice;
-    ordersByMonth[key].profit  += o.profit ?? 0;
-    ordersByMonth[key].orders++;
+    const key = formatSaoPauloMonth(o.orderCreatedAt ?? o.soldAt);
+    if (!ordersByMonthRows[key]) ordersByMonthRows[key] = [];
+    ordersByMonthRows[key].push(o);
   }
 
   const history = goals.map((goal) => {
-    const a = ordersByMonth[goal.month] ?? { revenue: 0, profit: 0, orders: 0 };
+    const a = summarizeValidOrders(ordersByMonthRows[goal.month] ?? []);
     return {
       month:  goal.month,
       goal:   { revenue: goal.revenue, profit: goal.profit, orders: goal.orders },

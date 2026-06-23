@@ -4,6 +4,7 @@ const { parseYearMonth, r2 } = require('../lib/utils');
 
 const APP_TIMEZONE = 'America/Sao_Paulo';
 const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
+const UPSELLER_VALID_CATEGORIES = ['valid', 'pending'];
 
 function getZonedParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -123,6 +124,30 @@ function summarizeOrderBreakdown(orders) {
   ]));
 }
 
+function summarizeUniqueOrders(orders, predicate, valueSelector) {
+  const byOrder = new Map();
+  for (const order of orders) {
+    if (predicate && !predicate(order)) continue;
+    const key = getOrderUniqueKey(order);
+    if (!key) continue;
+    if (!byOrder.has(key)) byOrder.set(key, { units: 0, value: 0 });
+    const bucket = byOrder.get(key);
+    bucket.units += order.quantity ?? 0;
+    bucket.value = Math.max(bucket.value, valueSelector(order) ?? 0);
+  }
+  const values = [...byOrder.values()];
+  return {
+    orders: byOrder.size,
+    units: values.reduce((sum, item) => sum + item.units, 0),
+    value: values.reduce((sum, item) => sum + item.value, 0),
+  };
+}
+
+function isUpsellerValidOrder(order) {
+  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+  return UPSELLER_VALID_CATEGORIES.includes(order.orderCategory) && rawStatus !== 'CANCELLED';
+}
+
 // GET /api/dashboard/summary
 async function getSummary(req, res) {
   const { storeId, startDate, endDate } = req.query;
@@ -180,7 +205,7 @@ async function getSummary(req, res) {
           select: {
             id: true, salePrice: true, profit: true, calcGrossProfit: true, calcGmv: true, margin: true, orderId: true,
             orderCategory: true, buyerUsername: true, globalTotal: true, quantity: true,
-            orderStatus: true, orderPaidAt: true,
+            orderStatus: true, orderPaidAt: true, orderCreatedAt: true, soldAt: true,
           },
         })
       : Promise.resolve([]),
@@ -219,6 +244,7 @@ async function getSummary(req, res) {
       select: {
         id: true, storeId: true, orderId: true, orderCategory: true, orderStatus: true,
         orderPaidAt: true, orderCreatedAt: true, soldAt: true, globalTotal: true,
+        calcGmv: true, salePrice: true,
         buyerUsername: true, quantity: true,
       },
     }),
@@ -231,11 +257,21 @@ async function getSummary(req, res) {
 
   // ── KPIs do período atual ──────────────────────────────────────────────────
   const breakdown = summarizeOrderBreakdown(allPeriodRaw);
+  const upsellerValid = summarizeUniqueOrders(
+    allPeriodRaw,
+    isUpsellerValidOrder,
+    (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
+  );
+  const allGenerated = summarizeUniqueOrders(
+    allPeriodRaw,
+    null,
+    (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
+  );
   const createdOrders = breakdown.created.orders;
   const createdUnits = breakdown.created.units;
-  const paidOrders = breakdown.paid.orders;
-  const paidUnits = breakdown.paid.units;
-  const validOrders = breakdown.valid.orders;
+  const paidOrders = upsellerValid.orders;
+  const paidUnits = upsellerValid.units;
+  const validOrders = upsellerValid.orders;
   const unpaidOrders = breakdown.unpaid.orders;
   const unpaidUnits = breakdown.unpaid.units;
   const cancelledOrders = breakdown.cancelled.orders;
@@ -245,8 +281,8 @@ async function getSummary(req, res) {
 
   const totalOrders = paidOrders;
   const allClientsSet  = new Set(allPeriodRaw.map(o => o.buyerUsername).filter(Boolean));
-  const totalSales = allPeriodRaw.reduce((s, o) => s + (o.globalTotal ?? 0), 0);
-  const validSales = orders.reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
+  const totalSales = allGenerated.value;
+  const validSales = upsellerValid.value;
   const allClientsCount = allClientsSet.size;
 
   // Clientes únicos (buyerUsername distinto) — fallback para orders (status=paid) se allPeriodRaw vazio
@@ -254,7 +290,7 @@ async function getSummary(req, res) {
   const clientsCount  = clientsSet.size;
 
   const totalItems    = paidUnits;
-  const totalRevenue  = orders.reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
+  const totalRevenue  = validSales;
   const totalProfit   = orders.reduce((s, o) => s + orderProfit(o), 0);
   const avgMargin     = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
   const avgTicket     = paidOrders ? totalRevenue / paidOrders : 0;
@@ -277,10 +313,20 @@ async function getSummary(req, res) {
   let prevKPIs = null;
   if (prevRange) {
     const prevBreakdown = summarizeOrderBreakdown(prevOrdersRaw);
+    const prevUpsellerValid = summarizeUniqueOrders(
+      prevOrdersRaw,
+      isUpsellerValidOrder,
+      (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
+    );
+    const prevGenerated = summarizeUniqueOrders(
+      prevOrdersRaw,
+      null,
+      (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
+    );
     const prevRevenueOrders = prevOrdersRaw.filter(o => REVENUE_ORDER_CATEGORIES.includes(o.orderCategory));
     const prevClients    = new Set(prevOrdersRaw.map(o => o.buyerUsername).filter(Boolean));
-    const prevPaidCount  = prevBreakdown.paid.orders;
-    const prevRevenue    = prevRevenueOrders.reduce((s, o) => s + (o.calcGmv ?? o.salePrice ?? 0), 0);
+    const prevPaidCount  = prevUpsellerValid.orders;
+    const prevRevenue    = prevUpsellerValid.value;
     const prevProfit     = prevRevenueOrders.reduce((s, o) => s + orderProfit(o), 0);
     const prevClientsCount = prevClients.size;
     prevKPIs = {
@@ -289,15 +335,18 @@ async function getSummary(req, res) {
       avgMargin:     prevRevenue > 0 ? parseFloat(((prevProfit / prevRevenue) * 100).toFixed(2)) : 0,
       totalOrders:   prevPaidCount,
       paidOrders:    prevPaidCount,
-      paidUnits:     prevBreakdown.paid.units,
+      paidUnits:     prevUpsellerValid.units,
       createdOrders: prevBreakdown.created.orders,
       createdUnits:  prevBreakdown.created.units,
       unpaidOrders:  prevBreakdown.unpaid.orders,
       cancelledOrders: prevBreakdown.cancelled.orders,
-      validOrders:   prevBreakdown.valid.orders,
+      validOrders:   prevUpsellerValid.orders,
+      upsellerValidOrders: prevUpsellerValid.orders,
+      upsellerValidUnits: prevUpsellerValid.units,
+      upsellerValidRevenue: parseFloat(prevRevenue.toFixed(2)),
       clientsCount:  prevClientsCount,
       salesPerClient: prevClientsCount > 0 ? parseFloat((prevRevenue / prevClientsCount).toFixed(2)) : 0,
-      totalSales:    parseFloat(prevOrdersRaw.reduce((s, o) => s + (o.globalTotal ?? 0), 0).toFixed(2)),
+      totalSales:    parseFloat(prevGenerated.value.toFixed(2)),
       validRevenue:  parseFloat(prevRevenue.toFixed(2)),
       totalPeriodOrders: prevBreakdown.created.orders,
       avgTicket:     prevPaidCount ? parseFloat((prevRevenue / prevPaidCount).toFixed(2)) : 0,
@@ -399,13 +448,16 @@ async function getSummary(req, res) {
   // ── Breakdown por canal ────────────────────────────────────────────────────
   const channelMap = {};
   const channelOrderIds = {};
-  for (const o of orders) {
+  for (const o of allPeriodRaw) {
+    if (!isUpsellerValidOrder(o)) continue;
     const ch = marketplaceByStore[o.storeId] ?? 'outros';
     if (!channelMap[ch]) channelMap[ch] = { channel: ch, revenue: 0, profit: 0, orders: 0 };
     if (!channelOrderIds[ch]) channelOrderIds[ch] = new Set();
-    channelMap[ch].revenue += (o.calcGmv ?? o.salePrice ?? 0);
+    const orderKey = getOrderUniqueKey(o);
+    if (channelOrderIds[ch].has(orderKey)) continue;
+    channelMap[ch].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
     channelMap[ch].profit  += orderProfit(o);
-    channelOrderIds[ch].add(getOrderUniqueKey(o));
+    channelOrderIds[ch].add(orderKey);
     channelMap[ch].orders = channelOrderIds[ch].size;
   }
   const channelBreakdown = Object.values(channelMap).map((c) => ({
@@ -421,21 +473,34 @@ async function getSummary(req, res) {
   // ── Heatmap diário (total + por loja) ─────────────────────────────────────
   const dailyMap      = {};
   const dailyByStore  = {}; // storeId → { date → { revenue, orders } }
+  const dailyOrderIds = {};
+  const dailyStoreOrderIds = {};
   const storeNameMap  = Object.fromEntries(stores.map((s) => [s.id, { name: s.name, marketplace: s.marketplace }]));
 
-  for (const o of orders) {
+  for (const o of allPeriodRaw) {
+    if (!isUpsellerValidOrder(o)) continue;
     const sourceDate = o.orderCreatedAt ?? o.soldAt;
     if (!sourceDate) continue;
     const day = formatSaoPauloDay(sourceDate);
+    const orderKey = getOrderUniqueKey(o);
     // Total
     if (!dailyMap[day]) dailyMap[day] = { date: day, revenue: 0, orders: 0 };
-    dailyMap[day].revenue += (o.calcGmv ?? o.salePrice ?? 0);
-    dailyMap[day].orders++;
+    if (!dailyOrderIds[day]) dailyOrderIds[day] = new Set();
+    if (!dailyOrderIds[day].has(orderKey)) {
+      dailyMap[day].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
+      dailyOrderIds[day].add(orderKey);
+      dailyMap[day].orders = dailyOrderIds[day].size;
+    }
     // Por loja
     if (!dailyByStore[o.storeId]) dailyByStore[o.storeId] = {};
     if (!dailyByStore[o.storeId][day]) dailyByStore[o.storeId][day] = { date: day, revenue: 0, orders: 0 };
-    dailyByStore[o.storeId][day].revenue += (o.calcGmv ?? o.salePrice ?? 0);
-    dailyByStore[o.storeId][day].orders++;
+    if (!dailyStoreOrderIds[o.storeId]) dailyStoreOrderIds[o.storeId] = {};
+    if (!dailyStoreOrderIds[o.storeId][day]) dailyStoreOrderIds[o.storeId][day] = new Set();
+    if (!dailyStoreOrderIds[o.storeId][day].has(orderKey)) {
+      dailyByStore[o.storeId][day].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
+      dailyStoreOrderIds[o.storeId][day].add(orderKey);
+      dailyByStore[o.storeId][day].orders = dailyStoreOrderIds[o.storeId][day].size;
+    }
   }
 
   const dailyHeatmap = Object.values(dailyMap).map((d) => ({
@@ -506,6 +571,9 @@ async function getSummary(req, res) {
     paidCancelledOrders,
     paidCancelledUnits,
     orderBreakdown: breakdown,
+    upsellerValidOrders: validOrders,
+    upsellerValidUnits: paidUnits,
+    upsellerValidRevenue: parseFloat(validSales.toFixed(2)),
     validOrders,
     totalSales:    parseFloat(totalSales.toFixed(2)),  // "Valor Total de Vendas" Upseller
     validRevenue:  parseFloat(validSales.toFixed(2)),  // "Valor de Vendas Válidas" Upseller
