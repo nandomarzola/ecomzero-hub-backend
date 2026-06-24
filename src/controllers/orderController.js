@@ -38,6 +38,24 @@ function getOrderUniqueKey(order) {
   return order.orderId || order.id;
 }
 
+function summarizeUniqueOrders(orders, valueSelector) {
+  const byOrder = new Map();
+  for (const order of orders) {
+    const key = getOrderUniqueKey(order);
+    if (!key) continue;
+    if (!byOrder.has(key)) byOrder.set(key, { units: 0, value: 0 });
+    const bucket = byOrder.get(key);
+    bucket.units += order.quantity ?? 0;
+    bucket.value = Math.max(bucket.value, valueSelector(order) ?? 0);
+  }
+  const values = [...byOrder.values()];
+  return {
+    orders: byOrder.size,
+    units: values.reduce((sum, item) => sum + item.units, 0),
+    value: values.reduce((sum, item) => sum + item.value, 0),
+  };
+}
+
 function isConfirmedRepasse(order, marketplace) {
   if (order.orderCategory !== 'valid') return false;
   if (String(marketplace ?? '').toLowerCase() === 'shopee') {
@@ -63,7 +81,7 @@ function calcOrderFinancials(order, taxRate = 0, marketplace = 'shopee') {
   const profit = confirmed
     ? r2(netRevenue - tax - cost)
     : r2(order.calcGrossProfit ?? (netRevenue - tax - cost));
-  const margin = netRevenue > 0 ? r2((profit / netRevenue) * 100) : 0;
+  const margin = gmv > 0 ? r2((profit / gmv) * 100) : 0;
 
   return { gmv, fee, netRevenue, tax, profit, margin, confirmed };
 }
@@ -268,7 +286,7 @@ async function listOrders(req, res) {
     prisma.order.findMany({
       where: { ...revenueBaseWhere, orderCategory: { in: ['valid', 'pending'] } },
       select: {
-        id: true, storeId: true, orderId: true, orderCategory: true, calcGmv: true, salePrice: true, quantity: true,
+        id: true, storeId: true, orderId: true, orderCategory: true, calcGmv: true, globalTotal: true, salePrice: true, quantity: true,
         platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
         calcProductCost: true, calcPackaging: true, calcShopeeFee: true,
@@ -303,14 +321,16 @@ async function listOrders(req, res) {
   let confirmedNetRevenue = 0, confirmedGrossProfit = 0, estimatedNetRevenue = 0, estimatedGrossProfit = 0;
   const confirmedRepasseIds = new Set();
   const awaitingRepasseIds = new Set();
+  const validGmv = summarizeUniqueOrders(
+    revenueOrders,
+    (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
+  );
   for (const o of revenueOrders) {
     const fin = calcOrderFinancials(o, taxRateMap.get(o.storeId) ?? 0, marketplaceMap.get(o.storeId));
     const orderKey = getOrderUniqueKey(o);
-    gmv         += fin.gmv;
     shopeeFee   += fin.fee;
     netRevenue  += fin.netRevenue;
     grossProfit += fin.profit;
-    units       += o.quantity ?? 0;
     if (fin.confirmed) {
       confirmedNetRevenue += fin.netRevenue;
       confirmedGrossProfit += fin.profit;
@@ -321,6 +341,8 @@ async function listOrders(req, res) {
       if (orderKey) awaitingRepasseIds.add(orderKey);
     }
   }
+  gmv = validGmv.value;
+  units = validGmv.units;
   gmv = r2(gmv); shopeeFee = r2(shopeeFee); netRevenue = r2(netRevenue); grossProfit = r2(grossProfit);
   confirmedNetRevenue = r2(confirmedNetRevenue);
   confirmedGrossProfit = r2(confirmedGrossProfit);
@@ -342,7 +364,7 @@ async function listOrders(req, res) {
     estimatedRepasse: estimatedNetRevenue,
     confirmedRepasseOrders: confirmedRepasseIds.size,
     awaitingRepasseOrders: awaitingRepasseIds.size,
-    margin:       netRevenue > 0 ? r2((grossProfit / netRevenue) * 100) : 0,
+    margin:       gmv > 0 ? r2((grossProfit / gmv) * 100) : 0,
     units,
     cancelledGmv: r2(aggCancelled._sum.calcGmv),
     cancelledCount: aggCancelled._count._all,
