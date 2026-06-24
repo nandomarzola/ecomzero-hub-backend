@@ -1,19 +1,19 @@
 const prisma = require('../lib/prisma');
-const { parseYearMonth } = require('../lib/utils');
+const { parseYearMonth, r2 } = require('../lib/utils');
 
 const APP_TIMEZONE = 'America/Sao_Paulo';
-const VALID_CATEGORIES = ['valid', 'pending'];
 
-function saoPauloDateToUtc(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
-  return new Date(Date.UTC(year, month - 1, day, hour + 3, minute, second, millisecond));
+// Categorias de receita — alinha com closingController.FINANCIAL_REVENUE_CATEGORIES
+const REVENUE_CATEGORIES = ['valid', 'pending', 'returned_partial'];
+
+function spToUtc(y, m, d, h = 0, min = 0, sec = 0, ms = 0) {
+  return new Date(Date.UTC(y, m - 1, d, h + 3, min, sec, ms));
 }
 
 function getZonedParts(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: APP_TIMEZONE,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
+    year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(date);
   const out = {};
   for (const part of parts) if (part.type !== 'literal') out[part.type] = Number(part.value);
@@ -21,38 +21,74 @@ function getZonedParts(date = new Date()) {
 }
 
 function formatSaoPauloMonth(date) {
+  if (!date) return null;
   const parts = getZonedParts(date);
   return `${parts.year}-${String(parts.month).padStart(2, '0')}`;
 }
 
-function orderPeriodWhere(start, end) {
+// Competência de caixa — alinha com closingController.buildClosingData:
+// pedidos confirmados filtrados por orderPaidAt, pendentes por soldAt (fallback)
+function paidPeriodWhere(start, end) {
   return {
     OR: [
-      { orderCreatedAt: { gte: start, lte: end } },
-      { orderCreatedAt: null, soldAt: { gte: start, lte: end } },
+      { orderPaidAt: { gte: start, lte: end } },
+      { orderPaidAt: null, soldAt: { gte: start, lte: end } },
     ],
   };
 }
 
-function summarizeValidOrders(orders) {
+// Fórmula canônica — mirrors closingController.calcLine e appAuthController.calcOrderProfit
+// NUNCA lê calcGrossProfit, calcNetRevenue ou calcTax como entrada do cálculo
+function calcLineProfit(order, taxRate) {
+  const fee     = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const disc    = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const net     = r2((order.calcGmv ?? 0) - fee - disc);
+  const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
+  const repasse = hasEscrow ? r2(order.escrowAmount) : net;
+  const tax     = r2((order.calcGmv ?? 0) * taxRate / 100);
+  const cost    = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
+  return r2(repasse - tax - cost);
+}
+
+// Agrega pedidos por orderId — revenue e profit calculados do raw, sem snapshots
+function summarizeOrders(orders, taxRateByStore) {
   const byOrder = new Map();
   for (const order of orders) {
-    if (!VALID_CATEGORIES.includes(order.orderCategory)) continue;
+    if (!REVENUE_CATEGORIES.includes(order.orderCategory)) continue;
     if (String(order.orderStatus ?? '').toUpperCase() === 'CANCELLED') continue;
     const key = order.orderId || order.id;
     if (!key) continue;
+
+    const taxRate = taxRateByStore?.[order.storeId] ?? 0;
+
     if (!byOrder.has(key)) byOrder.set(key, { revenue: 0, profit: 0 });
     const bucket = byOrder.get(key);
-    bucket.revenue = Math.max(bucket.revenue, order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0);
-    bucket.profit += order.calcGrossProfit ?? order.profit ?? 0;
+
+    // Revenue: soma calcGmv por linha (alinha com Fechamento Mensal — não usa Math.max)
+    bucket.revenue += (order.calcGmv ?? 0);
+
+    // Profit: fórmula canônica — sem snapshot calcGrossProfit
+    bucket.profit += calcLineProfit(order, taxRate);
   }
   const values = [...byOrder.values()];
   return {
-    revenue: values.reduce((sum, item) => sum + item.revenue, 0),
-    profit: values.reduce((sum, item) => sum + item.profit, 0),
-    orders: byOrder.size,
+    revenue: r2(values.reduce((s, v) => s + v.revenue, 0)),
+    profit:  r2(values.reduce((s, v) => s + v.profit, 0)),
+    orders:  byOrder.size,
   };
 }
+
+// Campos necessários para o cálculo canônico (raw fields apenas)
+const ORDER_SELECT = {
+  id: true, orderId: true, storeId: true,
+  orderStatus: true, orderCategory: true,
+  calcGmv: true,
+  platformCommission: true, platformServiceFee: true,
+  sellerCoupon: true, lmmDiscount: true,
+  escrowAmount: true,
+  calcProductCost: true, calcPackaging: true,
+  soldAt: true, orderCreatedAt: true, orderPaidAt: true,
+};
 
 async function upsertGoal(req, res) {
   const { month, revenue = 0, profit = 0, orders = 0 } = req.body;
@@ -84,58 +120,64 @@ async function getGoalWithProgress(req, res) {
   const [goal, stores] = await Promise.all([
     prisma.goal.findUnique({ where: { userId_month: { userId: req.userId, month } } }),
     prisma.store.findMany({
-      where: { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
-      select: { id: true },
+      where:  { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
+      select: { id: true, taxRate: true },
     }),
   ]);
 
-  const storeIds = stores.map((s) => s.id);
+  const storeIds      = stores.map((s) => s.id);
+  const taxRateByStore = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
+
   const { year: y, month: mo } = parseYearMonth(month);
-  const startDate  = saoPauloDateToUtc(y, mo, 1);
-  const today      = new Date();
-  const todayParts = getZonedParts(today);
-  const isCurrentMonth = todayParts.year === y && todayParts.month === mo;
-  const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
-  const endDate = isCurrentMonth ? today : saoPauloDateToUtc(y, mo, lastDay, 23, 59, 59, 999);
+  const startDate = spToUtc(y, mo, 1);
+  const lastDay   = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+
+  const nowParts       = getZonedParts(new Date());
+  const isCurrentMonth = nowParts.year === y && nowParts.month === mo;
+
+  // Para mês corrente: endDate = agora (não inclui o futuro do dia)
+  // Para meses passados: endDate = fim do último dia do mês em SP
+  const endDate = isCurrentMonth
+    ? new Date()
+    : spToUtc(y, mo, lastDay, 23, 59, 59, 999);
 
   const orders = await prisma.order.findMany({
-    where: { storeId: { in: storeIds }, ...orderPeriodWhere(startDate, endDate) },
-    select: { id: true, orderId: true, orderStatus: true, orderCategory: true, salePrice: true, calcGmv: true, globalTotal: true, profit: true, calcGrossProfit: true },
+    where:  { storeId: { in: storeIds }, ...paidPeriodWhere(startDate, endDate) },
+    select: ORDER_SELECT,
   });
 
-  const actual = summarizeValidOrders(orders);
-  const actualRevenue = actual.revenue;
-  const actualProfit  = actual.profit;
-  const actualOrders  = actual.orders;
+  const actual = summarizeOrders(orders, taxRateByStore);
 
   let projection = null;
   if (isCurrentMonth) {
-    const daysPassed = today.getDate();
-    const daysInMonth = new Date(y, mo, 0).getDate();
-    const projRevenue = daysPassed > 0 ? (actualRevenue / daysPassed) * daysInMonth : 0;
-    const projProfit  = daysPassed > 0 ? (actualProfit  / daysPassed) * daysInMonth : 0;
-    const projOrders  = daysPassed > 0 ? Math.round((actualOrders / daysPassed) * daysInMonth) : 0;
+    // Bug fix: usa dia SP (nowParts.day) em vez de today.getDate() (dia UTC)
+    const daysPassed  = nowParts.day;
+    const daysInMonth = lastDay;
+    const daysLeft    = daysInMonth - daysPassed;
+    const projRevenue = daysPassed > 0 ? r2((actual.revenue / daysPassed) * daysInMonth) : 0;
+    const projProfit  = daysPassed > 0 ? r2((actual.profit  / daysPassed) * daysInMonth) : 0;
+    const projOrders  = daysPassed > 0 ? Math.round((actual.orders / daysPassed) * daysInMonth) : 0;
     projection = {
-      revenue:        parseFloat(projRevenue.toFixed(2)),
-      profit:         parseFloat(projProfit.toFixed(2)),
+      revenue:        projRevenue,
+      profit:         projProfit,
       orders:         projOrders,
       revenueGoalPct: goal?.revenue > 0 ? parseFloat(((projRevenue / goal.revenue) * 100).toFixed(1)) : null,
       profitGoalPct:  goal?.profit  > 0 ? parseFloat(((projProfit  / goal.profit)  * 100).toFixed(1)) : null,
       daysPassed,
       daysInMonth,
-      daysLeft: daysInMonth - daysPassed,
+      daysLeft,
     };
   }
 
   return res.json({
     goal,
     actual: {
-      revenue:    parseFloat(actualRevenue.toFixed(2)),
-      profit:     parseFloat(actualProfit.toFixed(2)),
-      orders:     actualOrders,
-      revenuePct: goal?.revenue > 0 ? parseFloat(((actualRevenue / goal.revenue) * 100).toFixed(1)) : null,
-      profitPct:  goal?.profit  > 0 ? parseFloat(((actualProfit  / goal.profit)  * 100).toFixed(1)) : null,
-      ordersPct:  goal?.orders  > 0 ? parseFloat(((actualOrders  / goal.orders)  * 100).toFixed(1)) : null,
+      revenue:    actual.revenue,
+      profit:     actual.profit,
+      orders:     actual.orders,
+      revenuePct: goal?.revenue > 0 ? parseFloat(((actual.revenue / goal.revenue) * 100).toFixed(1)) : null,
+      profitPct:  goal?.profit  > 0 ? parseFloat(((actual.profit  / goal.profit)  * 100).toFixed(1)) : null,
+      ordersPct:  goal?.orders  > 0 ? parseFloat(((actual.orders  / goal.orders)  * 100).toFixed(1)) : null,
     },
     projection,
   });
@@ -145,47 +187,47 @@ async function getGoalsHistory(req, res) {
   const { storeId } = req.query;
 
   const goals = await prisma.goal.findMany({
-    where: { userId: req.userId },
+    where:   { userId: req.userId },
     orderBy: { month: 'desc' },
-    take: 12,
+    take:    12,
   });
   if (!goals.length) return res.json({ history: [] });
 
   const stores = await prisma.store.findMany({
-    where: { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
-    select: { id: true },
+    where:  { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
+    select: { id: true, taxRate: true },
   });
-  const storeIds = stores.map((s) => s.id);
+  const storeIds       = stores.map((s) => s.id);
+  const taxRateByStore = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
 
   const oldest = goals[goals.length - 1].month;
   const [oy, om] = oldest.split('-').map(Number);
 
+  // Bug fix: chamada correta com dois argumentos separados (era um objeto único)
+  const rangeStart = spToUtc(oy, om, 1);
+  const rangeEnd   = new Date();
+
   const orders = await prisma.order.findMany({
-    where: {
-      storeId: { in: storeIds },
-      status:  'paid',
-      ...orderPeriodWhere({ start: saoPauloDateToUtc(oy, om, 1), end: new Date() }),
-    },
-    select: { id: true, orderId: true, orderStatus: true, orderCategory: true, salePrice: true, calcGmv: true, globalTotal: true, profit: true, calcGrossProfit: true, soldAt: true, orderCreatedAt: true },
+    where:  { storeId: { in: storeIds }, ...paidPeriodWhere(rangeStart, rangeEnd) },
+    select: ORDER_SELECT,
   });
 
-  const ordersByMonthRows = {};
+  // Agrupar por mês SP da data de pagamento (competência de caixa)
+  // Bug fix: era orderCreatedAt ?? soldAt — agora usa orderPaidAt ?? soldAt
+  const ordersByMonth = {};
   for (const o of orders) {
-    const key = formatSaoPauloMonth(o.orderCreatedAt ?? o.soldAt);
-    if (!ordersByMonthRows[key]) ordersByMonthRows[key] = [];
-    ordersByMonthRows[key].push(o);
+    const monthKey = formatSaoPauloMonth(o.orderPaidAt ?? o.soldAt);
+    if (!monthKey) continue;
+    if (!ordersByMonth[monthKey]) ordersByMonth[monthKey] = [];
+    ordersByMonth[monthKey].push(o);
   }
 
   const history = goals.map((goal) => {
-    const a = summarizeValidOrders(ordersByMonthRows[goal.month] ?? []);
+    const a = summarizeOrders(ordersByMonth[goal.month] ?? [], taxRateByStore);
     return {
       month:  goal.month,
       goal:   { revenue: goal.revenue, profit: goal.profit, orders: goal.orders },
-      actual: {
-        revenue: parseFloat(a.revenue.toFixed(2)),
-        profit:  parseFloat(a.profit.toFixed(2)),
-        orders:  a.orders,
-      },
+      actual: { revenue: a.revenue, profit: a.profit, orders: a.orders },
       pct: {
         revenue: goal.revenue > 0 ? parseFloat(((a.revenue / goal.revenue) * 100).toFixed(1)) : null,
         profit:  goal.profit  > 0 ? parseFloat(((a.profit  / goal.profit)  * 100).toFixed(1)) : null,
