@@ -156,22 +156,30 @@ function orderPeriodWhere(range) {
   };
 }
 
+function paidPeriodWhere(range) {
+  return { orderPaidAt: { gte: range.start, lte: range.end } };
+}
+
 function formatSaoPauloDay(date) {
   const parts = getZonedParts(date);
   return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
 }
 
 function calcOrderProfit(order, taxRateMap) {
-  // Cadeia canônica — idêntica ao closingController. Nunca lê calcGrossProfit,
-  // calcNetRevenue ou calcTax como entrada (campos snapshot, podem estar desatualizados).
   const taxRate   = taxRateMap[order.storeId] ?? 0;
-  const fee       = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const rawFee    = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const fee       = rawFee > 0 ? rawFee : r2(order.calcShopeeFee ?? 0);
   const disc      = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
   const net       = r2((order.calcGmv ?? 0) - fee - disc);
   const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
-  const repasse   = hasEscrow ? r2(order.escrowAmount) : net;
-  const tax       = r2((order.calcGmv ?? 0) * (taxRate / 100));
-  const profit    = r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
+  const repasse   = hasEscrow ? r2(order.escrowAmount) : r2(order.calcNetRevenue ?? net);
+  const tax       = order.calcTax !== null && order.calcTax !== undefined
+    ? r2(order.calcTax)
+    : r2((order.calcGmv ?? 0) * (taxRate / 100));
+  const cost      = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
+  const profit    = hasEscrow
+    ? r2(repasse - tax - cost)
+    : r2(order.calcGrossProfit ?? (repasse - tax - cost));
   return { fee, discount: disc, netRevenue: repasse, tax, profit };
 }
 
@@ -261,13 +269,19 @@ function summarizeUniqueValidOrders(orders) {
 }
 
 function addUnique(bucket, order) {
-  bucket.orderIds.add(order.orderId);
+  bucket.orderIds.add(order.orderId ?? order.id);
   bucket.lines += 1;
   bucket.units += order.quantity ?? 0;
 }
 
 function summarizeOrderBreakdown(orders) {
   const makeBucket = () => ({ orderIds: new Set(), lines: 0, units: 0 });
+  const cancelledUnpaidOrderIds = new Set(
+    orders
+      .filter((order) => order.orderCategory === 'cancelled_unpaid')
+      .map((order) => order.orderId ?? order.id)
+      .filter(Boolean)
+  );
   const buckets = {
     created: makeBucket(),
     paid: makeBucket(),
@@ -276,6 +290,7 @@ function summarizeOrderBreakdown(orders) {
     shipping: makeBucket(),
     unpaid: makeBucket(),
     cancelled: makeBucket(),
+    paidCancelled: makeBucket(),
     returned: makeBucket(),
   };
 
@@ -283,7 +298,11 @@ function summarizeOrderBreakdown(orders) {
     const hasPayment = !!order.orderPaidAt || (order.orderCategory !== 'cancelled_unpaid' && REVENUE_ORDER_CATEGORIES.includes(order.orderCategory));
     const rawStatus = String(order.orderStatus ?? '').toUpperCase();
     const isOpenUnpaid = !hasPayment && rawStatus === 'UNPAID';
-    const isCancelledWithoutPayment = !hasPayment && (order.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED');
+    const isCancelled = order.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED';
+    const isCancelledWithoutPayment = !hasPayment && isCancelled;
+    const orderKey = order.orderId ?? order.id;
+    const hasUnpaidCancellationLine = orderKey && cancelledUnpaidOrderIds.has(orderKey);
+    const hasRealBuyer = !!order.buyerUsername && order.buyerUsername !== '-';
     const isWaitingShipment = SHIPPING_ORDER_STATUSES.has(rawStatus);
 
     addUnique(buckets.created, order);
@@ -293,6 +312,7 @@ function summarizeOrderBreakdown(orders) {
     if (isWaitingShipment) addUnique(buckets.shipping, order);
     if (isOpenUnpaid) addUnique(buckets.unpaid, order);
     if (isCancelledWithoutPayment) addUnique(buckets.cancelled, order);
+    if (hasPayment && isCancelled && hasRealBuyer && !hasUnpaidCancellationLine) addUnique(buckets.paidCancelled, order);
     if (['returned_full', 'returned_partial'].includes(order.orderCategory)) addUnique(buckets.returned, order);
   }
 
@@ -328,7 +348,7 @@ async function getAppDashboard(req, res) {
   const yearOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...orderPeriodWhere({ start: startOfYear, end: now }),
+      ...paidPeriodWhere({ start: startOfYear, end: now }),
       orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
     },
     select: { id: true, orderId: true, orderCategory: true, orderStatus: true, quantity: true, calcGmv: true, globalTotal: true },
@@ -350,16 +370,31 @@ async function getAppDashboard(req, res) {
       calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
       calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
       orderStatus: true, orderPaidAt: true, cancelReason: true,
-      productId: true,
+      productId: true, buyerUsername: true,
     },
   });
-  const orders = allPeriodOrders.filter((order) => REVENUE_ORDER_CATEGORIES.includes(order.orderCategory));
+  const orders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      ...paidPeriodWhere(range),
+      orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+    },
+    select: {
+      id: true, storeId: true, soldAt: true, orderCreatedAt: true, quantity: true,
+      orderId: true,
+      calcGmv: true, globalTotal: true, platformCommission: true, platformServiceFee: true,
+      sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
+      calcProductCost: true, calcPackaging: true, calcGrossProfit: true,
+      calcNetRevenue: true, calcTax: true, calcShopeeFee: true, orderCategory: true,
+      orderStatus: true, orderPaidAt: true, buyerUsername: true, productId: true,
+    },
+  });
   const breakdown = summarizeOrderBreakdown(allPeriodOrders);
 
   const monthOrders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...orderPeriodWhere(monthRange),
+      ...paidPeriodWhere(monthRange),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -428,7 +463,7 @@ async function getAppDashboard(req, res) {
       valueByStoreOrder[o.storeId].set(orderKey, Math.max(valueByStoreOrder[o.storeId].get(orderKey) ?? 0, value));
     }
 
-    const orderDate = new Date(o.orderCreatedAt ?? o.soldAt);
+    const orderDate = o.orderPaidAt ? new Date(o.orderPaidAt) : null;
     if (orderDate >= todayRange.start && orderDate <= todayRange.end && isValidForRevenue && orderKey) {
       validOrderValuesToday.set(orderKey, Math.max(validOrderValuesToday.get(orderKey) ?? 0, orderRevenueValue(o)));
       todayProfit += calc.profit;
@@ -460,7 +495,7 @@ async function getAppDashboard(req, res) {
   const prevOrds = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...orderPeriodWhere(prevRange),
+      ...paidPeriodWhere(prevRange),
       orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
     },
     select: {
@@ -494,7 +529,7 @@ async function getAppDashboard(req, res) {
     const spOrds = await prisma.order.findMany({
       where: {
         storeId: { in: storeIds },
-        ...orderPeriodWhere(spRange),
+        ...paidPeriodWhere(spRange),
         orderCategory: { in: APP_VALID_ORDER_CATEGORIES },
       },
       select: {
@@ -548,6 +583,8 @@ async function getAppDashboard(req, res) {
       units:  paidUnits,
       paidOrders: uniqueOrderIdsSize,
       paidUnits,
+      totalShopeeOrders: uniqueOrderIdsSize + breakdown.paidCancelled.orders,
+      totalOperationalOrders: breakdown.created.orders,
       createdOrders: breakdown.created.orders,
       createdUnits: breakdown.created.units,
       unpaidOrders: breakdown.unpaid.orders,
@@ -556,6 +593,8 @@ async function getAppDashboard(req, res) {
       shippingUnits: breakdown.shipping.units,
       cancelledOrders: breakdown.cancelled.orders,
       cancelledUnits: breakdown.cancelled.units,
+      paidCancelledOrders: breakdown.paidCancelled.orders,
+      paidCancelledUnits: breakdown.paidCancelled.units,
       returnedOrders: breakdown.returned.orders,
       returnedUnits: breakdown.returned.units,
       margin: totalGmv > 0 ? r2((totalProfit / totalGmv) * 100) : 0,
@@ -609,11 +648,11 @@ async function getAppTrends(req, res) {
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...orderPeriodWhere(range),
+      ...paidPeriodWhere(range),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
-      storeId: true, soldAt: true, orderCreatedAt: true, calcGmv: true,
+      storeId: true, soldAt: true, orderCreatedAt: true, orderPaidAt: true, calcGmv: true,
       globalTotal: true, orderStatus: true,
       platformCommission: true, platformServiceFee: true,
       sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
@@ -629,7 +668,7 @@ async function getAppTrends(req, res) {
   const uniqueOrders = new Set();
 
   for (const o of orders) {
-    const day = formatSaoPauloDay(o.orderCreatedAt ?? o.soldAt);
+    const day = formatSaoPauloDay(o.orderPaidAt ?? o.orderCreatedAt ?? o.soldAt);
     if (!byDay[day]) byDay[day] = { date: day, gmv: 0, profit: 0, orders: 0 };
 
     const { profit } = calcOrderProfit(o, taxRateMap);
@@ -691,7 +730,7 @@ async function getAppProducts(req, res) {
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...orderPeriodWhere(range),
+      ...paidPeriodWhere(range),
       orderCategory: { in: ['valid', 'pending', 'returned_partial'] },
     },
     select: {
@@ -1037,7 +1076,7 @@ async function getAppAlerts(req, res) {
 
   const [todayOrders, weekOrders, noCostCount] = await Promise.all([
     prisma.order.findMany({
-      where: { storeId: { in: storeIds }, ...orderPeriodWhere(todayRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      where: { storeId: { in: storeIds }, ...paidPeriodWhere(todayRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
       select: {
         calcGmv: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
@@ -1047,7 +1086,7 @@ async function getAppAlerts(req, res) {
       },
     }),
     prisma.order.findMany({
-      where: { storeId: { in: storeIds }, ...orderPeriodWhere(weekRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
+      where: { storeId: { in: storeIds }, ...paidPeriodWhere(weekRange), orderCategory: { in: ['valid', 'pending', 'returned_partial'] } },
       select: {
         calcGmv: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
