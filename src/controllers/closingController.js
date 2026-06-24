@@ -853,11 +853,24 @@ async function buildClosingData(storeIds, month) {
   const pendingOrderIds = new Set();
   const cancelledOrderIds = new Set();
   const returnedOrderIds = new Set();
+  const revenueOrderIds = new Set();
+  const revenueGlobalByOrder = new Map();
+  const confirmedGlobalByOrder = new Map();
+  const pendingGlobalByOrder = new Map();
+  let revenueLineCount = 0;
+  let revenueUnitCount = 0;
 
   const groupMap = new Map();
   const returnedOrdersList = [];
   const cancelledOrdersList = [];
   const pendingOrdersList = [];
+
+  const addOrderGlobal = (map, order) => {
+    const key = orderKey(order);
+    if (!key) return;
+    const value = order.globalTotal ?? order.calcGmv ?? 0;
+    map.set(key, Math.max(map.get(key) ?? 0, value));
+  };
 
   for (const o of allOrders) {
     const hasConfirmedRepasse = financialRowIds.has(o.id);
@@ -938,6 +951,13 @@ async function buildClosingData(storeIds, month) {
     }
 
     if (!isRevenue) continue;
+
+    revenueLineCount++;
+    revenueUnitCount += o.quantity ?? 0;
+    addUniqueOrder(revenueOrderIds, o);
+    addOrderGlobal(revenueGlobalByOrder, o);
+    if (hasConfirmedRepasse) addOrderGlobal(confirmedGlobalByOrder, o);
+    if (isEstimatedRevenue) addOrderGlobal(pendingGlobalByOrder, o);
 
     const key = o.productId
       ? `pid:${o.productId}`
@@ -1055,13 +1075,17 @@ async function buildClosingData(storeIds, month) {
     }
   }
 
+  const revenueGmvTotal = r2([...revenueGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
+  const confirmedSalesTotal = r2([...confirmedGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
+  const pendingSalesTotal = r2([...pendingGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
+
   grossProfit -= fixedTaxAmount;
-  const avgMargin = gmvTotal > 0 ? (grossProfit / gmvTotal) * 100 : 0;
+  const avgMargin = confirmedSalesTotal > 0 ? (grossProfit / confirmedSalesTotal) * 100 : 0;
   const repasseTotal = r2(repasseConfirmado + repasseEstimado);
   const impostoTotal = r2(taxAmount);
   const custoTotal = r2(productCost + packagingCost);
   const resultadoLiquido = r2(grossProfit);
-  const margem = gmvTotal > 0 ? r2((resultadoLiquido / gmvTotal) * 100) : 0;
+  const margem = revenueGmvTotal > 0 ? r2((resultadoLiquido / revenueGmvTotal) * 100) : 0;
   const resultadoEstimado = r2(estimatedGrossProfit);
   const impostoEstimadoTotal = r2(estimatedTaxAmount);
   const custoEstimadoTotal = r2(estimatedProductCost + estimatedPackagingCost);
@@ -1126,12 +1150,6 @@ async function buildClosingData(storeIds, month) {
     }))
     .sort((a, b) => b.gmv - a.gmv);
 
-  const totalOrderIds = new Set([
-    ...confirmedOrderIds,
-    ...pendingOrderIds,
-    ...cancelledOrderIds,
-    ...returnedOrderIds,
-  ]);
   const orphanGroups = groups.filter(g => !g.hasCost);
   const orphanCatalogIds = new Set(orphanGroups.map(g => g.catalogProductId ?? g.productId).filter(Boolean));
   const orphanLinkedGmv = orphanGroups
@@ -1141,8 +1159,8 @@ async function buildClosingData(storeIds, month) {
   const orphanUnlinkedGmv = orphanUnlinkedGroups.reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
 
   return {
-    totalOrders: totalOrderIds.size,
-    totalLineCount: allOrders.length,
+    totalOrders: revenueOrderIds.size,
+    totalLineCount: revenueLineCount,
     confirmedOrders: confirmedOrderIds.size,
     confirmedLineCount,
     pendingOrders: pendingOrderIds.size,
@@ -1151,10 +1169,10 @@ async function buildClosingData(storeIds, month) {
     cancelledLineCount,
     returnedOrders: returnedOrderIds.size,
     returnedLineCount,
-    unitCount,
-    gmvTotal: r2(gmvTotal),
-    gmvConfirmed: r2(gmvConfirmed),
-    gmvPending: r2(gmvPending),
+    unitCount: revenueUnitCount,
+    gmvTotal: revenueGmvTotal,
+    gmvConfirmed: confirmedSalesTotal,
+    gmvPending: pendingSalesTotal,
     shopeeDeductions: r2(shopeeDeductions),
     sellerDiscounts: r2(sellerDiscounts),
     netRevenue: r2(netRevenue),

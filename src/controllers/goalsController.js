@@ -176,11 +176,11 @@ async function getGoalWithProgress(req, res) {
   const nowParts       = getZonedParts(new Date());
   const isCurrentMonth = nowParts.year === y && nowParts.month === mo;
 
-  // Para mês corrente, espelha o preset "Mês" do dashboard:
-  // usa dias fechados até ontem; no dia 1 usa o próprio dia.
+  // Para mês corrente, espelha o preset "Mês" do dashboard/Upseller:
+  // inclui o dia atual.
   // Para meses passados: endDate = fim do último dia do mês em SP
   const currentMonthCutoffDay = isCurrentMonth
-    ? Math.max(1, Math.min(nowParts.day === 1 ? 1 : nowParts.day - 1, lastDay))
+    ? Math.max(1, Math.min(nowParts.day, lastDay))
     : lastDay;
   const endDate = isCurrentMonth
     ? spToUtc(y, mo, currentMonthCutoffDay, 23, 59, 59, 999)
