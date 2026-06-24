@@ -404,6 +404,17 @@ async function recalculateOrders(req, res) {
   const storeId = body.storeId ?? null;
   const dateBasis = body.dateBasis ?? null;
 
+  if (body.async) {
+    const job = await recalculateQueue.add('recalculate', {
+      userId: req.userId,
+      all,
+      months,
+      storeId,
+      dateBasis,
+    });
+    return res.status(202).json({ jobId: job.id });
+  }
+
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
   const stores     = await prisma.store.findMany({ where: storeWhere, select: { id: true } });

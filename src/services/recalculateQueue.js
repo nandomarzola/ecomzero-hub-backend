@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
 const { calcOrderProfit } = require('./calculatorService');
+const { recalculateOrdersForStore } = require('./recalculateService');
 const { randomUUID } = require('crypto');
 const { r2 } = require('../lib/utils');
 
@@ -215,10 +216,51 @@ function startRecalculateWorker() {}
 
 // Shim para compatibilidade com orderController que usa recalculateQueue.add()
 const recalculateQueue = {
-  add: async (_name, data) => {
-    const jobId = randomUUID();
+  add: async (_name, data, options = {}) => {
+    const jobId = options.jobId ?? randomUUID();
     recalcProgress.set(jobId, { pct: 2, message: 'Iniciando...', status: 'active' });
-    setImmediate(() => doRecalculate(jobId, data.userId, data.all, data.months));
+    setImmediate(async () => {
+      if (data.storeId || data.dateBasis) {
+        try {
+          recalcProgress.set(jobId, { pct: 8, message: 'Selecionando lojas...', status: 'active' });
+          const storeWhere = { userId: data.userId };
+          if (data.storeId) storeWhere.id = data.storeId;
+          const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, name: true } });
+          let periodMonth = null;
+          if (!data.all) {
+            if (Array.isArray(data.months) && data.months.length) {
+              periodMonth = data.months[0];
+            } else {
+              const now = new Date();
+              periodMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+            }
+          }
+          let updated = 0;
+
+          for (let i = 0; i < stores.length; i++) {
+            const store = stores[i];
+            const pct = Math.round(15 + (i / Math.max(1, stores.length)) * 70);
+            recalcProgress.set(jobId, { pct, message: `Recalculando ${store.name || 'loja'}...`, status: 'active' });
+            updated += await recalculateOrdersForStore(store.id, periodMonth, { dateBasis: data.dateBasis });
+          }
+
+          const result = {
+            updated,
+            stores: stores.length,
+            months: periodMonth ?? 'todos',
+            message: `${updated} pedido(s) recalculado(s)`,
+          };
+          recalcProgress.set(jobId, { pct: 100, message: 'Atualização concluída', status: 'completed', result });
+          setTimeout(() => recalcProgress.delete(jobId), 5 * 60 * 1000);
+        } catch (err) {
+          console.error('[recalculate] erro:', err.message);
+          recalcProgress.set(jobId, { pct: 0, message: err.message, status: 'failed', error: err.message });
+          setTimeout(() => recalcProgress.delete(jobId), 5 * 60 * 1000);
+        }
+        return;
+      }
+      doRecalculate(jobId, data.userId, data.all, data.months);
+    });
     return { id: jobId };
   },
 };
