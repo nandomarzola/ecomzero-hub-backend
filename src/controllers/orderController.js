@@ -401,8 +401,11 @@ async function recalculateOrders(req, res) {
   const body   = req.body ?? {};
   const months = body.months ?? null;
   const all    = body.all ?? false;
+  const storeId = body.storeId ?? null;
+  const dateBasis = body.dateBasis ?? null;
 
   const storeWhere = { userId: req.userId };
+  if (storeId) storeWhere.id = storeId;
   const stores     = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
   const storeIds   = stores.map((s) => s.id);
   if (!storeIds.length) return res.json({ success: true, updated: 0, months: months ?? 'current' });
@@ -420,7 +423,7 @@ async function recalculateOrders(req, res) {
 
   let total = 0;
   for (const sid of storeIds) {
-    total += await recalculateOrdersForStore(sid, periodMonth);
+    total += await recalculateOrdersForStore(sid, periodMonth, { dateBasis });
   }
 
   return res.json({ success: true, updated: total, months: months ?? 'current' });

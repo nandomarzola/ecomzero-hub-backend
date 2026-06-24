@@ -208,7 +208,7 @@ function expectedProfit(order, marketplace) {
 
 // GET /api/dashboard/summary
 async function getSummary(req, res) {
-  const { storeId, startDate, endDate } = req.query;
+  const { storeId, startDate, endDate, periodKey } = req.query;
 
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
@@ -232,6 +232,9 @@ async function getSummary(req, res) {
   }
 
   const dateRange = buildDateRange(startDate, endDate);
+  const rangeDays = dateRange
+    ? Math.max(1, Math.round((dateRange.end.getTime() - dateRange.start.getTime() + 1) / 86400000))
+    : null;
   const periodWhere = orderPeriodWhere(dateRange);
   const paidWhere = paidPeriodWhere(dateRange);
   const allOrderWhere = {
@@ -629,23 +632,34 @@ async function getSummary(req, res) {
     days: Object.values(dayMap).map((d) => ({ ...d, revenue: parseFloat(d.revenue.toFixed(2)) })),
   }));
 
-  // ── Projeção de fechamento (só para o mês corrente em andamento) ──
+  // ── Projeção de fechamento: só faz sentido na visão "Mês" do mês corrente.
   let projection = null;
-  if (startDate && endDate) {
-    const sd = new Date(startDate);
-    const now = new Date();
-    const isCurrentMonth = sd.getUTCFullYear() === now.getUTCFullYear() && sd.getUTCMonth() === now.getUTCMonth();
+  if (periodKey === 'month' && dateRange) {
+    const startParts = parseYmd(dateRange.startDate);
+    const endParts = parseYmd(dateRange.endDate);
+    const todayParts = getZonedParts(new Date());
+    const isCurrentMonth = startParts
+      && endParts
+      && startParts.day === 1
+      && startParts.year === todayParts.year
+      && startParts.month === todayParts.month
+      && endParts.year === todayParts.year
+      && endParts.month === todayParts.month;
     if (isCurrentMonth) {
-      const daysInMonth = new Date(now.getUTCFullYear(), now.getUTCMonth() + 1, 0).getDate();
-      const dayOfMonth  = now.getUTCDate();
-      if (dayOfMonth > 0 && dayOfMonth < daysInMonth) {
-        const factor = daysInMonth / dayOfMonth;
+      const daysInMonth = new Date(Date.UTC(todayParts.year, todayParts.month, 0)).getUTCDate();
+      const daysElapsed = Math.min(endParts.day, todayParts.day, daysInMonth);
+      if (daysElapsed > 0 && daysElapsed < daysInMonth) {
+        const factor = daysInMonth / daysElapsed;
+        const dailyRevenue = totalRevenue / daysElapsed;
+        const dailyProfit = projectedProfit / daysElapsed;
         projection = {
-          revenue:     parseFloat((totalRevenue * factor).toFixed(2)),
-          profit:      parseFloat((projectedProfit * factor).toFixed(2)),
+          revenue: parseFloat((totalRevenue * factor).toFixed(2)),
+          profit: parseFloat((projectedProfit * factor).toFixed(2)),
           confirmedProfit: parseFloat((totalProfit * factor).toFixed(2)),
           estimatedProfit: parseFloat((estimatedProfit * factor).toFixed(2)),
-          daysElapsed: dayOfMonth,
+          dailyRevenue: parseFloat(dailyRevenue.toFixed(2)),
+          dailyProfit: parseFloat(dailyProfit.toFixed(2)),
+          daysElapsed,
           daysInMonth,
         };
       }
@@ -662,14 +676,18 @@ async function getSummary(req, res) {
   const returnedPartialCount = summarizeOrderBreakdown(
     allPeriodRaw.filter(o => o.orderCategory === 'returned_partial')
   ).created.orders;
-  const returnedCount        = returnedFullCount + returnedPartialCount;
-  const returnRate = {
-    rate:                 createdOrders > 0 ? parseFloat(((returnedCount / createdOrders) * 100).toFixed(1)) : 0,
+  const returnedCount = returnedFullCount + returnedPartialCount;
+  const canShowReturnRate = !['today', 'yesterday'].includes(String(periodKey || ''))
+    && (rangeDays ?? 0) >= 7
+    && createdOrders > 0;
+  const returnRate = canShowReturnRate ? {
+    rate: createdOrders > 0 ? parseFloat(((returnedCount / createdOrders) * 100).toFixed(1)) : 0,
     returnedCount,
     returnedFullCount,
     returnedPartialCount,
     totalGenerated: createdOrders,
-  };
+    periodDays: rangeDays,
+  } : null;
 
   return res.json({
     totalRevenue:   parseFloat(totalRevenue.toFixed(2)),

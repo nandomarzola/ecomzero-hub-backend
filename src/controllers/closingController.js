@@ -261,6 +261,13 @@ function calcLine(order, storeTaxRateMap) {
   return { orderFee, orderDisc, orderNet, repasse, tax, cost, profit };
 }
 
+function hasCurrentCost(order) {
+  const savedLineCost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
+  const variantCost = Number(order.variant?.costPrice ?? 0);
+  const productCost = Number(order.product?.costPrice ?? 0);
+  return savedLineCost > 0 || variantCost > 0 || productCost > 0;
+}
+
 function summarizeLines(rows, storeTaxRateMap) {
   const orderIds = new Set();
   const globalByOrder = new Map();
@@ -736,8 +743,8 @@ async function buildClosingData(storeIds, month) {
   const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
 
   const includeProduct = {
-    product: { select: { id: true, name: true, sku: true } },
-    variant: { select: { id: true, name: true, sku: true } },
+    product: { select: { id: true, name: true, sku: true, costPrice: true, packaging: true } },
+    variant: { select: { id: true, name: true, sku: true, costPrice: true } },
   };
 
   const financialOrders = await prisma.order.findMany({
@@ -936,7 +943,7 @@ async function buildClosingData(storeIds, month) {
       g.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
       g.repasseEstimado += orderRepasse;
     }
-    if (!o.hasCost) g.hasCost = false;
+    if (!hasCurrentCost(o)) g.hasCost = false;
     if (isEstimatedRevenue) g.hasPending = true;
     g.orders.push({
       orderId: o.orderId,
@@ -990,7 +997,7 @@ async function buildClosingData(storeIds, month) {
         v.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
         v.repasseEstimado += orderRepasse;
       }
-      if (!o.hasCost) v.hasCost = false;
+      if (!hasCurrentCost(o)) v.hasCost = false;
       if (isEstimatedRevenue) v.hasPending = true;
       v.orders.push({
         orderId: o.orderId,

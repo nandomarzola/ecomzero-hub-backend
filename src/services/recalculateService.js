@@ -22,10 +22,15 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
     const { year: y, month: mo } = parseYearMonth(periodMonth);
     // São Paulo UTC-3 fixo — mesmo critério do closingController e dashboard
     const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
-    where.soldAt = {
+    const range = {
       gte: new Date(Date.UTC(y, mo - 1, 1,  3, 0, 0, 0)),   // dia 1 00:00 SP
       lte: new Date(Date.UTC(y, mo - 1, lastDay, 26, 59, 59, 999)), // último dia 23:59 SP
     };
+    if (options.dateBasis === 'paidOrSold') {
+      where.OR = [{ soldAt: range }, { orderPaidAt: range }];
+    } else {
+      where.soldAt = range;
+    }
   }
 
   const orders = await prisma.order.findMany({
