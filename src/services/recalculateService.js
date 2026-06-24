@@ -37,7 +37,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
     where,
     include: {
       store:   { select: { taxRate: true, marketplace: true } },
-      product: { select: { costPrice: true, packaging: true, category: true, shopeeShippingCost: true } },
+      product: { select: { costPrice: true, packaging: true, category: true, shopeeShippingCost: true, parent: { select: { costPrice: true, packaging: true } } } },
       variant: { select: { costPrice: true } },
     },
   });
@@ -100,14 +100,23 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
     const skuMatch = order.skuVariacao
       ? variantBySku.get(`${order.productId}|${order.skuVariacao}`)
       : null;
+    const effectiveCostPrice = [
+      order.variant?.costPrice,
+      skuMatch?.costPrice,
+      order.product?.costPrice,
+      order.product?.parent?.costPrice,
+    ].find((value) => value != null && Number(value) > 0) ?? 0;
+    const effectivePackaging = Number(order.product?.packaging ?? 0) > 0
+      ? order.product.packaging
+      : (order.product?.parent?.packaging ?? 0);
 
     const calc = calcOrderProfit({
       agreedPrice:        order.agreedPrice,
       quantity:           order.quantity,
       sellerCoupon:       order.sellerCoupon,
       lmmDiscount:        order.lmmDiscount,
-      costPrice:          order.variant?.costPrice ?? skuMatch?.costPrice ?? order.product?.costPrice ?? 0,
-      packagingCost:      order.product?.packaging ?? 0,
+      costPrice:          effectiveCostPrice,
+      packagingCost:      effectivePackaging,
       taxRate,
       marketplace,
       precomputedFee,

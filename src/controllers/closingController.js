@@ -46,6 +46,14 @@ function snapshotToClosingData(closing) {
   const resultadoLiquido  = closing.grossProfit;
   const margem = closing.gmvTotal > 0 ? r2((resultadoLiquido / closing.gmvTotal) * 100) : closing.avgMargin;
 
+  const orphanGroups = Array.isArray(snap) ? snap.filter(g => !g.hasCost) : [];
+  const orphanCatalogIds = new Set(orphanGroups.map(g => g.catalogProductId ?? g.productId).filter(Boolean));
+  const orphanUnlinkedGroups = orphanGroups.filter(g => !(g.catalogProductId ?? g.productId));
+  const orphanLinkedGmv = orphanGroups
+    .filter(g => g.catalogProductId ?? g.productId)
+    .reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
+  const orphanUnlinkedGmv = orphanUnlinkedGroups.reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
+
   return {
     totalOrders:      closing.totalOrders,
     totalLineCount:   closing.totalOrders,
@@ -72,7 +80,16 @@ function snapshotToClosingData(closing) {
     avgMargin:        closing.avgMargin,
     cancelledGmv:     closing.cancelledGmv,
     returnedValue:    closing.returnedValue,
-    orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+    orphanCount:      orphanGroups.length,
+    costIssues: {
+      totalGroups: orphanGroups.length,
+      catalogProducts: orphanCatalogIds.size,
+      linkedGroups: orphanGroups.length - orphanUnlinkedGroups.length,
+      unlinkedGroups: orphanUnlinkedGroups.length,
+      linkedGmv: r2(orphanLinkedGmv),
+      unlinkedGmv: r2(orphanUnlinkedGmv),
+      gmv: r2(orphanLinkedGmv + orphanUnlinkedGmv),
+    },
     operational: {
       createdOrders: closing.totalOrders,
       createdLines: closing.totalOrders,
@@ -196,6 +213,23 @@ function combineClosingData(items) {
     estimatedTax: r2(combined.impostoEstimadoTotal),
     estimatedCost: r2(combined.custoEstimadoTotal),
   };
+  const orphanGroups = combined.groups.filter(g => !g.hasCost);
+  const orphanCatalogIds = new Set(orphanGroups.map(g => g.catalogProductId ?? g.productId).filter(Boolean));
+  const orphanUnlinkedGroups = orphanGroups.filter(g => !(g.catalogProductId ?? g.productId));
+  const orphanLinkedGmv = orphanGroups
+    .filter(g => g.catalogProductId ?? g.productId)
+    .reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
+  const orphanUnlinkedGmv = orphanUnlinkedGroups.reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
+  combined.orphanCount = orphanGroups.length;
+  combined.costIssues = {
+    totalGroups: orphanGroups.length,
+    catalogProducts: orphanCatalogIds.size,
+    linkedGroups: orphanGroups.length - orphanUnlinkedGroups.length,
+    unlinkedGroups: orphanUnlinkedGroups.length,
+    linkedGmv: r2(orphanLinkedGmv),
+    unlinkedGmv: r2(orphanUnlinkedGmv),
+    gmv: r2(orphanLinkedGmv + orphanUnlinkedGmv),
+  };
 
   for (const key of [...sumKeys, 'avgMargin', 'margem']) {
     if (typeof combined[key] === 'number') combined[key] = r2(combined[key]);
@@ -266,7 +300,12 @@ function hasCurrentCost(order) {
   const savedLineCost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
   const variantCost = Number(order.variant?.costPrice ?? 0);
   const productCost = Number(order.product?.costPrice ?? 0);
-  return savedLineCost > 0 || variantCost > 0 || productCost > 0;
+  const parentCost = Number(order.product?.parent?.costPrice ?? 0);
+  return savedLineCost > 0 || variantCost > 0 || productCost > 0 || parentCost > 0;
+}
+
+function catalogProductId(order) {
+  return order.product?.parentId ?? order.productId ?? null;
 }
 
 function summarizeLines(rows, storeTaxRateMap) {
@@ -744,7 +783,7 @@ async function buildClosingData(storeIds, month) {
   const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
 
   const includeProduct = {
-    product: { select: { id: true, name: true, sku: true, costPrice: true, packaging: true } },
+    product: { select: { id: true, parentId: true, name: true, sku: true, costPrice: true, packaging: true, parent: { select: { id: true, name: true, sku: true, costPrice: true } } } },
     variant: { select: { id: true, name: true, sku: true, costPrice: true } },
   };
 
@@ -907,6 +946,7 @@ async function buildClosingData(storeIds, month) {
     if (!groupMap.has(key)) {
       groupMap.set(key, {
         productId: o.productId,
+        catalogProductId: catalogProductId(o),
         productName: o.product?.name ?? o.productName ?? '(sem nome)',
         sku: o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
         variationName: o.variationName ?? null,
@@ -1030,6 +1070,7 @@ async function buildClosingData(storeIds, month) {
   const groups = [...groupMap.values()]
     .map(g => ({
       productId: g.productId,
+      catalogProductId: g.catalogProductId,
       productName: g.productName,
       sku: g.sku,
       variationName: g.variationName,
@@ -1091,6 +1132,13 @@ async function buildClosingData(storeIds, month) {
     ...cancelledOrderIds,
     ...returnedOrderIds,
   ]);
+  const orphanGroups = groups.filter(g => !g.hasCost);
+  const orphanCatalogIds = new Set(orphanGroups.map(g => g.catalogProductId ?? g.productId).filter(Boolean));
+  const orphanLinkedGmv = orphanGroups
+    .filter(g => g.catalogProductId ?? g.productId)
+    .reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
+  const orphanUnlinkedGroups = orphanGroups.filter(g => !(g.catalogProductId ?? g.productId));
+  const orphanUnlinkedGmv = orphanUnlinkedGroups.reduce((sum, g) => sum + (g.gmv ?? 0) + (g.gmvEstimado ?? 0), 0);
 
   return {
     totalOrders: totalOrderIds.size,
@@ -1119,7 +1167,16 @@ async function buildClosingData(storeIds, month) {
     cancelledGmv: r2(cancelledGmv),
     returnedValue: r2(returnedValue),
     returnedCost: r2(returnedCost),
-    orphanCount: groups.filter(g => !g.hasCost).length,
+    orphanCount: orphanGroups.length,
+    costIssues: {
+      totalGroups: orphanGroups.length,
+      catalogProducts: orphanCatalogIds.size,
+      linkedGroups: orphanGroups.length - orphanUnlinkedGroups.length,
+      unlinkedGroups: orphanUnlinkedGroups.length,
+      linkedGmv: r2(orphanLinkedGmv),
+      unlinkedGmv: r2(orphanUnlinkedGmv),
+      gmv: r2(orphanLinkedGmv + orphanUnlinkedGmv),
+    },
     operational,
     competence,
 

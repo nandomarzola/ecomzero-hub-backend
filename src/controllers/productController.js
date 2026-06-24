@@ -66,7 +66,7 @@ async function list(req, res) {
   if (noCost === '1') {
     andConditions.push({ OR: [
       { productVariants: { none: {} }, costPrice: 0 },
-      { productVariants: { some: { costPrice: null } } },
+      { productVariants: { some: { OR: [{ costPrice: null }, { costPrice: { lte: 0 } }] } } },
     ]});
   }
 
@@ -1006,6 +1006,15 @@ async function getProductStats(req, res) {
       commissionPct = 12; fixedFee = 0;
     }
 
+    const hasNoCost = p.productVariants?.length
+      ? p.productVariants.some(v => v.costPrice == null || v.costPrice <= 0)
+      : (p.costPrice ?? 0) <= 0;
+
+    if (hasNoCost) {
+      noCostCount++;
+      continue;
+    }
+
     const items = p.productVariants?.length
       ? p.productVariants
           .filter(v => (v.costPrice ?? 0) > 0 && (v.price ?? 0) > 0)
@@ -1023,16 +1032,15 @@ async function getProductStats(req, res) {
       margin = (profit / p.listPrice) * 100;
     }
 
-    if (margin === null) {
-      noCostCount++;
-      continue;
+    if (margin !== null) {
+      marginSum += margin;
+      marginCount++;
     }
 
-    marginSum += margin;
-    marginCount++;
-
-    const score = margin >= 25 ? 'healthy' : margin >= 15 ? 'warning' : margin >= 10 ? 'risk' : 'loss';
-    if (score === 'risk' || score === 'loss') atRiskCount++;
+    if (margin !== null) {
+      const score = margin >= 25 ? 'healthy' : margin >= 15 ? 'warning' : margin >= 10 ? 'risk' : 'loss';
+      if (score === 'risk' || score === 'loss') atRiskCount++;
+    }
   }
 
   return res.json({
