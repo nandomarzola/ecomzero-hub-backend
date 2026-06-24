@@ -43,14 +43,19 @@ function snapshotToClosingData(closing) {
   const gmvEstimado = hasNewFields ? sumGroupField(snap, 'gmvEstimado') : closing.gmvPending;
   const custoTotal        = r2(closing.productCost + closing.packagingCost);
   const resultadoLiquido  = closing.grossProfit;
-  const margem = repasseConfirmado > 0 ? r2((resultadoLiquido / repasseConfirmado) * 100) : closing.avgMargin;
+  const margem = closing.gmvTotal > 0 ? r2((resultadoLiquido / closing.gmvTotal) * 100) : closing.avgMargin;
 
   return {
     totalOrders:      closing.totalOrders,
+    totalLineCount:   closing.totalOrders,
     confirmedOrders:  closing.confirmedOrders,
+    confirmedLineCount: closing.confirmedOrders,
     pendingOrders:    closing.pendingOrders,
+    pendingLineCount: closing.pendingOrders,
     cancelledOrders:  closing.cancelledOrders,
+    cancelledLineCount: closing.cancelledOrders,
     returnedOrders:   closing.returnedOrders,
+    returnedLineCount: closing.returnedOrders,
     unitCount:        closing.unitCount,
     gmvTotal:         closing.gmvTotal,
     gmvConfirmed:     closing.gmvConfirmed,
@@ -67,6 +72,33 @@ function snapshotToClosingData(closing) {
     cancelledGmv:     closing.cancelledGmv,
     returnedValue:    closing.returnedValue,
     orphanCount:      Array.isArray(snap) ? snap.filter(g => !g.hasCost).length : 0,
+    operational: {
+      createdOrders: closing.totalOrders,
+      createdLines: closing.totalOrders,
+      createdUnits: closing.unitCount,
+      createdSalesTotal: closing.gmvTotal,
+    },
+    competence: {
+      basis: 'repasse',
+      basisField: 'orderPaidAt',
+      operationalField: 'soldAt',
+      hasShift: false,
+      financial: {
+        orders: closing.confirmedOrders,
+        lines: closing.confirmedOrders,
+        units: closing.unitCount,
+        salesTotal: closing.gmvTotal,
+        gmv: closing.gmvTotal,
+        repasse: repasseConfirmado,
+        tax: impostoTotal,
+        cost: custoTotal,
+        profit: resultadoLiquido,
+      },
+      soldInPeriod: null,
+      soldInPeriodPaidOutside: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+      paidInPeriodSoldOutside: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+      returnedPartial: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+    },
 
     repasseConfirmado,
     repasseEstimado,
@@ -121,6 +153,96 @@ function trunc(str, max = 46) {
   return s.length > max ? s.substring(0, max) + '...' : s;
 }
 
+const FINANCIAL_REVENUE_CATEGORIES = ['valid', 'returned_partial'];
+
+function orderKey(order) {
+  return order?.orderId || order?.id;
+}
+
+function hasRealRepasse(order) {
+  return FINANCIAL_REVENUE_CATEGORIES.includes(order.orderCategory)
+    && order.escrowAmount !== null
+    && order.escrowAmount !== undefined;
+}
+
+function inRange(date, start, end) {
+  if (!date) return false;
+  const t = new Date(date).getTime();
+  return t >= start.getTime() && t <= end.getTime();
+}
+
+function addUniqueOrder(set, order) {
+  const key = orderKey(order);
+  if (key) set.add(key);
+}
+
+function calcLine(order, storeTaxRateMap) {
+  const orderFee  = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const orderDisc = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const orderNet  = r2((order.calcGmv ?? 0) - orderFee - orderDisc);
+  const repasse   = hasRealRepasse(order) ? r2(order.escrowAmount) : orderNet;
+  const taxRate   = storeTaxRateMap.get(order.storeId) ?? 0;
+  const tax       = r2((order.calcGmv ?? 0) * taxRate / 100);
+  const cost      = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
+  const profit    = r2(repasse - tax - cost);
+  return { orderFee, orderDisc, orderNet, repasse, tax, cost, profit };
+}
+
+function summarizeLines(rows, storeTaxRateMap) {
+  const orderIds = new Set();
+  const globalByOrder = new Map();
+  const totals = {
+    orders: 0, lines: rows.length, units: 0, salesTotal: 0, gmv: 0,
+    repasse: 0, marketplaceFee: 0, tax: 0, cost: 0, profit: 0,
+  };
+
+  for (const row of rows) {
+    addUniqueOrder(orderIds, row);
+    const key = orderKey(row);
+    if (key && !globalByOrder.has(key)) globalByOrder.set(key, row.globalTotal ?? row.calcGmv ?? 0);
+    const line = calcLine(row, storeTaxRateMap);
+    totals.units += row.quantity ?? 0;
+    totals.gmv += row.calcGmv ?? 0;
+    totals.repasse += line.repasse;
+    totals.marketplaceFee += line.orderFee;
+    totals.tax += line.tax;
+    totals.cost += line.cost;
+    totals.profit += line.profit;
+  }
+
+  totals.orders = orderIds.size;
+  totals.salesTotal = [...globalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0);
+  for (const key of ['salesTotal', 'gmv', 'repasse', 'marketplaceFee', 'tax', 'cost', 'profit']) {
+    totals[key] = r2(totals[key]);
+  }
+  return totals;
+}
+
+function auditOrder(row, storeTaxRateMap) {
+  const line = calcLine(row, storeTaxRateMap);
+  return {
+    id: row.id,
+    orderId: row.orderId,
+    lineItemKey: row.lineItemKey,
+    productName: row.productName,
+    variationName: row.variationName,
+    orderCategory: row.orderCategory,
+    orderStatus: row.orderStatus,
+    returnStatus: row.returnStatus ?? null,
+    soldAt: row.soldAt,
+    orderPaidAt: row.orderPaidAt,
+    orderCreatedAt: row.orderCreatedAt,
+    quantity: row.quantity ?? 0,
+    salesTotal: r2(row.globalTotal ?? row.calcGmv ?? 0),
+    gmv: r2(row.calcGmv ?? 0),
+    repasse: line.repasse,
+    marketplaceFee: line.orderFee,
+    tax: line.tax,
+    cost: line.cost,
+    profit: line.profit,
+  };
+}
+
 // Shared doc-bound helpers factory
 function makeH(doc, ML = 42, MR = 553) {
   return {
@@ -133,7 +255,7 @@ function makeH(doc, ML = 42, MR = 553) {
 }
 
 // ── Core: compute monthly data ─────────────────────────────────────────────────
-async function buildClosingData(storeIds, month) {
+async function buildClosingDataLegacy(storeIds, month) {
   const { year: y, month: mo } = parseYearMonth(month);
   // Range em horário de São Paulo (UTC-3) — mesmo critério do dashboard/appAuthController.
   // spToUtc(y, mo, 1) = dia 1 às 00:00 SP = 03:00 UTC
@@ -151,8 +273,18 @@ async function buildClosingData(storeIds, month) {
     .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
   const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
 
+  // Competência de caixa/repasse:
+  //  - Pedidos pagos (orderPaidAt não null): filtrar pela data de pagamento ao seller
+  //  - Pedidos sem pagamento (pendentes, cancelados s/ pag.): filtrar por soldAt (criação)
+  // Isso alinha o Fechamento com o Dashboard que usa a mesma competência de repasse.
   const allOrders = await prisma.order.findMany({
-    where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
+    where: {
+      storeId: { in: storeIds },
+      OR: [
+        { orderPaidAt: { gte: start, lte: end } },
+        { orderPaidAt: null, soldAt: { gte: start, lte: end } },
+      ],
+    },
     include: {
       product: { select: { id: true, name: true, sku: true } },
       variant: { select: { id: true, name: true, sku: true } },
@@ -515,6 +647,430 @@ async function buildClosingData(storeIds, month) {
   };
 }
 
+async function buildClosingData(storeIds, month) {
+  const { year: y, month: mo } = parseYearMonth(month);
+  const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  const start = spToUtc(y, mo, 1);
+  const end = spToUtc(y, mo, lastDay, 23, 59, 59, 999);
+
+  const stores = await prisma.store.findMany({
+    where: { id: { in: storeIds } },
+    select: { id: true, taxType: true, taxRate: true, fixedMonthlyTax: true },
+  });
+  const fixedTaxAmount = r2(stores
+    .filter(s => s.taxType === 'mei')
+    .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
+  const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
+
+  const includeProduct = {
+    product: { select: { id: true, name: true, sku: true } },
+    variant: { select: { id: true, name: true, sku: true } },
+  };
+
+  const financialOrders = await prisma.order.findMany({
+    where: {
+      storeId: { in: storeIds },
+      orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
+      escrowAmount: { not: null },
+      orderPaidAt: { gte: start, lte: end },
+    },
+    include: includeProduct,
+  });
+
+  const soldAtOrders = await prisma.order.findMany({
+    where: { storeId: { in: storeIds }, soldAt: { gte: start, lte: end } },
+    include: includeProduct,
+  });
+
+  const financialRowIds = new Set(financialOrders.map(o => o.id));
+  const allOrders = [
+    ...financialOrders,
+    ...soldAtOrders.filter(o => !financialRowIds.has(o.id)),
+  ];
+
+  const soldAtFinancialRows = soldAtOrders.filter(o => hasRealRepasse(o));
+  const soldInPeriodPaidOutsideRows = soldAtFinancialRows.filter(o => !inRange(o.orderPaidAt, start, end));
+  const paidInPeriodSoldOutsideRows = financialOrders.filter(o => !inRange(o.soldAt, start, end));
+  const returnedPartialRows = financialOrders.filter(o => o.orderCategory === 'returned_partial');
+
+  const competence = {
+    basis: 'repasse',
+    basisField: 'orderPaidAt',
+    operationalField: 'soldAt',
+    financial: summarizeLines(financialOrders, storeTaxRateMap),
+    soldInPeriod: summarizeLines(soldAtFinancialRows, storeTaxRateMap),
+    soldInPeriodPaidOutside: {
+      ...summarizeLines(soldInPeriodPaidOutsideRows, storeTaxRateMap),
+      ordersList: soldInPeriodPaidOutsideRows.map(o => auditOrder(o, storeTaxRateMap)),
+    },
+    paidInPeriodSoldOutside: {
+      ...summarizeLines(paidInPeriodSoldOutsideRows, storeTaxRateMap),
+      ordersList: paidInPeriodSoldOutsideRows.map(o => auditOrder(o, storeTaxRateMap)),
+    },
+    returnedPartial: {
+      ...summarizeLines(returnedPartialRows, storeTaxRateMap),
+      ordersList: returnedPartialRows.map(o => auditOrder(o, storeTaxRateMap)),
+    },
+  };
+  competence.hasShift = competence.soldInPeriodPaidOutside.orders > 0 || competence.paidInPeriodSoldOutside.orders > 0;
+
+  const operational = {
+    createdOrders: new Set(soldAtOrders.map(orderKey).filter(Boolean)).size,
+    createdLines: soldAtOrders.length,
+    createdUnits: soldAtOrders.reduce((sum, o) => sum + (o.quantity ?? 0), 0),
+    createdSalesTotal: summarizeLines(soldAtOrders, storeTaxRateMap).salesTotal,
+  };
+
+  let gmvTotal = 0, gmvConfirmed = 0, gmvPending = 0;
+  let shopeeDeductions = 0, sellerDiscounts = 0, netRevenue = 0;
+  let taxAmount = 0, productCost = 0, packagingCost = 0, grossProfit = 0;
+  let estimatedTaxAmount = 0, estimatedProductCost = 0, estimatedPackagingCost = 0, estimatedGrossProfit = 0;
+  let repasseConfirmado = 0, repasseEstimado = 0;
+  let cancelledGmv = 0, returnedValue = 0, returnedCost = 0;
+  let unitCount = 0;
+  let confirmedLineCount = 0, pendingLineCount = 0, cancelledLineCount = 0, returnedLineCount = 0;
+  const confirmedOrderIds = new Set();
+  const pendingOrderIds = new Set();
+  const cancelledOrderIds = new Set();
+  const returnedOrderIds = new Set();
+
+  const groupMap = new Map();
+  const returnedOrdersList = [];
+  const cancelledOrdersList = [];
+  const pendingOrdersList = [];
+
+  for (const o of allOrders) {
+    const hasConfirmedRepasse = financialRowIds.has(o.id);
+    const isPending = o.orderCategory === 'pending';
+    const isEstimatedRevenue = isPending || (
+      FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory)
+      && !hasConfirmedRepasse
+      && !hasRealRepasse(o)
+    );
+    const isRevenue = hasConfirmedRepasse || isEstimatedRevenue;
+    const isCancelled = !hasConfirmedRepasse && o.orderCategory.startsWith('cancelled');
+    const isReturned = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
+    const { orderFee, orderDisc, repasse: orderRepasse, tax: orderTax, profit: orderProfit } = calcLine(o, storeTaxRateMap);
+
+    if (hasConfirmedRepasse) {
+      confirmedLineCount++;
+      addUniqueOrder(confirmedOrderIds, o);
+    } else if (isPending || isEstimatedRevenue) {
+      pendingLineCount++;
+      addUniqueOrder(pendingOrderIds, o);
+    } else if (isCancelled) {
+      cancelledLineCount++;
+      addUniqueOrder(cancelledOrderIds, o);
+    }
+    if (isReturned) {
+      returnedLineCount++;
+      addUniqueOrder(returnedOrderIds, o);
+    }
+
+    if (isCancelled) {
+      cancelledOrdersList.push({
+        id: o.id, orderId: o.orderId, soldAt: o.soldAt, orderPaidAt: o.orderPaidAt,
+        productName: o.productName, variationName: o.variationName,
+        calcGmv: r2(o.calcGmv), cancelReason: o.cancelReason ?? null,
+      });
+    }
+    if (isReturned) {
+      returnedOrdersList.push({
+        id: o.id, orderId: o.orderId, soldAt: o.soldAt, orderPaidAt: o.orderPaidAt,
+        productName: o.productName, variationName: o.variationName,
+        calcGmv: r2(o.calcGmv), escrowAmount: o.escrowAmount,
+        orderCategory: o.orderCategory, returnStatus: o.returnStatus ?? null,
+      });
+    }
+    if (isPending || (FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory) && !hasConfirmedRepasse && !hasRealRepasse(o))) {
+      pendingOrdersList.push({
+        id: o.id, orderId: o.orderId, soldAt: o.soldAt, orderPaidAt: o.orderPaidAt,
+        productName: o.productName, variationName: o.variationName,
+        calcGmv: r2(o.calcGmv), estimatedRepasse: orderRepasse,
+        reason: isPending ? undefined : 'Aguardando repasse Shopee',
+      });
+    }
+
+    if (hasConfirmedRepasse) {
+      gmvTotal += o.calcGmv;
+      shopeeDeductions += orderFee;
+      sellerDiscounts += orderDisc;
+      netRevenue += orderRepasse;
+      taxAmount += orderTax;
+      productCost += o.calcProductCost;
+      packagingCost += o.calcPackaging;
+      grossProfit += orderProfit;
+      unitCount += o.quantity;
+      gmvConfirmed += o.calcGmv;
+      repasseConfirmado += orderRepasse;
+    } else if (isEstimatedRevenue) {
+      gmvPending += o.calcGmv;
+      repasseEstimado += orderRepasse;
+      estimatedTaxAmount += orderTax;
+      estimatedProductCost += o.calcProductCost;
+      estimatedPackagingCost += o.calcPackaging;
+      estimatedGrossProfit += orderProfit;
+    }
+    if (isCancelled) cancelledGmv += o.calcGmv;
+    if (isReturned) {
+      returnedValue += o.calcGmv;
+      returnedCost += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+    }
+
+    if (!isRevenue) continue;
+
+    const key = o.productId
+      ? `pid:${o.productId}`
+      : `sku:${o.skuVariacao || o.skuPrincipal || o.productName || o.orderId}`;
+
+    if (!groupMap.has(key)) {
+      groupMap.set(key, {
+        productId: o.productId,
+        productName: o.product?.name ?? o.productName ?? '(sem nome)',
+        sku: o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
+        variationName: o.variationName ?? null,
+        hasCost: true, hasPending: false,
+        orderCount: 0, qty: 0, pendingOrderCount: 0, pendingQty: 0,
+        orderIds: new Set(), pendingOrderIds: new Set(),
+        gmv: 0, shopeeFee: 0, netRevenue: 0,
+        productCost: 0, packaging: 0, grossProfit: 0, estimatedProfit: 0,
+        gmvEstimado: 0, impostoEstimado: 0, custoEstimado: 0,
+        repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
+        orders: [],
+        variantMap: new Map(),
+      });
+    }
+    const g = groupMap.get(key);
+    if (hasConfirmedRepasse) {
+      addUniqueOrder(g.orderIds, o);
+      g.orderCount = g.orderIds.size;
+      g.qty += o.quantity;
+      g.gmv += o.calcGmv;
+      g.shopeeFee += orderFee;
+      g.netRevenue += orderRepasse;
+      g.productCost += o.calcProductCost;
+      g.packaging += o.calcPackaging;
+      g.grossProfit += orderProfit;
+      g.impostoTotal += orderTax;
+      g.repasseConfirmado += orderRepasse;
+    } else if (isEstimatedRevenue) {
+      addUniqueOrder(g.pendingOrderIds, o);
+      g.pendingOrderCount = g.pendingOrderIds.size;
+      g.pendingQty += o.quantity;
+      g.gmvEstimado += o.calcGmv;
+      g.estimatedProfit += orderProfit;
+      g.impostoEstimado += orderTax;
+      g.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+      g.repasseEstimado += orderRepasse;
+    }
+    if (!o.hasCost) g.hasCost = false;
+    if (isEstimatedRevenue) g.hasPending = true;
+    g.orders.push({
+      orderId: o.orderId,
+      soldAt: o.soldAt,
+      orderPaidAt: o.orderPaidAt,
+      quantity: o.quantity,
+      calcGmv: r2(o.calcGmv),
+      escrowAmount: o.escrowAmount,
+      orderCategory: o.orderCategory,
+      variationName: o.variationName ?? null,
+      repasse: orderRepasse,
+      estimated: isEstimatedRevenue,
+    });
+
+    if (o.variantId) {
+      if (!g.variantMap.has(o.variantId)) {
+        g.variantMap.set(o.variantId, {
+          variantId: o.variantId,
+          name: o.variant?.name ?? o.variationName ?? null,
+          sku: o.variant?.sku ?? o.skuVariacao ?? null,
+          hasCost: true, hasPending: false,
+          orderCount: 0, qty: 0, pendingOrderCount: 0, pendingQty: 0,
+          orderIds: new Set(), pendingOrderIds: new Set(),
+          gmv: 0, shopeeFee: 0, netRevenue: 0,
+          productCost: 0, packaging: 0, grossProfit: 0, estimatedProfit: 0,
+          gmvEstimado: 0, impostoEstimado: 0, custoEstimado: 0,
+          repasseConfirmado: 0, repasseEstimado: 0, impostoTotal: 0,
+          orders: [],
+        });
+      }
+      const v = g.variantMap.get(o.variantId);
+      if (hasConfirmedRepasse) {
+        addUniqueOrder(v.orderIds, o);
+        v.orderCount = v.orderIds.size;
+        v.qty += o.quantity;
+        v.gmv += o.calcGmv;
+        v.shopeeFee += orderFee;
+        v.netRevenue += orderRepasse;
+        v.productCost += o.calcProductCost;
+        v.packaging += o.calcPackaging;
+        v.grossProfit += orderProfit;
+        v.impostoTotal += orderTax;
+        v.repasseConfirmado += orderRepasse;
+      } else if (isEstimatedRevenue) {
+        addUniqueOrder(v.pendingOrderIds, o);
+        v.pendingOrderCount = v.pendingOrderIds.size;
+        v.pendingQty += o.quantity;
+        v.gmvEstimado += o.calcGmv;
+        v.estimatedProfit += orderProfit;
+        v.impostoEstimado += orderTax;
+        v.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+        v.repasseEstimado += orderRepasse;
+      }
+      if (!o.hasCost) v.hasCost = false;
+      if (isEstimatedRevenue) v.hasPending = true;
+      v.orders.push({
+        orderId: o.orderId,
+        soldAt: o.soldAt,
+        orderPaidAt: o.orderPaidAt,
+        quantity: o.quantity,
+        calcGmv: r2(o.calcGmv),
+        escrowAmount: o.escrowAmount,
+        orderCategory: o.orderCategory,
+        variationName: o.variationName ?? null,
+        repasse: orderRepasse,
+        estimated: isEstimatedRevenue,
+      });
+    }
+  }
+
+  grossProfit -= fixedTaxAmount;
+  const avgMargin = gmvTotal > 0 ? (grossProfit / gmvTotal) * 100 : 0;
+  const repasseTotal = r2(repasseConfirmado + repasseEstimado);
+  const impostoTotal = r2(taxAmount);
+  const custoTotal = r2(productCost + packagingCost);
+  const resultadoLiquido = r2(grossProfit);
+  const margem = gmvTotal > 0 ? r2((resultadoLiquido / gmvTotal) * 100) : 0;
+  const resultadoEstimado = r2(estimatedGrossProfit);
+  const impostoEstimadoTotal = r2(estimatedTaxAmount);
+  const custoEstimadoTotal = r2(estimatedProductCost + estimatedPackagingCost);
+
+  const sortOrders = (orders) => orders.slice().sort((a, b) => new Date(a.orderPaidAt ?? a.soldAt) - new Date(b.orderPaidAt ?? b.soldAt));
+  const groups = [...groupMap.values()]
+    .map(g => ({
+      productId: g.productId,
+      productName: g.productName,
+      sku: g.sku,
+      variationName: g.variationName,
+      hasCost: g.hasCost,
+      hasPending: g.hasPending,
+      orderCount: g.orderCount,
+      qty: g.qty,
+      gmv: r2(g.gmv),
+      shopeeFee: r2(g.shopeeFee),
+      netRevenue: r2(g.netRevenue),
+      productCost: r2(g.productCost),
+      packaging: r2(g.packaging),
+      grossProfit: r2(g.grossProfit),
+      margin: g.gmv > 0 ? r2((g.grossProfit / g.gmv) * 100) : 0,
+      estimatedProfit: r2(g.estimatedProfit),
+      gmvEstimado: r2(g.gmvEstimado),
+      impostoEstimado: r2(g.impostoEstimado),
+      custoEstimado: r2(g.custoEstimado),
+      pendingOrderCount: g.pendingOrderCount,
+      pendingQty: g.pendingQty,
+      repasseConfirmado: r2(g.repasseConfirmado),
+      repasseEstimado: r2(g.repasseEstimado),
+      impostoTotal: r2(g.impostoTotal),
+      orders: sortOrders(g.orders),
+      variants: [...g.variantMap.values()]
+        .map(v => ({
+          variantId: v.variantId,
+          name: v.name,
+          sku: v.sku,
+          hasCost: v.hasCost,
+          hasPending: v.hasPending,
+          orderCount: v.orderCount,
+          qty: v.qty,
+          gmv: r2(v.gmv),
+          shopeeFee: r2(v.shopeeFee),
+          netRevenue: r2(v.netRevenue),
+          productCost: r2(v.productCost),
+          packaging: r2(v.packaging),
+          grossProfit: r2(v.grossProfit),
+          margin: v.gmv > 0 ? r2((v.grossProfit / v.gmv) * 100) : 0,
+          estimatedProfit: r2(v.estimatedProfit),
+          gmvEstimado: r2(v.gmvEstimado),
+          impostoEstimado: r2(v.impostoEstimado),
+          custoEstimado: r2(v.custoEstimado),
+          pendingOrderCount: v.pendingOrderCount,
+          pendingQty: v.pendingQty,
+          repasseConfirmado: r2(v.repasseConfirmado),
+          repasseEstimado: r2(v.repasseEstimado),
+          impostoTotal: r2(v.impostoTotal),
+          orders: sortOrders(v.orders),
+        }))
+        .sort((a, b) => b.gmv - a.gmv),
+    }))
+    .sort((a, b) => b.gmv - a.gmv);
+
+  const totalOrderIds = new Set([
+    ...confirmedOrderIds,
+    ...pendingOrderIds,
+    ...cancelledOrderIds,
+    ...returnedOrderIds,
+  ]);
+
+  return {
+    totalOrders: totalOrderIds.size,
+    totalLineCount: allOrders.length,
+    confirmedOrders: confirmedOrderIds.size,
+    confirmedLineCount,
+    pendingOrders: pendingOrderIds.size,
+    pendingLineCount,
+    cancelledOrders: cancelledOrderIds.size,
+    cancelledLineCount,
+    returnedOrders: returnedOrderIds.size,
+    returnedLineCount,
+    unitCount,
+    gmvTotal: r2(gmvTotal),
+    gmvConfirmed: r2(gmvConfirmed),
+    gmvPending: r2(gmvPending),
+    shopeeDeductions: r2(shopeeDeductions),
+    sellerDiscounts: r2(sellerDiscounts),
+    netRevenue: r2(netRevenue),
+    taxAmount: r2(taxAmount),
+    fixedTaxAmount,
+    productCost: r2(productCost),
+    packagingCost: r2(packagingCost),
+    grossProfit: r2(grossProfit),
+    avgMargin: r2(avgMargin),
+    cancelledGmv: r2(cancelledGmv),
+    returnedValue: r2(returnedValue),
+    returnedCost: r2(returnedCost),
+    orphanCount: groups.filter(g => !g.hasCost).length,
+    operational,
+    competence,
+
+    repasseConfirmado: r2(repasseConfirmado),
+    repasseEstimado: r2(repasseEstimado),
+    repasseTotal,
+    impostoTotal,
+    custoTotal,
+    resultadoLiquido,
+    margem,
+    resultadoEstimado,
+    impostoEstimadoTotal,
+    custoEstimadoTotal,
+    gmvEstimado: r2(gmvPending),
+    pendentes: {
+      count: pendingOrderIds.size,
+      lineCount: pendingLineCount,
+      gmv: r2(gmvPending),
+      estimatedRepasse: r2(repasseEstimado),
+      estimatedProfit: resultadoEstimado,
+      estimatedTax: impostoEstimadoTotal,
+      estimatedCost: custoEstimadoTotal,
+    },
+
+    returnedOrdersList,
+    cancelledOrdersList,
+    pendingOrdersList,
+
+    groups,
+  };
+}
+
 // ── GET /api/closing/:month/orders ────────────────────────────────────────────
 // Lista os pedidos individuais de um produto/variação no mês, para o drawer de detalhe
 async function getProductOrders(req, res) {
@@ -530,22 +1086,37 @@ async function getProductOrders(req, res) {
     if (!storeIds.length) return res.json({ orders: [] });
 
     const { year: y, month: mo } = parseYearMonth(month);
-    const start = new Date(Date.UTC(y, mo - 1, 1));
-    const end   = new Date(Date.UTC(y, mo, 0, 23, 59, 59, 999));
+    const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+    const start = spToUtc(y, mo, 1);
+    const end   = spToUtc(y, mo, lastDay, 23, 59, 59, 999);
 
     const where = {
       storeId: { in: storeIds },
-      soldAt: { gte: start, lte: end },
       productId,
-      orderCategory: { in: ['valid', 'pending'] },
+      OR: [
+        {
+          orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
+          escrowAmount: { not: null },
+          orderPaidAt: { gte: start, lte: end },
+        },
+        {
+          orderCategory: 'pending',
+          soldAt: { gte: start, lte: end },
+        },
+        {
+          orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
+          escrowAmount: null,
+          soldAt: { gte: start, lte: end },
+        },
+      ],
     };
     if (variantId) where.variantId = variantId;
 
     const orders = await prisma.order.findMany({
       where,
-      orderBy: { soldAt: 'asc' },
+      orderBy: [{ orderPaidAt: 'asc' }, { soldAt: 'asc' }],
       select: {
-        orderId: true, orderCategory: true, soldAt: true, calcGmv: true,
+        orderId: true, orderCategory: true, soldAt: true, orderPaidAt: true, calcGmv: true,
         escrowAmount: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true,
       },
@@ -561,6 +1132,7 @@ async function getProductOrders(req, res) {
       return {
         orderSn: o.orderId,
         soldAt:  o.soldAt,
+        orderPaidAt: o.orderPaidAt,
         valor:   r2(o.calcGmv),
         status:  isConfirmed ? 'Liquidado' : 'Aguardando repasse',
         repasse,
@@ -729,7 +1301,7 @@ function renderStoreSection(doc, store, d, month, opts = {}) {
   const top10     = d.groups.slice(0, 10);
   const negMargin = d.groups.filter(g => g.hasCost && g.margin < 0).length;
   const hasCosts  = d.orphanCount === 0;
-  const totalOrd  = d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders;
+  const totalOrd  = d.totalOrders ?? (d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders);
   const cancelPct = totalOrd > 0 ? ((d.cancelledOrders / totalOrd) * 100).toFixed(1) : '0.0';
   const returnPct = totalOrd > 0 ? ((d.returnedOrders  / totalOrd) * 100).toFixed(1) : '0.0';
 
@@ -1025,7 +1597,7 @@ async function getPdf(req, res) {
       const mLabelCap = mLabel.charAt(0).toUpperCase() + mLabel.slice(1);
       const d         = consolidatedData;
       const hasCosts  = d.orphanCount === 0;
-      const totalOrd  = d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders;
+      const totalOrd  = d.totalOrders ?? (d.confirmedOrders + d.pendingOrders + d.cancelledOrders + d.returnedOrders);
       const cancelPct = totalOrd > 0 ? ((d.cancelledOrders / totalOrd) * 100).toFixed(1) : '0.0';
       const returnPct = totalOrd > 0 ? ((d.returnedOrders  / totalOrd) * 100).toFixed(1) : '0.0';
 

@@ -169,7 +169,7 @@ function isUpsellerValidOrder(order) {
 function isConfirmedPaidOrder(order, marketplace) {
   const rawStatus = String(order.orderStatus ?? '').toUpperCase();
   if (rawStatus === 'CANCELLED') return false;
-  if (order.orderCategory !== 'valid') return false;
+  if (!['valid', 'returned_partial'].includes(order.orderCategory)) return false;
   if (String(marketplace ?? '').toLowerCase() === 'shopee') {
     return order.escrowAmount !== null && order.escrowAmount !== undefined;
   }
