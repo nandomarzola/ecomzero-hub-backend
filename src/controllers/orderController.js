@@ -57,31 +57,42 @@ function summarizeUniqueOrders(orders, valueSelector) {
 }
 
 function isConfirmedRepasse(order, marketplace) {
-  if (order.orderCategory !== 'valid') return false;
+  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+  if (rawStatus === 'CANCELLED') return false;
+  if (!['valid', 'returned_partial'].includes(order.orderCategory)) return false;
   if (String(marketplace ?? '').toLowerCase() === 'shopee') {
     return order.escrowAmount !== null && order.escrowAmount !== undefined;
   }
-  return true;
+  return !!order.orderPaidAt || order.status === 'paid';
+}
+
+function expectedRepasse(order, marketplace) {
+  if (isConfirmedRepasse(order, marketplace)) {
+    return String(marketplace ?? '').toLowerCase() === 'shopee'
+      ? (order.escrowAmount ?? 0)
+      : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
+  }
+  if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
+  if (order.calcNetRevenue > 0) return order.calcNetRevenue;
+
+  const gmv = r2(order.calcGmv ?? order.salePrice ?? 0);
+  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  if (fee <= 0 && discount <= 0) return null;
+  const estimatedNet = r2(gmv - fee - discount);
+  return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
 }
 
 function calcOrderFinancials(order, taxRate = 0, marketplace = 'shopee') {
   const gmv = r2(order.calcGmv ?? order.salePrice ?? 0);
-  const rawFee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const fee = rawFee > 0 ? rawFee : r2(order.calcShopeeFee ?? 0);
-  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
   const confirmed = isConfirmedRepasse(order, marketplace);
-  const fallbackNet = r2(gmv - fee - discount);
-  const netRevenue = confirmed && order.escrowAmount !== null && order.escrowAmount !== undefined
-    ? r2(order.escrowAmount)
-    : r2(order.calcNetRevenue ?? fallbackNet);
-  const tax = order.calcTax !== null && order.calcTax !== undefined
-    ? r2(order.calcTax)
-    : r2(gmv * taxRate / 100);
+  const netRevenueRaw = expectedRepasse(order, marketplace);
+  const netRevenue = netRevenueRaw === null || netRevenueRaw === undefined ? null : r2(netRevenueRaw);
+  const tax = r2(gmv * taxRate / 100);
   const cost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-  const profit = confirmed
-    ? r2(netRevenue - tax - cost)
-    : r2(order.calcGrossProfit ?? (netRevenue - tax - cost));
-  const margin = gmv > 0 ? r2((profit / gmv) * 100) : 0;
+  const profit = netRevenue === null ? null : r2(netRevenue - tax - cost);
+  const margin = gmv > 0 && profit !== null ? r2((profit / gmv) * 100) : 0;
 
   return { gmv, fee, netRevenue, tax, profit, margin, confirmed };
 }
@@ -282,11 +293,12 @@ async function listOrders(req, res) {
     prisma.order.count({ where: { ...revenueBaseWhere, orderCategory: 'pending' } }),
     prisma.order.findMany({ where: paidCancelledWhere, distinct: ['orderId'], select: { orderId: true } }),
     prisma.order.count({ where: { ...revenueBaseWhere, status: 'returned' } }),
-    // Totais financeiros pela lógica Upseller: vendas válidas entram pelo pagamento/validação.
+    // Totais financeiros pela mesma régua do dashboard: válidos, pendentes e devolução parcial.
     prisma.order.findMany({
-      where: { ...revenueBaseWhere, orderCategory: { in: ['valid', 'pending'] } },
+      where: { ...revenueBaseWhere, orderCategory: { in: REVENUE_ORDER_CATEGORIES } },
       select: {
         id: true, storeId: true, orderId: true, orderCategory: true, calcGmv: true, globalTotal: true, salePrice: true, quantity: true,
+        orderStatus: true, orderPaidAt: true, status: true,
         platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true, escrowAmount: true,
         calcProductCost: true, calcPackaging: true, calcShopeeFee: true,
@@ -321,6 +333,7 @@ async function listOrders(req, res) {
   let confirmedNetRevenue = 0, confirmedGrossProfit = 0, estimatedNetRevenue = 0, estimatedGrossProfit = 0;
   const confirmedRepasseIds = new Set();
   const awaitingRepasseIds = new Set();
+  const unreliableEstimateIds = new Set();
   const validGmv = summarizeUniqueOrders(
     revenueOrders,
     (order) => order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0
@@ -329,13 +342,18 @@ async function listOrders(req, res) {
     const fin = calcOrderFinancials(o, taxRateMap.get(o.storeId) ?? 0, marketplaceMap.get(o.storeId));
     const orderKey = getOrderUniqueKey(o);
     shopeeFee   += fin.fee;
-    netRevenue  += fin.netRevenue;
-    grossProfit += fin.profit;
+    if (fin.netRevenue !== null && fin.netRevenue !== undefined) netRevenue += fin.netRevenue;
+    if (fin.profit !== null && fin.profit !== undefined) grossProfit += fin.profit;
     if (fin.confirmed) {
-      confirmedNetRevenue += fin.netRevenue;
-      confirmedGrossProfit += fin.profit;
+      if (fin.netRevenue !== null && fin.netRevenue !== undefined) confirmedNetRevenue += fin.netRevenue;
+      if (fin.profit !== null && fin.profit !== undefined) confirmedGrossProfit += fin.profit;
       if (orderKey) confirmedRepasseIds.add(orderKey);
     } else {
+      if (orderKey) awaitingRepasseIds.add(orderKey);
+      if (fin.netRevenue === null || fin.netRevenue === undefined || fin.profit === null || fin.profit === undefined) {
+        if (orderKey) unreliableEstimateIds.add(orderKey);
+        continue;
+      }
       estimatedNetRevenue += fin.netRevenue;
       estimatedGrossProfit += fin.profit;
       if (orderKey) awaitingRepasseIds.add(orderKey);
@@ -364,6 +382,7 @@ async function listOrders(req, res) {
     estimatedRepasse: estimatedNetRevenue,
     confirmedRepasseOrders: confirmedRepasseIds.size,
     awaitingRepasseOrders: awaitingRepasseIds.size,
+    estimatedProfitOrdersUnreliable: unreliableEstimateIds.size,
     margin:       gmv > 0 ? r2((grossProfit / gmv) * 100) : 0,
     units,
     cancelledGmv: r2(aggCancelled._sum.calcGmv),
