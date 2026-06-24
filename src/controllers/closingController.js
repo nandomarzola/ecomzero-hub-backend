@@ -130,6 +130,79 @@ function snapshotToClosingData(closing) {
   };
 }
 
+function combineClosingData(items) {
+  const combined = {
+    totalOrders: 0, totalLineCount: 0,
+    confirmedOrders: 0, confirmedLineCount: 0,
+    pendingOrders: 0, pendingLineCount: 0,
+    cancelledOrders: 0, cancelledLineCount: 0,
+    returnedOrders: 0, returnedLineCount: 0,
+    unitCount: 0,
+    gmvTotal: 0, gmvConfirmed: 0, gmvPending: 0,
+    shopeeDeductions: 0, sellerDiscounts: 0, netRevenue: 0,
+    taxAmount: 0, fixedTaxAmount: 0, productCost: 0, packagingCost: 0,
+    grossProfit: 0, cancelledGmv: 0, returnedValue: 0, returnedCost: 0,
+    repasseConfirmado: 0, repasseEstimado: 0, repasseTotal: 0,
+    impostoTotal: 0, custoTotal: 0, resultadoLiquido: 0,
+    resultadoEstimado: 0, impostoEstimadoTotal: 0, custoEstimadoTotal: 0,
+    gmvEstimado: 0, orphanCount: 0,
+    groups: [],
+    returnedOrdersList: [], cancelledOrdersList: [], pendingOrdersList: [],
+    operational: { createdOrders: 0, createdLines: 0, createdUnits: 0, createdSalesTotal: 0 },
+    competence: {
+      basis: 'repasse',
+      basisField: 'orderPaidAt',
+      operationalField: 'soldAt',
+      hasShift: false,
+      soldInPeriodPaidOutside: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+      paidInPeriodSoldOutside: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+      returnedPartial: { orders: 0, lines: 0, units: 0, salesTotal: 0, gmv: 0, repasse: 0, tax: 0, cost: 0, profit: 0, ordersList: [] },
+    },
+  };
+
+  const sumKeys = [
+    'totalOrders', 'totalLineCount', 'confirmedOrders', 'confirmedLineCount',
+    'pendingOrders', 'pendingLineCount', 'cancelledOrders', 'cancelledLineCount',
+    'returnedOrders', 'returnedLineCount', 'unitCount', 'gmvTotal', 'gmvConfirmed',
+    'gmvPending', 'shopeeDeductions', 'sellerDiscounts', 'netRevenue', 'taxAmount',
+    'fixedTaxAmount', 'productCost', 'packagingCost', 'grossProfit', 'cancelledGmv',
+    'returnedValue', 'returnedCost', 'repasseConfirmado', 'repasseEstimado',
+    'repasseTotal', 'impostoTotal', 'custoTotal', 'resultadoLiquido',
+    'resultadoEstimado', 'impostoEstimadoTotal', 'custoEstimadoTotal',
+    'gmvEstimado', 'orphanCount',
+  ];
+
+  for (const data of items) {
+    for (const key of sumKeys) combined[key] += data[key] ?? 0;
+    combined.groups.push(...(data.groups ?? []));
+    combined.returnedOrdersList.push(...(data.returnedOrdersList ?? []));
+    combined.cancelledOrdersList.push(...(data.cancelledOrdersList ?? []));
+    combined.pendingOrdersList.push(...(data.pendingOrdersList ?? []));
+    combined.operational.createdOrders += data.operational?.createdOrders ?? data.totalOrders ?? 0;
+    combined.operational.createdLines += data.operational?.createdLines ?? data.totalLineCount ?? data.totalOrders ?? 0;
+    combined.operational.createdUnits += data.operational?.createdUnits ?? data.unitCount ?? 0;
+    combined.operational.createdSalesTotal += data.operational?.createdSalesTotal ?? data.gmvTotal ?? 0;
+  }
+
+  combined.avgMargin = combined.gmvTotal > 0 ? r2((combined.grossProfit / combined.gmvTotal) * 100) : 0;
+  combined.margem = combined.gmvTotal > 0 ? r2((combined.resultadoLiquido / combined.gmvTotal) * 100) : 0;
+  combined.pendentes = {
+    count: combined.pendingOrders,
+    lineCount: combined.pendingLineCount,
+    gmv: r2(combined.gmvPending),
+    estimatedRepasse: r2(combined.repasseEstimado),
+    estimatedProfit: r2(combined.resultadoEstimado),
+    estimatedTax: r2(combined.impostoEstimadoTotal),
+    estimatedCost: r2(combined.custoEstimadoTotal),
+  };
+
+  for (const key of [...sumKeys, 'avgMargin', 'margem']) {
+    if (typeof combined[key] === 'number') combined[key] = r2(combined[key]);
+  }
+  combined.operational.createdSalesTotal = r2(combined.operational.createdSalesTotal);
+  return combined;
+}
+
 function fmtDateTime(d) {
   if (!d) return '';
   const dt = new Date(d);
@@ -1179,16 +1252,28 @@ async function getClosing(req, res) {
     const storeIds = stores.map(s => s.id);
     if (!storeIds.length) return res.json({ status: 'open', data: null, groups: [] });
 
-    const closing = await prisma.monthlyClosing.findFirst({
+    const closings = await prisma.monthlyClosing.findMany({
       where: { storeId: { in: storeIds }, periodMonth: month, status: 'closed' },
+      orderBy: { closedAt: 'desc' },
     });
 
-    if (closing) {
-      const data = snapshotToClosingData(closing);
+    if (storeId && closings.length > 0) {
+      const data = snapshotToClosingData(closings[0]);
       return res.json({
-        status:   'closed',
-        closedAt: closing.closedAt,
-        closedBy: closing.closedBy,
+        status: 'closed',
+        closedAt: closings[0].closedAt,
+        closedBy: closings[0].closedBy,
+        data,
+        groups: data.groups,
+      });
+    }
+
+    if (!storeId && closings.length === storeIds.length) {
+      const data = combineClosingData(closings.map(snapshotToClosingData));
+      return res.json({
+        status: 'closed',
+        closedAt: closings[0]?.closedAt ?? null,
+        closedBy: closings[0]?.closedBy ?? null,
         data,
         groups: data.groups,
       });
@@ -1212,52 +1297,64 @@ async function closeMonth(req, res) {
     if (storeId) storeWhere.id = storeId;
     const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
     if (!stores.length) return res.status(404).json({ error: 'Loja nao encontrada' });
-    const sid = stores[0].id;
+    const storeIds = stores.map(s => s.id);
 
-    const existing = await prisma.monthlyClosing.findFirst({
-      where: { storeId: sid, periodMonth: month, status: 'closed' },
+    const existingClosings = await prisma.monthlyClosing.findMany({
+      where: { storeId: { in: storeIds }, periodMonth: month, status: 'closed' },
+      select: { storeId: true, closedAt: true },
     });
-    if (existing) {
+    if (storeId && existingClosings.length > 0) {
       return res.status(409).json({
-        error: `Mes ${month} ja foi fechado em ${fmtDateTime(existing.closedAt)}`,
-        closedAt: existing.closedAt,
+        error: `Mes ${month} ja foi fechado em ${fmtDateTime(existingClosings[0].closedAt)}`,
+        closedAt: existingClosings[0].closedAt,
+      });
+    }
+    if (!storeId && existingClosings.length === storeIds.length) {
+      return res.status(409).json({
+        error: `Mes ${month} ja foi fechado para todas as lojas`,
+        closedAt: existingClosings[0]?.closedAt ?? null,
       });
     }
 
-    const d = await buildClosingData([sid], month);
+    const closedAt = new Date();
+    const results = [];
+    for (const sid of storeIds) {
+      const d = await buildClosingData([sid], month);
+      const closing = await prisma.monthlyClosing.upsert({
+        where: { storeId_periodMonth: { storeId: sid, periodMonth: month } },
+        create: {
+          storeId: sid, periodMonth: month,
+          closedAt, closedBy: req.userId, status: 'closed',
+          totalOrders: d.totalOrders, confirmedOrders: d.confirmedOrders,
+          pendingOrders: d.pendingOrders, cancelledOrders: d.cancelledOrders,
+          returnedOrders: d.returnedOrders, unitCount: d.unitCount,
+          gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
+          shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
+          netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
+          productCost: d.productCost, packagingCost: d.packagingCost,
+          grossProfit: d.grossProfit, avgMargin: d.avgMargin,
+          cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
+          productsSnapshot: d.groups,
+        },
+        update: {
+          closedAt, closedBy: req.userId, status: 'closed',
+          totalOrders: d.totalOrders, confirmedOrders: d.confirmedOrders,
+          pendingOrders: d.pendingOrders, cancelledOrders: d.cancelledOrders,
+          returnedOrders: d.returnedOrders, unitCount: d.unitCount,
+          gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
+          shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
+          netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
+          productCost: d.productCost, packagingCost: d.packagingCost,
+          grossProfit: d.grossProfit, avgMargin: d.avgMargin,
+          cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
+          productsSnapshot: d.groups,
+        },
+      });
+      results.push({ closing, data: d });
+    }
 
-    const closing = await prisma.monthlyClosing.upsert({
-      where:  { storeId_periodMonth: { storeId: sid, periodMonth: month } },
-      create: {
-        storeId: sid, periodMonth: month,
-        closedAt: new Date(), closedBy: req.userId, status: 'closed',
-        totalOrders: d.totalOrders, confirmedOrders: d.confirmedOrders,
-        pendingOrders: d.pendingOrders, cancelledOrders: d.cancelledOrders,
-        returnedOrders: d.returnedOrders, unitCount: d.unitCount,
-        gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
-        shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
-        netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
-        productCost: d.productCost, packagingCost: d.packagingCost,
-        grossProfit: d.grossProfit, avgMargin: d.avgMargin,
-        cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
-        productsSnapshot: d.groups,
-      },
-      update: {
-        closedAt: new Date(), closedBy: req.userId, status: 'closed',
-        totalOrders: d.totalOrders, confirmedOrders: d.confirmedOrders,
-        pendingOrders: d.pendingOrders, cancelledOrders: d.cancelledOrders,
-        returnedOrders: d.returnedOrders, unitCount: d.unitCount,
-        gmvTotal: d.gmvTotal, gmvConfirmed: d.gmvConfirmed, gmvPending: d.gmvPending,
-        shopeeDeductions: d.shopeeDeductions, sellerDiscounts: d.sellerDiscounts,
-        netRevenue: d.netRevenue, taxAmount: d.taxAmount, fixedTaxAmount: d.fixedTaxAmount,
-        productCost: d.productCost, packagingCost: d.packagingCost,
-        grossProfit: d.grossProfit, avgMargin: d.avgMargin,
-        cancelledGmv: d.cancelledGmv, returnedValue: d.returnedValue,
-        productsSnapshot: d.groups,
-      },
-    });
-
-    return res.json({ success: true, closedAt: closing.closedAt, data: d });
+    const data = storeId ? results[0].data : combineClosingData(results.map(r => r.data));
+    return res.json({ success: true, closedAt, data });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Erro ao fechar mes' });
