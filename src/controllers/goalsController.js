@@ -176,10 +176,14 @@ async function getGoalWithProgress(req, res) {
   const nowParts       = getZonedParts(new Date());
   const isCurrentMonth = nowParts.year === y && nowParts.month === mo;
 
-  // Para mês corrente: endDate = agora (não inclui o futuro do dia)
+  // Para mês corrente, espelha o preset "Mês" do dashboard:
+  // usa dias fechados até ontem; no dia 1 usa o próprio dia.
   // Para meses passados: endDate = fim do último dia do mês em SP
+  const currentMonthCutoffDay = isCurrentMonth
+    ? Math.max(1, Math.min(nowParts.day === 1 ? 1 : nowParts.day - 1, lastDay))
+    : lastDay;
   const endDate = isCurrentMonth
-    ? new Date()
+    ? spToUtc(y, mo, currentMonthCutoffDay, 23, 59, 59, 999)
     : spToUtc(y, mo, lastDay, 23, 59, 59, 999);
 
   const orders = await prisma.order.findMany({
@@ -191,8 +195,7 @@ async function getGoalWithProgress(req, res) {
 
   let projection = null;
   if (isCurrentMonth) {
-    // Bug fix: usa dia SP (nowParts.day) em vez de today.getDate() (dia UTC)
-    const daysPassed  = nowParts.day;
+    const daysPassed  = currentMonthCutoffDay;
     const daysInMonth = lastDay;
     const daysLeft    = daysInMonth - daysPassed;
     const projRevenue = daysPassed > 0 ? r2((actual.revenue / daysPassed) * daysInMonth) : 0;

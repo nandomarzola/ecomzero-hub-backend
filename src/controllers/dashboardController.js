@@ -663,6 +663,8 @@ async function getSummary(req, res) {
         projection = {
           revenue: parseFloat((totalRevenue * factor).toFixed(2)),
           profit: parseFloat((projectedProfit * factor).toFixed(2)),
+          currentRevenue: parseFloat(totalRevenue.toFixed(2)),
+          currentProfit: parseFloat(projectedProfit.toFixed(2)),
           confirmedProfit: parseFloat((totalProfit * factor).toFixed(2)),
           estimatedProfit: parseFloat((estimatedProfit * factor).toFixed(2)),
           dailyRevenue: parseFloat(dailyRevenue.toFixed(2)),
