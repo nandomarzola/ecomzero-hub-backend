@@ -1201,10 +1201,9 @@ async function getShopeeLosses(req, res) {
 }
 
 // GET /api/dashboard/stores-comparison
-// Comparativo de rentabilidade por loja + produtos campeões cross-loja.
-// Recomputa SEMPRE do raw — nunca usa calc* armazenados (regras invioláveis 1/2/3).
+// Comparativo de lucro real por loja, usando o mesmo período e a mesma cadeia canônica do dashboard.
 async function getStoresComparison(req, res) {
-  const { storeId } = req.query;
+  const { storeId, startDate, endDate } = req.query;
 
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
@@ -1222,27 +1221,38 @@ async function getStoresComparison(req, res) {
     return res.json({ period: { month: periodKey, start: null, end: null }, stores: [], crossStoreProducts: [] });
   }
 
-  // Período: mês atual, ou anterior se dia < 5
+  const requestedRange = buildDateRange(startDate, endDate);
   const now = new Date();
   let y = now.getUTCFullYear(), m = now.getUTCMonth(); // 0-indexed
   if (now.getUTCDate() < 5) { m -= 1; if (m < 0) { m = 11; y -= 1; } }
-  const periodStart = new Date(Date.UTC(y, m, 1));
-  const periodEnd   = new Date(Date.UTC(y, m + 1, 0, 23, 59, 59, 999));
-  const periodKey   = `${y}-${String(m + 1).padStart(2, '0')}`;
+  const fallbackRange = {
+    start: saoPauloDateToUtc(y, m + 1, 1),
+    end:   saoPauloDateToUtc(y, m + 1, new Date(Date.UTC(y, m + 1, 0)).getUTCDate(), 23, 59, 59, 999),
+    startDate: `${y}-${String(m + 1).padStart(2, '0')}-01`,
+    endDate:   `${y}-${String(m + 1).padStart(2, '0')}-${String(new Date(Date.UTC(y, m + 1, 0)).getUTCDate()).padStart(2, '0')}`,
+    timezone: APP_TIMEZONE,
+  };
+  const periodRange = requestedRange ?? fallbackRange;
+  const periodKey   = periodRange.startDate.substring(0, 7);
 
   const storeIds         = stores.map((s) => s.id);
   const storeTaxRateMap  = new Map(stores.map((s) => [s.id, s.taxRate ?? 0]));
   const storeMetaMap     = new Map(stores.map((s) => [s.id, s]));
 
-  // Buscar todos os pedidos do período (sem filtro de status — classificar por orderCategory)
+  // Mesmo recorte financeiro do dashboard principal: período por pagamento/repasse.
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      soldAt:  { gte: periodStart, lte: periodEnd },
+      ...paidPeriodWhere(periodRange),
+      orderCategory: { in: REVENUE_ORDER_CATEGORIES },
     },
     select: {
       storeId:            true,
+      orderId:            true,
       orderCategory:      true,
+      orderStatus:        true,
+      orderPaidAt:        true,
+      status:             true,
       calcGmv:            true,
       platformCommission: true,
       platformServiceFee: true,
@@ -1259,38 +1269,34 @@ async function getStoresComparison(req, res) {
   });
 
   // Acumuladores por loja
-  const storeAcc = {}; // storeId → { gmv, netRevenue, profit, orders }
+  const storeAcc = {}; // storeId → { gmv, netRevenue, profit, orderIds }
   for (const s of stores) {
-    storeAcc[s.id] = { gmv: 0, netRevenue: 0, profit: 0, orders: 0 };
+    storeAcc[s.id] = { gmv: 0, netRevenue: 0, profit: 0, orderIds: new Set() };
   }
 
   // Map para topProduct por loja: storeId → { productId → { name, profit, netRevenue } }
   const productByStore = {};
 
-  // Map para crossStoreProducts: normalizedName → { name (original), storeId → { profit, netRevenue, orders } }
+  // Map para crossStoreProducts: normalizedName → { name (original), storeId → { profit, gmv, orderIds } }
   const crossMap = {};
 
   for (const o of orders) {
-    const isConfirmed = o.orderCategory === 'valid';
-    const isPending   = o.orderCategory === 'pending';
-    const isRevenue   = isConfirmed || isPending;
+    const storeMeta = storeMetaMap.get(o.storeId);
+    const marketplace = storeMeta?.marketplace;
+    if (!isConfirmedPaidOrder(o, marketplace)) continue;
 
-    if (!isRevenue) continue;
-
-    const aliquota    = storeTaxRateMap.get(o.storeId) ?? 0;
-    const orderFee    = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-    const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-    const orderNet    = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
-    const orderRepasse = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
-    const orderTax    = r2((o.calcGmv ?? 0) * aliquota / 100);
-    const orderProfit = r2(orderRepasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
+    const aliquota     = storeTaxRateMap.get(o.storeId) ?? 0;
+    const orderGmv     = r2(o.calcGmv ?? 0);
+    const orderRepasse = r2(expectedRepasse(o, marketplace) ?? 0);
+    const orderProfit  = confirmedProfit(o, marketplace, aliquota);
+    const orderKey     = getOrderUniqueKey(o);
 
     // Acumular por loja
     const acc = storeAcc[o.storeId];
-    acc.gmv        += o.calcGmv ?? 0;
+    acc.gmv        += orderGmv;
     acc.netRevenue += orderRepasse;
     acc.profit     += orderProfit;
-    acc.orders++;
+    if (orderKey) acc.orderIds.add(orderKey);
 
     // Acumular por produto na loja (topProduct)
     if (o.productId) {
@@ -1310,11 +1316,11 @@ async function getStoresComparison(req, res) {
         crossMap[normName] = { name: o.product.name, stores: {} };
       }
       if (!crossMap[normName].stores[o.storeId]) {
-        crossMap[normName].stores[o.storeId] = { profit: 0, netRevenue: 0, orders: 0 };
+        crossMap[normName].stores[o.storeId] = { profit: 0, gmv: 0, orderIds: new Set() };
       }
-      crossMap[normName].stores[o.storeId].profit     += orderProfit;
-      crossMap[normName].stores[o.storeId].netRevenue += orderRepasse;
-      crossMap[normName].stores[o.storeId].orders++;
+      crossMap[normName].stores[o.storeId].profit += orderProfit;
+      crossMap[normName].stores[o.storeId].gmv    += orderGmv;
+      if (orderKey) crossMap[normName].stores[o.storeId].orderIds.add(orderKey);
     }
   }
 
@@ -1324,8 +1330,9 @@ async function getStoresComparison(req, res) {
     const gmv    = r2(acc.gmv);
     const net    = r2(acc.netRevenue);
     const profit = r2(acc.profit);
-    const margin = net > 0 ? r2(profit / net * 100) : 0;
-    const avgTicket = acc.orders > 0 ? r2(gmv / acc.orders) : 0;
+    const margin = gmv > 0 ? r2(profit / gmv * 100) : 0;
+    const orders = acc.orderIds.size;
+    const avgTicket = orders > 0 ? r2(gmv / orders) : 0;
 
     // topProduct da loja: produto com maior profit acumulado
     let topProduct = null;
@@ -1345,7 +1352,7 @@ async function getStoresComparison(req, res) {
       netRevenue: net,
       profit,
       margin,
-      orders:     acc.orders,
+      orders,
       avgTicket,
       topProduct,
     };
@@ -1354,19 +1361,19 @@ async function getStoresComparison(req, res) {
   // Montar crossStoreProducts: apenas produtos em >= 2 lojas distintas
   const crossStoreProducts = [];
   for (const [normName, data] of Object.entries(crossMap)) {
-    const storeEntries = Object.entries(data.stores); // [storeId, { profit, netRevenue, orders }]
+    const storeEntries = Object.entries(data.stores); // [storeId, { profit, gmv, orderIds }]
     if (storeEntries.length < 2) continue;
 
     const channels = storeEntries.map(([sid, vals]) => {
       const meta   = storeMetaMap.get(sid);
-      const margin = vals.netRevenue > 0 ? r2(vals.profit / vals.netRevenue * 100) : 0;
+      const margin = vals.gmv > 0 ? r2(vals.profit / vals.gmv * 100) : 0;
       return {
         storeId:    sid,
         storeName:  meta?.name ?? sid,
         marketplace: meta?.marketplace ?? 'outros',
         margin,
         profit:  r2(vals.profit),
-        orders:  vals.orders,
+        orders:  vals.orderIds.size,
       };
     });
 
@@ -1391,8 +1398,11 @@ async function getStoresComparison(req, res) {
   return res.json({
     period: {
       month: periodKey,
-      start: periodStart.toISOString(),
-      end:   periodEnd.toISOString(),
+      start: periodRange.start.toISOString(),
+      end:   periodRange.end.toISOString(),
+      startDate: periodRange.startDate,
+      endDate:   periodRange.endDate,
+      timezone:  periodRange.timezone,
     },
     stores:              storesResult,
     crossStoreProducts:  crossTop8,
