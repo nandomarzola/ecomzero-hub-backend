@@ -37,21 +37,57 @@ function paidPeriodWhere(start, end) {
   };
 }
 
-// Fórmula canônica — mirrors closingController.calcLine e appAuthController.calcOrderProfit
-// NUNCA lê calcGrossProfit, calcNetRevenue ou calcTax como entrada do cálculo
-function calcLineProfit(order, taxRate) {
-  const fee     = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const disc    = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-  const net     = r2((order.calcGmv ?? 0) - fee - disc);
-  const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
-  const repasse = hasEscrow ? r2(order.escrowAmount) : net;
+// Fórmula canônica — espelha dashboardController para a tela de metas não criar
+// um segundo "realizado" financeiro. Não usa calcGrossProfit nem calcTax.
+function isConfirmedPaidOrder(order, marketplace) {
+  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
+  if (rawStatus === 'CANCELLED') return false;
+  if (!['valid', 'returned_partial'].includes(order.orderCategory)) return false;
+  if (String(marketplace ?? '').toLowerCase() === 'shopee') {
+    return order.escrowAmount !== null && order.escrowAmount !== undefined;
+  }
+  return !!order.orderPaidAt || order.status === 'paid';
+}
+
+function expectedRepasse(order, marketplace) {
+  if (isConfirmedPaidOrder(order, marketplace)) {
+    return String(marketplace ?? '').toLowerCase() === 'shopee'
+      ? (order.escrowAmount ?? 0)
+      : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
+  }
+  if (!REVENUE_CATEGORIES.includes(order.orderCategory)) return 0;
+  if (order.calcNetRevenue > 0) return order.calcNetRevenue;
+
+  const gmv = r2(order.calcGmv ?? 0);
+  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  if (fee <= 0 && discount <= 0) return null;
+  const estimatedNet = r2(gmv - fee - discount);
+  return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
+}
+
+function calcLineProfit(order, taxRate, marketplace) {
+  if (isConfirmedPaidOrder(order, marketplace)) {
+    const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+    const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+    const net = r2((order.calcGmv ?? 0) - fee - discount);
+    const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
+    const repasse = hasEscrow ? r2(order.escrowAmount) : net;
+    const tax = r2((order.calcGmv ?? 0) * taxRate / 100);
+    const cost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
+    return r2(repasse - tax - cost);
+  }
+
+  const repasse = expectedRepasse(order, marketplace);
+  if (repasse === null || repasse === undefined) return null;
+  if (!REVENUE_CATEGORIES.includes(order.orderCategory)) return 0;
   const tax     = r2((order.calcGmv ?? 0) * taxRate / 100);
   const cost    = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
   return r2(repasse - tax - cost);
 }
 
 // Agrega pedidos por orderId — revenue e profit calculados do raw, sem snapshots
-function summarizeOrders(orders, taxRateByStore) {
+function summarizeOrders(orders, storeMetaById) {
   const byOrder = new Map();
   for (const order of orders) {
     if (!REVENUE_CATEGORIES.includes(order.orderCategory)) continue;
@@ -59,16 +95,19 @@ function summarizeOrders(orders, taxRateByStore) {
     const key = order.orderId || order.id;
     if (!key) continue;
 
-    const taxRate = taxRateByStore?.[order.storeId] ?? 0;
+    const storeMeta = storeMetaById?.[order.storeId] ?? {};
+    const taxRate = storeMeta.taxRate ?? 0;
+    const marketplace = storeMeta.marketplace;
 
     if (!byOrder.has(key)) byOrder.set(key, { revenue: 0, profit: 0 });
     const bucket = byOrder.get(key);
 
-    // Revenue: soma calcGmv por linha (alinha com Fechamento Mensal — não usa Math.max)
-    bucket.revenue += (order.calcGmv ?? 0);
+    // Mesmo GMV exibido no dashboard: pedido único, preferindo globalTotal quando existe.
+    bucket.revenue = Math.max(bucket.revenue, order.globalTotal ?? order.calcGmv ?? order.salePrice ?? 0);
 
-    // Profit: fórmula canônica — sem snapshot calcGrossProfit
-    bucket.profit += calcLineProfit(order, taxRate);
+    // Mesmo lucro do dashboard: repasse real quando existe; previsão só com base líquida confiável.
+    const profit = calcLineProfit(order, taxRate, marketplace);
+    if (profit !== null && profit !== undefined) bucket.profit += profit;
   }
   const values = [...byOrder.values()];
   return {
@@ -82,7 +121,9 @@ function summarizeOrders(orders, taxRateByStore) {
 const ORDER_SELECT = {
   id: true, orderId: true, storeId: true,
   orderStatus: true, orderCategory: true,
-  calcGmv: true,
+  status: true,
+  calcGmv: true, globalTotal: true, salePrice: true,
+  calcNetRevenue: true,
   platformCommission: true, platformServiceFee: true,
   sellerCoupon: true, lmmDiscount: true,
   escrowAmount: true,
@@ -121,12 +162,12 @@ async function getGoalWithProgress(req, res) {
     prisma.goal.findUnique({ where: { userId_month: { userId: req.userId, month } } }),
     prisma.store.findMany({
       where:  { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
-      select: { id: true, taxRate: true },
+      select: { id: true, taxRate: true, marketplace: true },
     }),
   ]);
 
   const storeIds      = stores.map((s) => s.id);
-  const taxRateByStore = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
+  const storeMetaById = Object.fromEntries(stores.map((s) => [s.id, { taxRate: s.taxRate ?? 0, marketplace: s.marketplace }]));
 
   const { year: y, month: mo } = parseYearMonth(month);
   const startDate = spToUtc(y, mo, 1);
@@ -146,7 +187,7 @@ async function getGoalWithProgress(req, res) {
     select: ORDER_SELECT,
   });
 
-  const actual = summarizeOrders(orders, taxRateByStore);
+  const actual = summarizeOrders(orders, storeMetaById);
 
   let projection = null;
   if (isCurrentMonth) {
@@ -195,10 +236,10 @@ async function getGoalsHistory(req, res) {
 
   const stores = await prisma.store.findMany({
     where:  { userId: req.userId, ...(storeId ? { id: storeId } : {}) },
-    select: { id: true, taxRate: true },
+    select: { id: true, taxRate: true, marketplace: true },
   });
   const storeIds       = stores.map((s) => s.id);
-  const taxRateByStore = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
+  const storeMetaById = Object.fromEntries(stores.map((s) => [s.id, { taxRate: s.taxRate ?? 0, marketplace: s.marketplace }]));
 
   const oldest = goals[goals.length - 1].month;
   const [oy, om] = oldest.split('-').map(Number);
@@ -223,7 +264,7 @@ async function getGoalsHistory(req, res) {
   }
 
   const history = goals.map((goal) => {
-    const a = summarizeOrders(ordersByMonth[goal.month] ?? [], taxRateByStore);
+    const a = summarizeOrders(ordersByMonth[goal.month] ?? [], storeMetaById);
     return {
       month:  goal.month,
       goal:   { revenue: goal.revenue, profit: goal.profit, orders: goal.orders },
