@@ -201,6 +201,7 @@ function expectedRepasse(order, marketplace) {
   const gmv = r2(order.calcGmv ?? 0);
   const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
   const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  if (fee <= 0 && discount <= 0) return null;
   const estimatedNet = r2(gmv - fee - discount);
   return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
 }
@@ -1225,7 +1226,7 @@ async function getStoresComparison(req, res) {
     let y = now.getUTCFullYear(), m = now.getUTCMonth();
     if (now.getUTCDate() < 5) { m -= 1; if (m < 0) { m = 11; y -= 1; } }
     const periodKey = `${y}-${String(m + 1).padStart(2, '0')}`;
-    return res.json({ period: { month: periodKey, start: null, end: null }, stores: [], crossStoreProducts: [] });
+    return res.json({ period: { month: periodKey, start: null, end: null }, stores: [] });
   }
 
   const requestedRange = buildDateRange(startDate, endDate);
@@ -1274,6 +1275,7 @@ async function getStoresComparison(req, res) {
       sellerCoupon:       true,
       lmmDiscount:        true,
       escrowAmount:       true,
+      calcNetRevenue:     true,
       calcProductCost:    true,
       calcPackaging:      true,
       productId:          true,
@@ -1299,9 +1301,6 @@ async function getStoresComparison(req, res) {
 
   // Map para topProduct por loja: storeId → real/estimated → { productId → { name, profit, netRevenue } }
   const productByStore = {};
-
-  // Map para crossStoreProducts: normalizedName → { name (original), storeId → { profit, gmv, orderIds } }
-  const crossMap = {};
 
   for (const o of orders) {
     const storeMeta = storeMetaMap.get(o.storeId);
@@ -1332,19 +1331,6 @@ async function getStoresComparison(req, res) {
       pm[o.productId].netRevenue += orderRepasse;
     }
 
-    // Acumular para crossStoreProducts
-    if (o.productId && o.product?.name) {
-      const normName = o.product.name.toLowerCase().trim();
-      if (!crossMap[normName]) {
-        crossMap[normName] = { name: o.product.name, stores: {} };
-      }
-      if (!crossMap[normName].stores[o.storeId]) {
-        crossMap[normName].stores[o.storeId] = { profit: 0, gmv: 0, orderIds: new Set() };
-      }
-      crossMap[normName].stores[o.storeId].profit += orderProfit;
-      crossMap[normName].stores[o.storeId].gmv    += orderGmv;
-      if (orderKey) crossMap[normName].stores[o.storeId].orderIds.add(orderKey);
-    }
   }
 
   // Montar array de lojas com topProduct
@@ -1390,43 +1376,6 @@ async function getStoresComparison(req, res) {
     };
   }).sort((a, b) => b.profit - a.profit);
 
-  // Montar crossStoreProducts: apenas produtos em >= 2 lojas distintas
-  const crossStoreProducts = [];
-  for (const [normName, data] of Object.entries(crossMap)) {
-    const storeEntries = Object.entries(data.stores); // [storeId, { profit, gmv, orderIds }]
-    if (storeEntries.length < 2) continue;
-
-    const channels = storeEntries.map(([sid, vals]) => {
-      const meta   = storeMetaMap.get(sid);
-      const margin = vals.gmv > 0 ? r2(vals.profit / vals.gmv * 100) : 0;
-      return {
-        storeId:    sid,
-        storeName:  meta?.name ?? sid,
-        marketplace: meta?.marketplace ?? 'outros',
-        margin,
-        profit:  r2(vals.profit),
-        orders:  vals.orderIds.size,
-      };
-    });
-
-    const bestChannel = channels.reduce((a, b) => (b.margin > a.margin ? b : a));
-    const totalProfit = channels.reduce((s, c) => s + c.profit, 0);
-
-    crossStoreProducts.push({
-      name: data.name,
-      channels,
-      bestChannel: {
-        marketplace: bestChannel.marketplace,
-        storeName:   bestChannel.storeName,
-        margin:      bestChannel.margin,
-      },
-      _totalProfit: totalProfit, // campo auxiliar para ordenação, removido abaixo
-    });
-  }
-
-  crossStoreProducts.sort((a, b) => b._totalProfit - a._totalProfit);
-  const crossTop8 = crossStoreProducts.slice(0, 8).map(({ _totalProfit, ...rest }) => rest);
-
   return res.json({
     period: {
       month: periodKey,
@@ -1436,8 +1385,7 @@ async function getStoresComparison(req, res) {
       endDate:   periodRange.endDate,
       timezone:  periodRange.timezone,
     },
-    stores:              storesResult,
-    crossStoreProducts:  crossTop8,
+    stores: storesResult,
   });
 }
 
