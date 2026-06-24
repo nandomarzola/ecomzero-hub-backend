@@ -199,11 +199,12 @@ function expectedRepasse(order, marketplace) {
   return order.calcNetRevenue > 0 ? order.calcNetRevenue : null;
 }
 
-function expectedProfit(order, marketplace) {
+function expectedProfit(order, marketplace, taxRate = 0) {
   if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
   const repasse = expectedRepasse(order, marketplace);
   if (repasse === null || repasse === undefined) return null;
-  return repasse - (order.calcProductCost ?? 0) - (order.calcTax ?? 0);
+  const tax = r2((order.calcGmv ?? 0) * taxRate / 100);
+  return r2(repasse - tax - (order.calcProductCost ?? 0) - (order.calcPackaging ?? 0));
 }
 
 // GET /api/dashboard/summary
@@ -399,7 +400,7 @@ async function getSummary(req, res) {
   const estimatedProfitOrders = countUniqueOrders(estimatedOrdersReliable);
   const estimatedProfitOrdersUnreliable = Math.max(0, awaitingRepasseOrders - estimatedProfitOrders);
   const estimatedRepasse = estimatedOrdersReliable.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
-  const estimatedProfit = estimatedOrdersReliable.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId]), 0);
+  const estimatedProfit = estimatedOrdersReliable.reduce((s, o) => s + expectedProfit(o, marketplaceByStore[o.storeId], taxRateByStore[o.storeId]), 0);
   const projectedProfit = totalProfit + estimatedProfit;
   const estimatedReliableIds = new Set(estimatedOrdersReliable.map((o) => o.id));
   const projectedGmv = orders
@@ -1268,13 +1269,21 @@ async function getStoresComparison(req, res) {
     },
   });
 
+  const makeFinancialBucket = () => ({ gmv: 0, netRevenue: 0, profit: 0, orderIds: new Set() });
+  const addToBucket = (bucket, orderGmv, orderRepasse, orderProfit, orderKey) => {
+    bucket.gmv += orderGmv;
+    bucket.netRevenue += orderRepasse;
+    bucket.profit += orderProfit;
+    if (orderKey) bucket.orderIds.add(orderKey);
+  };
+
   // Acumuladores por loja
-  const storeAcc = {}; // storeId → { gmv, netRevenue, profit, orderIds }
+  const storeAcc = {}; // storeId → { real, estimated }
   for (const s of stores) {
-    storeAcc[s.id] = { gmv: 0, netRevenue: 0, profit: 0, orderIds: new Set() };
+    storeAcc[s.id] = { real: makeFinancialBucket(), estimated: makeFinancialBucket() };
   }
 
-  // Map para topProduct por loja: storeId → { productId → { name, profit, netRevenue } }
+  // Map para topProduct por loja: storeId → real/estimated → { productId → { name, profit, netRevenue } }
   const productByStore = {};
 
   // Map para crossStoreProducts: normalizedName → { name (original), storeId → { profit, gmv, orderIds } }
@@ -1283,25 +1292,25 @@ async function getStoresComparison(req, res) {
   for (const o of orders) {
     const storeMeta = storeMetaMap.get(o.storeId);
     const marketplace = storeMeta?.marketplace;
-    if (!isConfirmedPaidOrder(o, marketplace)) continue;
-
     const aliquota     = storeTaxRateMap.get(o.storeId) ?? 0;
+    const isReal       = isConfirmedPaidOrder(o, marketplace);
     const orderGmv     = r2(o.calcGmv ?? 0);
     const orderRepasse = r2(expectedRepasse(o, marketplace) ?? 0);
-    const orderProfit  = confirmedProfit(o, marketplace, aliquota);
+    const orderProfit  = isReal
+      ? confirmedProfit(o, marketplace, aliquota)
+      : expectedProfit(o, marketplace, aliquota);
     const orderKey     = getOrderUniqueKey(o);
+    if (orderProfit === null || orderProfit === undefined) continue;
+    const bucketKey = isReal ? 'real' : 'estimated';
 
     // Acumular por loja
     const acc = storeAcc[o.storeId];
-    acc.gmv        += orderGmv;
-    acc.netRevenue += orderRepasse;
-    acc.profit     += orderProfit;
-    if (orderKey) acc.orderIds.add(orderKey);
+    addToBucket(acc[bucketKey], orderGmv, orderRepasse, orderProfit, orderKey);
 
     // Acumular por produto na loja (topProduct)
     if (o.productId) {
-      if (!productByStore[o.storeId]) productByStore[o.storeId] = {};
-      const pm = productByStore[o.storeId];
+      if (!productByStore[o.storeId]) productByStore[o.storeId] = { real: {}, estimated: {} };
+      const pm = productByStore[o.storeId][bucketKey];
       if (!pm[o.productId]) {
         pm[o.productId] = { name: o.product?.name ?? '', profit: 0, netRevenue: 0 };
       }
@@ -1327,16 +1336,18 @@ async function getStoresComparison(req, res) {
   // Montar array de lojas com topProduct
   const storesResult = stores.map((s) => {
     const acc    = storeAcc[s.id];
-    const gmv    = r2(acc.gmv);
-    const net    = r2(acc.netRevenue);
-    const profit = r2(acc.profit);
+    const hasRealProfit = acc.real.orderIds.size > 0;
+    const shown = hasRealProfit ? acc.real : acc.estimated;
+    const gmv    = r2(shown.gmv);
+    const net    = r2(shown.netRevenue);
+    const profit = r2(shown.profit);
     const margin = gmv > 0 ? r2(profit / gmv * 100) : 0;
-    const orders = acc.orderIds.size;
+    const orders = shown.orderIds.size;
     const avgTicket = orders > 0 ? r2(gmv / orders) : 0;
 
     // topProduct da loja: produto com maior profit acumulado
     let topProduct = null;
-    const pm = productByStore[s.id];
+    const pm = productByStore[s.id]?.[hasRealProfit ? 'real' : 'estimated'];
     if (pm) {
       const best = Object.values(pm).reduce((a, b) => (b.profit > a.profit ? b : a), { profit: -Infinity, name: '', netRevenue: 0 });
       if (best.name) {
@@ -1354,6 +1365,11 @@ async function getStoresComparison(req, res) {
       margin,
       orders,
       avgTicket,
+      profitKind: hasRealProfit ? 'real' : 'estimated',
+      realProfit: r2(acc.real.profit),
+      realOrders: acc.real.orderIds.size,
+      estimatedProfit: r2(acc.estimated.profit),
+      estimatedOrders: acc.estimated.orderIds.size,
       topProduct,
     };
   }).sort((a, b) => b.profit - a.profit);
