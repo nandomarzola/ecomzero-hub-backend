@@ -1,6 +1,7 @@
 const prisma      = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 const { r2, parseYearMonth } = require('../lib/utils');
+const { recalculateOrdersForStore } = require('../services/recalculateService');
 
 // São Paulo é UTC-3 fixo (sem horário de verão desde 2019)
 function spToUtc(year, month, day, h = 0, min = 0, sec = 0, ms = 0) {
@@ -1326,6 +1327,7 @@ async function closeMonth(req, res) {
     const closedAt = new Date();
     const results = [];
     for (const sid of storeIds) {
+      await recalculateOrdersForStore(sid, month, { dateBasis: 'paidOrSold' });
       const d = await buildClosingData([sid], month);
       const closing = await prisma.monthlyClosing.upsert({
         where: { storeId_periodMonth: { storeId: sid, periodMonth: month } },

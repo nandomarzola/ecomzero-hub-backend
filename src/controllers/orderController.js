@@ -1,6 +1,6 @@
 const fs    = require('fs');
 const prisma = require('../lib/prisma');
-const { recalculateQueue, recalcProgress } = require('../services/recalculateQueue');
+const { recalcProgress } = require('../services/recalculateQueue');
 const { recalculateOrdersForStore }       = require('../services/recalculateService');
 const { importShopeeOrderAll } = require('../services/importOrderAll');
 const { importSheinOrderAll }  = require('../services/importSheinService');
@@ -403,17 +403,6 @@ async function recalculateOrders(req, res) {
   const all    = body.all ?? false;
   const storeId = body.storeId ?? null;
   const dateBasis = body.dateBasis ?? null;
-
-  if (body.async) {
-    const job = await recalculateQueue.add('recalculate', {
-      userId: req.userId,
-      all,
-      months,
-      storeId,
-      dateBasis,
-    });
-    return res.status(202).json({ jobId: job.id });
-  }
 
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
