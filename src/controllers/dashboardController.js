@@ -196,7 +196,13 @@ function expectedRepasse(order, marketplace) {
       : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
   }
   if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
-  return order.calcNetRevenue > 0 ? order.calcNetRevenue : null;
+  if (order.calcNetRevenue > 0) return order.calcNetRevenue;
+
+  const gmv = r2(order.calcGmv ?? 0);
+  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
+  const estimatedNet = r2(gmv - fee - discount);
+  return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
 }
 
 function expectedProfit(order, marketplace, taxRate = 0) {
@@ -1240,14 +1246,22 @@ async function getStoresComparison(req, res) {
   const storeTaxRateMap  = new Map(stores.map((s) => [s.id, s.taxRate ?? 0]));
   const storeMetaMap     = new Map(stores.map((s) => [s.id, s]));
 
-  // Mesmo recorte financeiro do dashboard principal: período por pagamento/repasse.
+  const comparisonPeriodWhere = {
+    OR: [
+      ...(orderPeriodWhere(periodRange).OR ?? []),
+      paidPeriodWhere(periodRange),
+    ],
+  };
+
+  // Real entra por pagamento/repasse; previsão entra pela data do pedido.
   const orders = await prisma.order.findMany({
     where: {
       storeId: { in: storeIds },
-      ...paidPeriodWhere(periodRange),
+      ...comparisonPeriodWhere,
       orderCategory: { in: REVENUE_ORDER_CATEGORIES },
     },
     select: {
+      id:                 true,
       storeId:            true,
       orderId:            true,
       orderCategory:      true,
@@ -1337,7 +1351,9 @@ async function getStoresComparison(req, res) {
   const storesResult = stores.map((s) => {
     const acc    = storeAcc[s.id];
     const hasRealProfit = acc.real.orderIds.size > 0;
-    const shown = hasRealProfit ? acc.real : acc.estimated;
+    const hasEstimatedProfit = acc.estimated.orderIds.size > 0;
+    const profitKind = hasRealProfit ? 'real' : hasEstimatedProfit ? 'estimated' : 'empty';
+    const shown = hasRealProfit ? acc.real : hasEstimatedProfit ? acc.estimated : makeFinancialBucket();
     const gmv    = r2(shown.gmv);
     const net    = r2(shown.netRevenue);
     const profit = r2(shown.profit);
@@ -1347,7 +1363,7 @@ async function getStoresComparison(req, res) {
 
     // topProduct da loja: produto com maior profit acumulado
     let topProduct = null;
-    const pm = productByStore[s.id]?.[hasRealProfit ? 'real' : 'estimated'];
+    const pm = productByStore[s.id]?.[profitKind === 'real' ? 'real' : 'estimated'];
     if (pm) {
       const best = Object.values(pm).reduce((a, b) => (b.profit > a.profit ? b : a), { profit: -Infinity, name: '', netRevenue: 0 });
       if (best.name) {
@@ -1365,7 +1381,7 @@ async function getStoresComparison(req, res) {
       margin,
       orders,
       avgTicket,
-      profitKind: hasRealProfit ? 'real' : 'estimated',
+      profitKind,
       realProfit: r2(acc.real.profit),
       realOrders: acc.real.orderIds.size,
       estimatedProfit: r2(acc.estimated.profit),
