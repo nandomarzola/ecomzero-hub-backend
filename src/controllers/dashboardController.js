@@ -460,10 +460,16 @@ async function getSummary(req, res) {
     const prevPaidCount  = prevUpsellerValid.orders;
     const prevRevenue    = prevUpsellerValid.value;
     const prevProfit     = prevRevenueOrders.reduce((s, o) => s + orderProfit(o), 0);
+    const prevEstimatedOrders = prevRevenueOrders.filter((o) => !isConfirmedPaidOrder(o, marketplaceByStore[o.storeId]));
+    const prevEstimatedProfit = prevEstimatedOrders.reduce((s, o) => s + (expectedProfit(o, marketplaceByStore[o.storeId], taxRateByStore[o.storeId]) ?? 0), 0);
+    const prevProjectedProfit = prevProfit + prevEstimatedProfit;
     const prevClientsCount = prevClients.size;
     prevKPIs = {
       totalRevenue:  parseFloat(prevRevenue.toFixed(2)),
       totalProfit:   parseFloat(prevProfit.toFixed(2)),
+      confirmedProfit: parseFloat(prevProfit.toFixed(2)),
+      estimatedProfit: parseFloat(prevEstimatedProfit.toFixed(2)),
+      projectedProfit: parseFloat(prevProjectedProfit.toFixed(2)),
       avgMargin:     prevProfitRevenueBase > 0 ? parseFloat(((prevProfit / prevProfitRevenueBase) * 100).toFixed(2)) : 0,
       totalOrders:   prevPaidCount,
       paidOrders:    prevPaidCount,
