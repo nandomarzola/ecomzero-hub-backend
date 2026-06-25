@@ -288,11 +288,18 @@ function calcLine(order, storeTaxRateMap) {
   const orderFee  = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
   const orderDisc = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
   const orderNet  = r2((order.calcGmv ?? 0) - orderFee - orderDisc);
-  const repasse   = hasRealRepasse(order) ? r2(order.escrowAmount) : orderNet;
+  let repasse = null;
+  if (hasRealRepasse(order)) {
+    repasse = r2(order.escrowAmount);
+  } else if ((order.calcNetRevenue ?? 0) > 0) {
+    repasse = r2(order.calcNetRevenue);
+  } else if (orderFee > 0 || orderDisc > 0) {
+    repasse = orderNet > 0 ? orderNet : null;
+  }
   const taxRate   = storeTaxRateMap.get(order.storeId) ?? 0;
   const tax       = r2((order.calcGmv ?? 0) * taxRate / 100);
   const cost      = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-  const profit    = r2(repasse - tax - cost);
+  const profit    = repasse === null || repasse === undefined ? null : r2(repasse - tax - cost);
   return { orderFee, orderDisc, orderNet, repasse, tax, cost, profit };
 }
 
@@ -323,11 +330,11 @@ function summarizeLines(rows, storeTaxRateMap) {
     const line = calcLine(row, storeTaxRateMap);
     totals.units += row.quantity ?? 0;
     totals.gmv += row.calcGmv ?? 0;
-    totals.repasse += line.repasse;
+    totals.repasse += line.repasse ?? 0;
     totals.marketplaceFee += line.orderFee;
     totals.tax += line.tax;
     totals.cost += line.cost;
-    totals.profit += line.profit;
+    totals.profit += line.profit ?? 0;
   }
 
   totals.orders = orderIds.size;
@@ -851,6 +858,8 @@ async function buildClosingData(storeIds, month) {
   let confirmedLineCount = 0, pendingLineCount = 0, cancelledLineCount = 0, returnedLineCount = 0;
   const confirmedOrderIds = new Set();
   const pendingOrderIds = new Set();
+  const estimatedReliableOrderIds = new Set();
+  const estimatedUnreliableOrderIds = new Set();
   const cancelledOrderIds = new Set();
   const returnedOrderIds = new Set();
   const revenueOrderIds = new Set();
@@ -884,6 +893,7 @@ async function buildClosingData(storeIds, month) {
     const isCancelled = !hasConfirmedRepasse && o.orderCategory.startsWith('cancelled');
     const isReturned = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
     const { orderFee, orderDisc, repasse: orderRepasse, tax: orderTax, profit: orderProfit } = calcLine(o, storeTaxRateMap);
+    const hasReliableEstimate = orderRepasse !== null && orderRepasse !== undefined && orderProfit !== null && orderProfit !== undefined;
 
     if (hasConfirmedRepasse) {
       confirmedLineCount++;
@@ -916,11 +926,13 @@ async function buildClosingData(storeIds, month) {
       });
     }
     if (isPending || (FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory) && !hasConfirmedRepasse && !hasRealRepasse(o))) {
+      if (hasReliableEstimate) addUniqueOrder(estimatedReliableOrderIds, o);
+      else addUniqueOrder(estimatedUnreliableOrderIds, o);
       pendingOrdersList.push({
         id: o.id, orderId: o.orderId, soldAt: o.soldAt, orderPaidAt: o.orderPaidAt,
         productName: o.productName, variationName: o.variationName,
         calcGmv: r2(o.calcGmv), estimatedRepasse: orderRepasse,
-        reason: isPending ? undefined : 'Aguardando repasse Shopee',
+        reason: hasReliableEstimate ? (isPending ? undefined : 'Aguardando repasse Shopee') : 'Sem base de repasse confiável',
       });
     }
 
@@ -938,11 +950,13 @@ async function buildClosingData(storeIds, month) {
       repasseConfirmado += orderRepasse;
     } else if (isEstimatedRevenue) {
       gmvPending += o.calcGmv;
-      repasseEstimado += orderRepasse;
-      estimatedTaxAmount += orderTax;
-      estimatedProductCost += o.calcProductCost;
-      estimatedPackagingCost += o.calcPackaging;
-      estimatedGrossProfit += orderProfit;
+      if (hasReliableEstimate) {
+        repasseEstimado += orderRepasse;
+        estimatedTaxAmount += orderTax;
+        estimatedProductCost += o.calcProductCost;
+        estimatedPackagingCost += o.calcPackaging;
+        estimatedGrossProfit += orderProfit;
+      }
     }
     if (isCancelled) cancelledGmv += o.calcGmv;
     if (isReturned) {
@@ -999,10 +1013,12 @@ async function buildClosingData(storeIds, month) {
       g.pendingOrderCount = g.pendingOrderIds.size;
       g.pendingQty += o.quantity;
       g.gmvEstimado += o.calcGmv;
-      g.estimatedProfit += orderProfit;
-      g.impostoEstimado += orderTax;
-      g.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
-      g.repasseEstimado += orderRepasse;
+      if (hasReliableEstimate) {
+        g.estimatedProfit += orderProfit;
+        g.impostoEstimado += orderTax;
+        g.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+        g.repasseEstimado += orderRepasse;
+      }
     }
     if (!hasCurrentCost(o)) g.hasCost = false;
     if (isEstimatedRevenue) g.hasPending = true;
@@ -1053,10 +1069,12 @@ async function buildClosingData(storeIds, month) {
         v.pendingOrderCount = v.pendingOrderIds.size;
         v.pendingQty += o.quantity;
         v.gmvEstimado += o.calcGmv;
-        v.estimatedProfit += orderProfit;
-        v.impostoEstimado += orderTax;
-        v.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
-        v.repasseEstimado += orderRepasse;
+        if (hasReliableEstimate) {
+          v.estimatedProfit += orderProfit;
+          v.impostoEstimado += orderTax;
+          v.custoEstimado += (o.calcProductCost ?? 0) + (o.calcPackaging ?? 0);
+          v.repasseEstimado += orderRepasse;
+        }
       }
       if (!hasCurrentCost(o)) v.hasCost = false;
       if (isEstimatedRevenue) v.hasPending = true;
@@ -1085,7 +1103,7 @@ async function buildClosingData(storeIds, month) {
   const impostoTotal = r2(taxAmount);
   const custoTotal = r2(productCost + packagingCost);
   const resultadoLiquido = r2(grossProfit);
-  const margem = revenueGmvTotal > 0 ? r2((resultadoLiquido / revenueGmvTotal) * 100) : 0;
+  const margem = confirmedSalesTotal > 0 ? r2((resultadoLiquido / confirmedSalesTotal) * 100) : 0;
   const resultadoEstimado = r2(estimatedGrossProfit);
   const impostoEstimadoTotal = r2(estimatedTaxAmount);
   const custoEstimadoTotal = r2(estimatedProductCost + estimatedPackagingCost);
@@ -1212,6 +1230,8 @@ async function buildClosingData(storeIds, month) {
     pendentes: {
       count: pendingOrderIds.size,
       lineCount: pendingLineCount,
+      reliableCount: estimatedReliableOrderIds.size,
+      unreliableCount: estimatedUnreliableOrderIds.size,
       gmv: r2(gmvPending),
       estimatedRepasse: r2(repasseEstimado),
       estimatedProfit: resultadoEstimado,

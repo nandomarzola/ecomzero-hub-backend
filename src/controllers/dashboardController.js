@@ -397,6 +397,14 @@ async function getSummary(req, res) {
   const avgMargin     = profitRevenueBase > 0 ? (totalProfit / profitRevenueBase) * 100 : 0;
   const confirmedRepasse = confirmedOrders.reduce((s, o) => s + expectedRepasse(o, marketplaceByStore[o.storeId]), 0);
   const confirmedRepasseOrders = countUniqueOrders(confirmedOrders);
+
+  // Separar repasse real (Shopee escrow) de estimado (ML usa calcNetRevenue como proxy)
+  const shopeeConfirmed = confirmedOrders.filter((o) => (marketplaceByStore[o.storeId] ?? '').toLowerCase() === 'shopee');
+  const mlConfirmed     = confirmedOrders.filter((o) => (marketplaceByStore[o.storeId] ?? '').toLowerCase() === 'mercadolivre');
+  const shopeeEscrowRepasse  = shopeeConfirmed.reduce((s, o) => s + (o.escrowAmount ?? 0), 0);
+  const shopeeEscrowOrders   = countUniqueOrders(shopeeConfirmed);
+  const mlEstimatedRepasse   = mlConfirmed.reduce((s, o) => s + (expectedRepasse(o, 'mercadolivre') ?? 0), 0);
+  const mlEstimatedOrders    = countUniqueOrders(mlConfirmed);
   const estimatedOrders = orders.filter((o) => (
     REVENUE_ORDER_CATEGORIES.includes(o.orderCategory)
     && !isConfirmedPaidOrder(o, marketplaceByStore[o.storeId])
@@ -707,6 +715,11 @@ async function getSummary(req, res) {
     confirmedNetRevenue: parseFloat(confirmedRepasse.toFixed(2)),
     confirmedProfit: parseFloat(totalProfit.toFixed(2)),
     confirmedRepasseOrders,
+    // Breakdown: escrow real (Shopee) vs estimado (ML usa calcNetRevenue como proxy)
+    shopeeEscrowRepasse:  parseFloat(shopeeEscrowRepasse.toFixed(2)),
+    shopeeEscrowOrders,
+    mlEstimatedRepasse:   parseFloat(mlEstimatedRepasse.toFixed(2)),
+    mlEstimatedOrders,
     estimatedRepasse: parseFloat(estimatedRepasse.toFixed(2)),
     estimatedNetRevenue: parseFloat(estimatedRepasse.toFixed(2)),
     projectedRepasse: parseFloat((confirmedRepasse + estimatedRepasse).toFixed(2)),
