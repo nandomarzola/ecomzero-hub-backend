@@ -604,11 +604,12 @@ async function getSummary(req, res) {
   })).sort((a, b) => b.profit - a.profit);
 
   // ── Heatmap diário (total + por loja) ─────────────────────────────────────
-  const dailyMap      = {};
-  const dailyByStore  = {}; // storeId → { date → { revenue, orders } }
-  const dailyOrderIds = {};
+  const dailyMap           = {};
+  const dailyByStore       = {}; // storeId → { date → { revenue, orders, cancelled } }
+  const dailyOrderIds      = {};
   const dailyStoreOrderIds = {};
-  const storeNameMap  = Object.fromEntries(stores.map((s) => [s.id, { name: s.name, marketplace: s.marketplace }]));
+  const dailyCancelledIds  = {}; // date → Set de orderIds cancelados
+  const storeNameMap       = Object.fromEntries(stores.map((s) => [s.id, { name: s.name, marketplace: s.marketplace }]));
 
   for (const o of orders) {
     if (!isUpsellerValidOrder(o)) continue;
@@ -617,7 +618,7 @@ async function getSummary(req, res) {
     const day = formatSaoPauloDay(sourceDate);
     const orderKey = getOrderUniqueKey(o);
     // Total
-    if (!dailyMap[day]) dailyMap[day] = { date: day, revenue: 0, orders: 0 };
+    if (!dailyMap[day]) dailyMap[day] = { date: day, revenue: 0, orders: 0, cancelled: 0 };
     if (!dailyOrderIds[day]) dailyOrderIds[day] = new Set();
     if (!dailyOrderIds[day].has(orderKey)) {
       dailyMap[day].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
@@ -626,13 +627,30 @@ async function getSummary(req, res) {
     }
     // Por loja
     if (!dailyByStore[o.storeId]) dailyByStore[o.storeId] = {};
-    if (!dailyByStore[o.storeId][day]) dailyByStore[o.storeId][day] = { date: day, revenue: 0, orders: 0 };
+    if (!dailyByStore[o.storeId][day]) dailyByStore[o.storeId][day] = { date: day, revenue: 0, orders: 0, cancelled: 0 };
     if (!dailyStoreOrderIds[o.storeId]) dailyStoreOrderIds[o.storeId] = {};
     if (!dailyStoreOrderIds[o.storeId][day]) dailyStoreOrderIds[o.storeId][day] = new Set();
     if (!dailyStoreOrderIds[o.storeId][day].has(orderKey)) {
       dailyByStore[o.storeId][day].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
       dailyStoreOrderIds[o.storeId][day].add(orderKey);
       dailyByStore[o.storeId][day].orders = dailyStoreOrderIds[o.storeId][day].size;
+    }
+  }
+
+  // Cancelados por dia — vem de allPeriodRaw (todos os pedidos do período)
+  for (const o of allPeriodRaw) {
+    const rawStatus = String(o.orderStatus ?? '').toUpperCase();
+    const isCancelled = o.orderCategory?.startsWith('cancelled') || rawStatus === 'CANCELLED';
+    if (!isCancelled) continue;
+    const sourceDate = o.orderCreatedAt ?? o.soldAt;
+    if (!sourceDate) continue;
+    const day = formatSaoPauloDay(sourceDate);
+    const orderKey = getOrderUniqueKey(o);
+    if (!dailyCancelledIds[day]) dailyCancelledIds[day] = new Set();
+    if (!dailyCancelledIds[day].has(orderKey)) {
+      dailyCancelledIds[day].add(orderKey);
+      if (!dailyMap[day]) dailyMap[day] = { date: day, revenue: 0, orders: 0, cancelled: 0 };
+      dailyMap[day].cancelled = dailyCancelledIds[day].size;
     }
   }
 
@@ -945,41 +963,61 @@ async function getMonthlyComparison(req, res) {
 
   const storeWhere = { userId: req.userId };
   if (storeId) storeWhere.id = storeId;
-  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+  const stores = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true, taxRate: true } });
   const storeIds = stores.map((s) => s.id);
   if (!storeIds.length) return res.json({ months: [] });
+
+  const marketplaceByStore = Object.fromEntries(stores.map((s) => [s.id, s.marketplace]));
+  const taxRateByStore     = Object.fromEntries(stores.map((s) => [s.id, s.taxRate ?? 0]));
 
   const now   = new Date();
   const start = new Date(now.getFullYear(), now.getMonth() - 5, 1);
   start.setUTCHours(0, 0, 0, 0);
 
+  // Mesmos critérios do getSummary: orderCategory válido + filtro por orderPaidAt
   const orders = await prisma.order.findMany({
-    where:  { storeId: { in: storeIds }, status: 'paid', soldAt: { gte: start } },
-    select: { salePrice: true, profit: true, margin: true, soldAt: true },
+    where: {
+      storeId:       { in: storeIds },
+      orderCategory: { in: REVENUE_ORDER_CATEGORIES },
+      orderPaidAt:   { gte: start },
+    },
+    select: {
+      storeId: true, orderCategory: true, orderStatus: true, orderPaidAt: true,
+      calcGmv: true, globalTotal: true, salePrice: true,
+      escrowAmount: true, calcNetRevenue: true, calcProductCost: true, calcPackaging: true,
+      platformCommission: true, platformServiceFee: true, sellerCoupon: true, lmmDiscount: true,
+    },
   });
 
   const monthMap = {};
   for (const o of orders) {
-    const key = o.soldAt.toISOString().substring(0, 7);
-    if (!monthMap[key]) monthMap[key] = { revenue: 0, profit: 0, marginSum: 0, orders: 0 };
-    monthMap[key].revenue   += o.salePrice;
-    monthMap[key].profit    += o.profit   ?? 0;
-    monthMap[key].marginSum += o.margin   ?? 0;
-    monthMap[key].orders++;
+    if (!o.orderPaidAt) continue;
+    const key = o.orderPaidAt.toISOString().substring(0, 7);
+    if (!monthMap[key]) monthMap[key] = { revenue: 0, profit: 0, gmvSum: 0, orders: 0 };
+
+    const marketplace = marketplaceByStore[o.storeId];
+    const taxRate     = taxRateByStore[o.storeId];
+
+    if (isUpsellerValidOrder(o)) {
+      monthMap[key].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
+      monthMap[key].orders++;
+    }
+    monthMap[key].profit  += confirmedProfit(o, marketplace, taxRate);
+    monthMap[key].gmvSum  += (o.calcGmv ?? o.salePrice ?? 0);
   }
 
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const d   = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    const m   = monthMap[key] ?? { revenue: 0, profit: 0, marginSum: 0, orders: 0 };
+    const m   = monthMap[key] ?? { revenue: 0, profit: 0, gmvSum: 0, orders: 0 };
     months.push({ key, ...m });
   }
 
   const result = months.map((m, i) => {
     const prev      = i > 0 ? months[i - 1] : null;
-    const margin    = m.orders > 0 ? m.marginSum / m.orders : 0;
-    const avgTicket = m.orders > 0 ? m.revenue   / m.orders : 0;
+    const margin    = m.gmvSum > 0 ? (m.profit / m.gmvSum) * 100 : 0;
+    const avgTicket = m.orders > 0 ? m.revenue / m.orders : 0;
     return {
       month:     m.key,
       revenue:   parseFloat(m.revenue.toFixed(2)),
