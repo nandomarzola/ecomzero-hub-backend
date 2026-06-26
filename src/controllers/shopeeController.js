@@ -486,6 +486,39 @@ async function syncOrders(req, res) {
       await recalculateOrdersForStore(storeId, periodMonth).catch(() => {});
     }
 
+    // 7b. Atualizar escrow de pedidos válidos sem repasse confirmado
+    // Pedidos criados em meses anteriores que ficaram COMPLETED depois do último sync
+    // não entram no fetchOrderList do período atual — o escrowAmount fica null.
+    // Aqui buscamos o repasse desses pedidos independente do período.
+    if (mode !== 'quick') {
+      const withoutEscrow = await prisma.order.findMany({
+        where: { storeId, orderCategory: 'valid', escrowAmount: null },
+        select: { orderId: true },
+      });
+      const staleSns = [...new Set(withoutEscrow.map(o => o.orderId))];
+      if (staleSns.length > 0) {
+        importProgress.set(imp.id, { pct: 96, message: `Buscando repasse de ${staleSns.length} pedido(s) antigo(s)...` });
+        const staleEscrowMap = await fetchEscrowDetails(accessToken, store.spShopId, staleSns,
+          (done, total) => importProgress.set(imp.id, { pct: 96 + Math.round((done / Math.max(total, 1)) * 3), message: `Atualizando repasses (${done}/${total})...` })
+        );
+        let escrowUpdated = 0;
+        for (const [orderSn, escrow] of Object.entries(staleEscrowMap)) {
+          if (escrow.escrow_amount == null) continue;
+          await prisma.order.updateMany({
+            where: { storeId, orderId: orderSn, escrowAmount: null },
+            data: {
+              escrowAmount:       r2(escrow.escrow_amount),
+              platformCommission: r2(escrow.commission_fee ?? 0),
+              platformServiceFee: r2((escrow.service_fee ?? 0) + (escrow.seller_transaction_fee ?? 0)),
+              sellerCoupon:       r2(escrow.voucher_from_seller ?? 0),
+            },
+          });
+          escrowUpdated++;
+        }
+        console.log(`[Shopee] ${escrowUpdated}/${staleSns.length} repasse(s) atualizado(s) de pedidos anteriores`);
+      }
+    }
+
     // 7. Totais
     const valid     = ordersData.filter(o => o.orderCategory === 'valid').length;
     const pending   = ordersData.filter(o => o.orderCategory === 'pending').length;
