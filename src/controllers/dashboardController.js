@@ -999,7 +999,7 @@ async function getMonthlyComparison(req, res) {
   for (const o of orders) {
     if (!o.orderPaidAt) continue;
     const key = o.orderPaidAt.toISOString().substring(0, 7);
-    if (!monthMap[key]) monthMap[key] = { revenue: 0, profit: 0, gmvSum: 0, orders: 0 };
+    if (!monthMap[key]) monthMap[key] = { revenue: 0, profit: 0, estimatedProfit: 0, gmvSum: 0, orders: 0 };
 
     const marketplace = marketplaceByStore[o.storeId];
     const taxRate     = taxRateByStore[o.storeId];
@@ -1008,34 +1008,43 @@ async function getMonthlyComparison(req, res) {
       monthMap[key].revenue += (o.globalTotal ?? o.calcGmv ?? o.salePrice ?? 0);
       monthMap[key].orders++;
     }
-    monthMap[key].profit  += confirmedProfit(o, marketplace, taxRate);
-    monthMap[key].gmvSum  += (o.calcGmv ?? o.salePrice ?? 0);
+    monthMap[key].profit += confirmedProfit(o, marketplace, taxRate);
+    monthMap[key].gmvSum += (o.calcGmv ?? o.salePrice ?? 0);
+
+    // Lucro estimado para pedidos ainda sem escrow confirmado
+    if (!isConfirmedPaidOrder(o, marketplace)) {
+      const est = expectedProfit(o, marketplace, taxRate);
+      if (est !== null) monthMap[key].estimatedProfit += est;
+    }
   }
 
   const months = [];
   for (let i = 5; i >= 0; i--) {
     const d   = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    const m   = monthMap[key] ?? { revenue: 0, profit: 0, gmvSum: 0, orders: 0 };
+    const m   = monthMap[key] ?? { revenue: 0, profit: 0, estimatedProfit: 0, gmvSum: 0, orders: 0 };
     months.push({ key, ...m });
   }
 
   const result = months.map((m, i) => {
-    const prev      = i > 0 ? months[i - 1] : null;
-    const margin    = m.gmvSum > 0 ? (m.profit / m.gmvSum) * 100 : 0;
+    const prev           = i > 0 ? months[i - 1] : null;
+    const projectedProfit = m.profit + m.estimatedProfit;
+    const prevProjected  = prev ? prev.profit + prev.estimatedProfit : null;
+    const margin    = m.gmvSum > 0 ? (projectedProfit / m.gmvSum) * 100 : 0;
     const avgTicket = m.orders > 0 ? m.revenue / m.orders : 0;
     return {
-      month:     m.key,
-      revenue:   parseFloat(m.revenue.toFixed(2)),
-      profit:    parseFloat(m.profit.toFixed(2)),
-      orders:    m.orders,
-      margin:    parseFloat(margin.toFixed(1)),
-      avgTicket: parseFloat(avgTicket.toFixed(2)),
+      month:           m.key,
+      revenue:         parseFloat(m.revenue.toFixed(2)),
+      profit:          parseFloat(m.profit.toFixed(2)),
+      projectedProfit: parseFloat(projectedProfit.toFixed(2)),
+      orders:          m.orders,
+      margin:          parseFloat(margin.toFixed(1)),
+      avgTicket:       parseFloat(avgTicket.toFixed(2)),
       vsRevenue: prev && prev.revenue !== 0
         ? parseFloat(((m.revenue - prev.revenue) / Math.abs(prev.revenue) * 100).toFixed(1))
         : null,
-      vsProfit:  prev && prev.profit !== 0
-        ? parseFloat(((m.profit - prev.profit) / Math.abs(prev.profit) * 100).toFixed(1))
+      vsProfit: prevProjected && prevProjected !== 0
+        ? parseFloat(((projectedProfit - prevProjected) / Math.abs(prevProjected) * 100).toFixed(1))
         : null,
     };
   });
