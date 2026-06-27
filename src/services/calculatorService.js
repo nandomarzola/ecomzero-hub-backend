@@ -27,11 +27,10 @@ function calcShopeeFeePorUnidade(agreedPrice, category = null) {
     const rate = SHOPEE_CATEGORY_RATES[cat] ?? SHOPEE_CATEGORY_RATES.geral;
     return r2(agreedPrice * rate);
   }
-  // Fallback legado — usado somente quando o produto não tem categoria cadastrada
-  if (agreedPrice < 80)  return (agreedPrice * 0.20) + 4.00;
-  if (agreedPrice < 100) return (agreedPrice * 0.14) + 16.00;
-  if (agreedPrice < 200) return (agreedPrice * 0.14) + 20.00;
-  return                        (agreedPrice * 0.14) + 26.00;
+  // Fallback sem categoria: comissão ~14% + taxa de serviço ~4% = 18% flat.
+  // Shopee BR pratica 12-22% dependendo da categoria; 18% é conservador mas realista.
+  // A fórmula antiga (20% + R$4 fixo) produzia 30-51% em produtos baratos — irreal.
+  return r2(agreedPrice * 0.18);
 }
 
 // ── Taxas Mercado Livre 2026 ───────────────────────────────────────────────────
