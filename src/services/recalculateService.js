@@ -44,13 +44,16 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
 
   if (!orders.length) return 0;
 
-  // Pré-carrega ProductVariant da store p/ fallback de custo por SKU da variação
+  // Pré-carrega ProductVariant da store p/ fallback de custo por SKU ou nome da variação
   // (cobre pedidos cujo variantId não foi resolvido no momento da importação)
   const variants = await prisma.productVariant.findMany({
     where: { product: { storeId } },
-    select: { productId: true, sku: true, costPrice: true },
+    select: { id: true, productId: true, sku: true, name: true, costPrice: true },
   });
-  const variantBySku = new Map(variants.map(v => [`${v.productId}|${v.sku}`, v]));
+  const variantBySku  = new Map(variants.filter(v => v.sku).map(v => [`${v.productId}|${v.sku}`, v]));
+  // Fallback por nome da variação — cobre sellers sem SKU no Shopee:
+  // o variationName do pedido bate com o ProductVariant.name cadastrado.
+  const variantByName = new Map(variants.filter(v => v.name).map(v => [`${v.productId}|${v.name.trim()}`, v]));
 
   const BATCH = 100;
   const updates = [];
@@ -97,12 +100,16 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
       );
     }
 
-    const skuMatch = order.skuVariacao
+    const skuMatch  = order.skuVariacao
       ? variantBySku.get(`${order.productId}|${order.skuVariacao}`)
+      : null;
+    const nameMatch = (!order.variantId && order.variationName)
+      ? variantByName.get(`${order.productId}|${order.variationName.trim()}`)
       : null;
     const effectiveCostPrice = [
       order.variant?.costPrice,
       skuMatch?.costPrice,
+      nameMatch?.costPrice,
       order.product?.costPrice,
       order.product?.parent?.costPrice,
     ].find((value) => value != null && Number(value) > 0) ?? 0;

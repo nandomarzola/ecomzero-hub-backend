@@ -379,6 +379,7 @@ async function syncOrders(req, res) {
         if (!variantMap[key] && modelId !== '0') {
           const existingCount = (product.productVariants ?? []).length;
           if (existingCount === 0) {
+            // Produto sem nenhuma variação: busca todas via API e cria
             const models = await fetchModelList(accessToken, store.spShopId, item.item_id);
             const createdVariants = [];
             for (const model of models) {
@@ -396,6 +397,27 @@ async function syncOrders(req, res) {
               if (String(model.model_id) === modelId) variantMap[key] = variant.id;
             }
             product.productVariants = createdVariants;
+          } else {
+            // Produto já tem variações mas esse model_id é novo (variação adicionada
+            // ao anúncio após o último sync de catálogo). Cria direto com os dados
+            // do item do pedido — custo fica null até o usuário cadastrar.
+            try {
+              const variant = await prisma.productVariant.create({
+                data: {
+                  productId:            product.id,
+                  marketplaceVariantId: modelId,
+                  name:  item.model_name || null,
+                  sku:   item.model_sku  || null,
+                  price: r2(item.model_discounted_price ?? item.model_original_price ?? 0),
+                  stock: 0,
+                },
+              });
+              variantMap[key] = variant.id;
+              product.productVariants = [...(product.productVariants ?? []), variant];
+              console.log(`[Shopee] Nova variação criada: ${product.id} / model_id ${modelId} "${item.model_name}"`);
+            } catch {
+              // Race condition em syncs paralelos — ignora, próximo sync resolve
+            }
           }
         }
       }
@@ -450,12 +472,18 @@ async function syncOrders(req, res) {
     for (const batch of chunkArr(ordersData, 100)) {
       await Promise.all(batch.map((order) => {
         const updateData = { ...order };
-        // Nunca sobrescrever escrowAmount (e campos derivados do escrow) com null.
-        // O sync rápido não busca escrow — se o valor já foi salvo por um sync
-        // completo anterior, preservá-lo é obrigatório para não perder o repasse.
+        // Quando escrowAmount é null neste sync (modo quick ou pedido ainda pendente),
+        // preservar todos os campos que vieram de um sync completo anterior com escrow real:
+        // escrowAmount, shopeeVoucher e as taxas brutas (platformCommission, platformServiceFee,
+        // sellerCoupon, sellerDiscount) que o recalculate usa para calcular o lucro correto.
+        // Sobrescrever com 0 faria o recalculate usar a fórmula estimada em vez das taxas reais.
         if (updateData.escrowAmount === null) {
           delete updateData.escrowAmount;
           delete updateData.shopeeVoucher;
+          delete updateData.platformCommission;
+          delete updateData.platformServiceFee;
+          delete updateData.sellerCoupon;
+          delete updateData.sellerDiscount;
         }
         return prisma.order.update({
           where: {
