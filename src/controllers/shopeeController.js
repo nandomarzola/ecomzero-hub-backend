@@ -448,16 +448,26 @@ async function syncOrders(req, res) {
     // Shopee altera status, pagamento e quantidade/itens depois da criação, nós
     // atualizamos todas as linhas importadas pela chave única do marketplace.
     for (const batch of chunkArr(ordersData, 100)) {
-      await Promise.all(batch.map((order) => prisma.order.update({
-        where: {
-          storeId_orderId_lineItemKey: {
-            storeId: order.storeId,
-            orderId: order.orderId,
-            lineItemKey: order.lineItemKey,
+      await Promise.all(batch.map((order) => {
+        const updateData = { ...order };
+        // Nunca sobrescrever escrowAmount (e campos derivados do escrow) com null.
+        // O sync rápido não busca escrow — se o valor já foi salvo por um sync
+        // completo anterior, preservá-lo é obrigatório para não perder o repasse.
+        if (updateData.escrowAmount === null) {
+          delete updateData.escrowAmount;
+          delete updateData.shopeeVoucher;
+        }
+        return prisma.order.update({
+          where: {
+            storeId_orderId_lineItemKey: {
+              storeId: order.storeId,
+              orderId: order.orderId,
+              lineItemKey: order.lineItemKey,
+            },
           },
-        },
-        data: order,
-      }).catch(() => null)));
+          data: updateData,
+        }).catch(() => null);
+      }));
     }
 
     // 6b. Ajuste de estoque — busca pedidos do import que precisam de decremento/restauro
