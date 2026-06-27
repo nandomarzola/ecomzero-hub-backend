@@ -85,7 +85,10 @@ function expectedRepasse(order, marketplace) {
 
 function calcOrderFinancials(order, taxRate = 0, marketplace = 'shopee') {
   const gmv = r2(order.calcGmv ?? order.salePrice ?? 0);
-  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  const rawFee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
+  // Para pedidos pendentes sem escrow, platformCommission/platformServiceFee são 0.
+  // Usa calcShopeeFee (taxa estimada já salva pelo recalculate) como fallback de exibição.
+  const fee = rawFee > 0 ? rawFee : r2(order.calcShopeeFee ?? 0);
   const confirmed = isConfirmedRepasse(order, marketplace);
   const netRevenueRaw = expectedRepasse(order, marketplace);
   const netRevenue = netRevenueRaw === null || netRevenueRaw === undefined ? null : r2(netRevenueRaw);
