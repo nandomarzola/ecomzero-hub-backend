@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
 const { r2 }  = require('../lib/utils');
+const { calcOrderFinancials } = require('../services/profitCalculator');
 
 // São Paulo UTC-3 fixo — alinha com closingController e goalsController
 function spToUtc(dateStr, endOfDay = false) {
@@ -25,10 +26,11 @@ async function getSummary(req, res) {
   if (storeId) storeWhere.id = storeId;
   const stores = await prisma.store.findMany({
     where:  storeWhere,
-    select: { id: true, taxRate: true, taxType: true, fixedMonthlyTax: true },
+    select: { id: true, taxRate: true, taxType: true, fixedMonthlyTax: true, marketplace: true },
   });
   const storeIds       = stores.map((s) => s.id);
   const storeTaxRateMap = new Map(stores.map((s) => [s.id, s.taxRate ?? 0]));
+  const marketplaceMap  = new Map(stores.map((s) => [s.id, s.marketplace ?? 'shopee']));
 
   // DAS MEI: soma valor fixo mensal por loja MEI
   const fixedTaxAmount = r2(
@@ -75,9 +77,13 @@ async function getSummary(req, res) {
       select: {
         storeId:            true,
         orderCategory:      true,
+        orderStatus:        true,
+        status:             true,
         calcGmv:            true,
         calcProductCost:    true,
         calcPackaging:      true,
+        calcNetRevenue:     true,
+        calcShopeeFee:      true,
         soldAt:             true,
         orderPaidAt:        true,
         platformCommission: true,
@@ -92,15 +98,29 @@ async function getSummary(req, res) {
     prisma.bill.findMany({ where: billWhere }),
   ]);
 
-  // Fix 4+5: acumular CMV/receita somente por categoria correta
-  let grossRevenue     = 0; // GMV de pedidos válidos confirmados (escrow real)
-  let pendingRevenue   = 0; // GMV de pedidos pendentes
+  // ── Fórmula canônica compartilhada (services/profitCalculator.js) ──────────
+  // Duas métricas SEPARADAS, nunca somadas:
+  //   entradaBruta  = dinheiro que entra/entrará (GMV valid + pending), sem
+  //                   desconto de taxa/imposto/custo e sem estimativa alguma
+  //   lucroLiquido  = Σ lucro canônico por pedido (mesma função do dashboard/
+  //                   fechamento/metas/pedidos); pendente sem taxa confiável
+  //                   fica FORA do lucro, mas DENTRO da entradaBruta
+  let entradaBruta            = 0; // GMV valid + pending
+  let entradaBrutaConfirmada  = 0; // GMV valid
+  let entradaBrutaPendente    = 0; // GMV pending
+  let lucroLiquidoPedidos     = 0; // Σ fin.profit (confirmados + estimados confiáveis)
+  let lucroConfirmado         = 0; // Σ fin.profit de pedidos com repasse real
+  let lucroEstimado           = 0; // Σ fin.profit de estimativas confiáveis
+  let semEstimativaCount      = 0; // pedidos fora da projeção de lucro
+
+  let grossRevenue     = 0; // GMV de pedidos com repasse confirmado (escrow real)
+  let pendingRevenue   = 0; // GMV de pedidos aguardando repasse
   let totalRepasse     = 0; // soma dos repasses reais (escrow)
-  let repassePending   = 0; // soma dos repasses estimados (pending)
+  let repassePending   = 0; // soma dos repasses estimados confiáveis
   let totalCommission  = 0;
   let totalServiceFee  = 0;
   let totalFreight     = 0;
-  let totalCmv         = 0; // Fix 5: só para pedidos de receita
+  let totalCmv         = 0; // escopo: pedidos confirmados (reconcilia com o DRE)
   let totalPackaging   = 0;
   let totalTaxProv     = 0;
   let confirmedCount   = 0;
@@ -109,37 +129,41 @@ async function getSummary(req, res) {
   const monthlyMap = {};
 
   for (const o of orders) {
-    const isConfirmed = o.orderCategory === 'valid';
-    const isPending   = o.orderCategory === 'pending';
-    const aliquota    = storeTaxRateMap.get(o.storeId) ?? 0;
-    const gmv         = o.calcGmv ?? 0;
-
-    // Fórmula canônica de repasse — nunca usa calcShopeeFee/calcNetRevenue
-    const fee      = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-    const disc     = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-    const net      = r2(gmv - fee - disc);
-    const hasEscrow = o.escrowAmount !== null && o.escrowAmount !== undefined;
-    const repasse  = isConfirmed && hasEscrow ? r2(o.escrowAmount) : net;
-    const orderTax = r2(gmv * aliquota / 100);
+    const aliquota = storeTaxRateMap.get(o.storeId) ?? 0;
+    const gmv      = o.calcGmv ?? 0;
     const freight  = o.shopeeShippingCost ?? 0;
+    const fin      = calcOrderFinancials(o, aliquota, marketplaceMap.get(o.storeId));
+    const reliable = fin.profit !== null && fin.profit !== undefined;
 
-    if (isConfirmed) {
-      grossRevenue  += gmv;
-      totalRepasse  += repasse;
-      confirmedCount++;
-    } else if (isPending) {
-      pendingRevenue += gmv;
-      repassePending += repasse;
-      pendingCount++;
+    // Entrada bruta: valid + pending, sem dedução nenhuma
+    if (o.orderCategory === 'valid')   { entradaBruta += gmv; entradaBrutaConfirmada += gmv; }
+    if (o.orderCategory === 'pending') { entradaBruta += gmv; entradaBrutaPendente   += gmv; }
+
+    // Lucro canônico: mesmo tratamento dos outros 4 pontos
+    if (reliable) {
+      lucroLiquidoPedidos += fin.profit;
+      if (fin.confirmed) lucroConfirmado += fin.profit;
+      else               lucroEstimado   += fin.profit;
+    } else {
+      semEstimativaCount++;
     }
 
-    // Fix 5: CMV acumula somente para pedidos de receita (evita sub-estimar gross profit)
-    totalCommission += o.platformCommission ?? 0;
-    totalServiceFee += o.platformServiceFee ?? 0;
-    totalFreight    += freight;
-    totalTaxProv    += orderTax;
-    totalCmv        += o.calcProductCost ?? 0;
-    totalPackaging  += o.calcPackaging ?? 0;
+    if (fin.confirmed) {
+      grossRevenue += gmv;
+      totalRepasse += fin.netRevenue;
+      confirmedCount++;
+      // Componentes do DRE escopados a confirmados — as linhas reconciliam com netProfit
+      totalCommission += o.platformCommission ?? 0;
+      totalServiceFee += o.platformServiceFee ?? 0;
+      totalTaxProv    += fin.tax;
+      totalCmv        += o.calcProductCost ?? 0;
+      totalPackaging  += o.calcPackaging ?? 0;
+    } else {
+      pendingRevenue += gmv;
+      pendingCount++;
+      if (reliable) repassePending += fin.netRevenue;
+    }
+    totalFreight += freight;
 
     // Mapa mensal (usa orderPaidAt quando disponível, fallback soldAt)
     const dateRef = o.orderPaidAt ?? o.soldAt;
@@ -149,8 +173,8 @@ async function getSummary(req, res) {
     }
     const m      = monthlyMap[key];
     m.revenue     += gmv;
-    m.fees        += fee;
-    m.taxProvision += orderTax;
+    m.fees        += fin.fee;
+    m.taxProvision += fin.tax;
     m.cmv         += o.calcProductCost ?? 0;
     m.operational += (o.calcPackaging ?? 0) + freight;
   }
@@ -180,12 +204,13 @@ async function getSummary(req, res) {
   // (-) Provisão de Imposto
   // (-) Despesas Pagas
   // = Lucro Líquido Real
-  const repasseLiquido  = r2(r2(grossRevenue) - totalMarketplaceFees);
+  // Repasse Líquido = repasse REAL da plataforma (escrow) dos pedidos confirmados —
+  // valor canônico, não mais grossRevenue − taxas (que ignorava ajustes do escrow)
+  const repasseLiquido  = r2(totalRepasse);
   const resultadoBruto  = r2(repasseLiquido - totalCmv - totalOperationalCosts);
-  // Fix 6: fórmula única e explícita — sem switch silencioso
-  const lucroLiquido    = r2(resultadoBruto - totalTaxProv - fixedTaxAmount - totalPaid);
+  const lucroLiquidoDre = r2(resultadoBruto - totalTaxProv - fixedTaxAmount - totalPaid);
   // Projeção: com pendentes e vencidas
-  const lucroLiquidoProj = r2(lucroLiquido - totalPending - totalOverdue);
+  const lucroLiquidoProj = r2(lucroLiquidoDre - totalPending - totalOverdue);
 
   // Mapa mensal — bills
   for (const b of enrichedBills) {
@@ -216,6 +241,21 @@ async function getSummary(req, res) {
 
   return res.json({
     orderCount: orders.length,
+
+    // ── Métricas de caixa vs lucro — SEPARADAS, nunca somar uma na outra ─────
+    cash: {
+      // Dinheiro que entra/entrará (GMV valid + pending), sem desconto algum
+      entradaBruta:           r2(entradaBruta),
+      entradaBrutaConfirmada: r2(entradaBrutaConfirmada),
+      entradaBrutaPendente:   r2(entradaBrutaPendente),
+      // Lucro pela fórmula canônica (mesma dos outros 4 pontos do sistema)
+      lucroLiquido:           r2(lucroLiquidoPedidos),
+      lucroConfirmado:        r2(lucroConfirmado),
+      lucroEstimado:          r2(lucroEstimado),
+      // Pedidos sem estimativa confiável: fora do lucro, dentro da entradaBruta
+      pedidosSemEstimativa:   semEstimativaCount,
+    },
+
     dre: {
       // Receita
       grossRevenue:        r2(grossRevenue),
@@ -252,7 +292,7 @@ async function getSummary(req, res) {
       billsOverdue:   r2(totalOverdue),
 
       // Fix 6: fórmulas explícitas, sem switch silencioso
-      netProfit:      lucroLiquido,
+      netProfit:      lucroLiquidoDre,
       netProfitProjected: lucroLiquidoProj,
 
       // Campos legados mantidos para não quebrar frontend enquanto não atualiza

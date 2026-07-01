@@ -2,6 +2,7 @@ const prisma      = require('../lib/prisma');
 const PDFDocument = require('pdfkit');
 const { r2, parseYearMonth } = require('../lib/utils');
 const { recalculateOrdersForStore } = require('../services/recalculateService');
+const { calcOrderFinancials } = require('../services/profitCalculator');
 
 // São Paulo é UTC-3 fixo (sem horário de verão desde 2019)
 function spToUtc(year, month, day, h = 0, min = 0, sec = 0, ms = 0) {
@@ -303,23 +304,17 @@ function addUniqueOrder(set, order) {
   if (key) set.add(key);
 }
 
-function calcLine(order, storeTaxRateMap) {
-  const orderFee  = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const orderDisc = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-  const orderNet  = r2((order.calcGmv ?? 0) - orderFee - orderDisc);
-  let repasse = null;
-  if (hasRealRepasse(order)) {
-    repasse = r2(order.escrowAmount);
-  } else if ((order.calcNetRevenue ?? 0) > 0) {
-    repasse = r2(order.calcNetRevenue);
-  } else if (orderFee > 0 || orderDisc > 0) {
-    repasse = orderNet > 0 ? orderNet : null;
-  }
-  const taxRate   = storeTaxRateMap.get(order.storeId) ?? 0;
-  const tax       = r2((order.calcGmv ?? 0) * taxRate / 100);
-  const cost      = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-  const profit    = repasse === null || repasse === undefined ? null : r2(repasse - tax - cost);
-  return { orderFee, orderDisc, orderNet, repasse, tax, cost, profit };
+// Fórmula canônica compartilhada — services/profitCalculator.js.
+// Mantém a forma { orderFee, orderDisc, orderNet, repasse, tax, cost, profit }
+// que o buildClosingData/summarizeLines/auditOrder consomem.
+function calcLine(order, storeTaxRateMap, storeMarketplaceMap = null) {
+  const taxRate = storeTaxRateMap.get(order.storeId) ?? 0;
+  const marketplace = storeMarketplaceMap?.get?.(order.storeId) ?? 'shopee';
+  const fin = calcOrderFinancials(order, taxRate, marketplace);
+  return {
+    orderFee: fin.fee, orderDisc: fin.disc, orderNet: fin.net,
+    repasse: fin.repasse, tax: fin.tax, cost: fin.cost, profit: fin.profit,
+  };
 }
 
 function hasCurrentCost(order) {
@@ -334,7 +329,7 @@ function catalogProductId(order) {
   return order.product?.parentId ?? order.productId ?? null;
 }
 
-function summarizeLines(rows, storeTaxRateMap) {
+function summarizeLines(rows, storeTaxRateMap, storeMarketplaceMap = null) {
   const orderIds = new Set();
   const totals = {
     orders: 0, lines: rows.length, units: 0, salesTotal: 0, gmv: 0,
@@ -343,7 +338,7 @@ function summarizeLines(rows, storeTaxRateMap) {
 
   for (const row of rows) {
     addUniqueOrder(orderIds, row);
-    const line = calcLine(row, storeTaxRateMap);
+    const line = calcLine(row, storeTaxRateMap, storeMarketplaceMap);
     totals.units += row.quantity ?? 0;
     totals.gmv += row.calcGmv ?? 0;
     totals.repasse += line.repasse ?? 0;
@@ -514,8 +509,8 @@ function salesPerformanceFromGroups(groups) {
     .sort((a, b) => (b.qty - a.qty) || (b.gmv - a.gmv));
 }
 
-function auditOrder(row, storeTaxRateMap) {
-  const line = calcLine(row, storeTaxRateMap);
+function auditOrder(row, storeTaxRateMap, storeMarketplaceMap = null) {
+  const line = calcLine(row, storeTaxRateMap, storeMarketplaceMap);
   return {
     id: row.id,
     orderId: row.orderId,
@@ -999,19 +994,19 @@ async function buildClosingData(storeIds, month) {
     basis: 'repasse',
     basisField: 'orderPaidAt',
     operationalField: 'soldAt',
-    financial: summarizeLines(financialOrders, storeTaxRateMap),
-    soldInPeriod: summarizeLines(soldAtFinancialRows, storeTaxRateMap),
+    financial: summarizeLines(financialOrders, storeTaxRateMap, storeMarketplaceMap),
+    soldInPeriod: summarizeLines(soldAtFinancialRows, storeTaxRateMap, storeMarketplaceMap),
     soldInPeriodPaidOutside: {
-      ...summarizeLines(soldInPeriodPaidOutsideRows, storeTaxRateMap),
-      ordersList: soldInPeriodPaidOutsideRows.map(o => auditOrder(o, storeTaxRateMap)),
+      ...summarizeLines(soldInPeriodPaidOutsideRows, storeTaxRateMap, storeMarketplaceMap),
+      ordersList: soldInPeriodPaidOutsideRows.map(o => auditOrder(o, storeTaxRateMap, storeMarketplaceMap)),
     },
     paidInPeriodSoldOutside: {
-      ...summarizeLines(paidInPeriodSoldOutsideRows, storeTaxRateMap),
-      ordersList: paidInPeriodSoldOutsideRows.map(o => auditOrder(o, storeTaxRateMap)),
+      ...summarizeLines(paidInPeriodSoldOutsideRows, storeTaxRateMap, storeMarketplaceMap),
+      ordersList: paidInPeriodSoldOutsideRows.map(o => auditOrder(o, storeTaxRateMap, storeMarketplaceMap)),
     },
     returnedPartial: {
-      ...summarizeLines(returnedPartialRows, storeTaxRateMap),
-      ordersList: returnedPartialRows.map(o => auditOrder(o, storeTaxRateMap)),
+      ...summarizeLines(returnedPartialRows, storeTaxRateMap, storeMarketplaceMap),
+      ordersList: returnedPartialRows.map(o => auditOrder(o, storeTaxRateMap, storeMarketplaceMap)),
     },
   };
   competence.hasShift = competence.soldInPeriodPaidOutside.orders > 0 || competence.paidInPeriodSoldOutside.orders > 0;
@@ -1020,7 +1015,7 @@ async function buildClosingData(storeIds, month) {
     createdOrders: new Set(soldAtOrders.map(orderKey).filter(Boolean)).size,
     createdLines: soldAtOrders.length,
     createdUnits: soldAtOrders.reduce((sum, o) => sum + (o.quantity ?? 0), 0),
-    createdSalesTotal: summarizeLines(soldAtOrders, storeTaxRateMap).salesTotal,
+    createdSalesTotal: summarizeLines(soldAtOrders, storeTaxRateMap, storeMarketplaceMap).salesTotal,
   };
 
   let gmvTotal = 0, gmvConfirmed = 0, gmvPending = 0;
@@ -1057,7 +1052,7 @@ async function buildClosingData(storeIds, month) {
     const isRevenue = hasConfirmedRepasse || isEstimatedRevenue;
     const isCancelled = !hasConfirmedRepasse && o.orderCategory.startsWith('cancelled');
     const isReturned = o.orderCategory === 'returned_full' || o.orderCategory === 'returned_partial';
-    const { orderFee, orderDisc, repasse: orderRepasse, tax: orderTax, profit: orderProfit } = calcLine(o, storeTaxRateMap);
+    const { orderFee, orderDisc, repasse: orderRepasse, tax: orderTax, profit: orderProfit } = calcLine(o, storeTaxRateMap, storeMarketplaceMap);
     const hasReliableEstimate = orderRepasse !== null && orderRepasse !== undefined && orderProfit !== null && orderProfit !== undefined;
 
     if (hasConfirmedRepasse) {

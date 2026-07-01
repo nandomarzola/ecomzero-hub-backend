@@ -17,6 +17,7 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
   const where = { storeId };
 
   if (options.importId) where.importId = options.importId;
+  if (options.productIds?.length) where.productId = { in: options.productIds };
 
   if (periodMonth && !options.importId) {
     const { year: y, month: mo } = parseYearMonth(periodMonth);
@@ -143,10 +144,13 @@ async function recalculateOrdersForStore(storeId, periodMonth = null, options = 
     updates.push(prisma.order.update({
       where: { id: order.id },
       data: {
-        calcGmv:         calc.gmv,
-        calcShopeeFee:   calc.marketplaceFee,
-        calcNetRevenue:  calc.netRevenue,
-        calcTax:         calc.taxAmount,
+        // Gate por categoria — mesmo contrato do shopeeService: pedidos sem
+        // receita (cancelados/devolução total) têm calcGmv e derivados = 0.
+        calcGmv:         isRevenue ? calc.gmv : 0,
+        calcShopeeFee:   isRevenue ? calc.marketplaceFee : 0,
+        calcNetRevenue:  isRevenue ? calc.netRevenue : 0,
+        calcTax:         isRevenue ? calc.taxAmount : 0,
+        // custo permanece: o Fechamento usa calcProductCost de devoluções (returnedCost)
         calcProductCost: calc.productCost,
         calcPackaging:   calc.packaging,
         calcGrossProfit: finalProfit,

@@ -7,9 +7,9 @@ const { importSheinOrderAll }  = require('../services/importSheinService');
 const { importTiktokOrderAll } = require('../services/importTiktokService');
 const { importProgress } = require('../lib/importProgress');
 const { r2, parsePage, parseYearMonth } = require('../lib/utils');
+const { REVENUE_ORDER_CATEGORIES, calcOrderFinancials } = require('../services/profitCalculator');
 
 const PROCESSING_STALE_MS = 12 * 60 * 1000;
-const REVENUE_ORDER_CATEGORIES = ['valid', 'pending', 'returned_partial'];
 const APP_TIMEZONE = 'America/Sao_Paulo';
 
 function saoPauloDateToUtc(year, month, day, hour = 0, minute = 0, second = 0, millisecond = 0) {
@@ -56,49 +56,8 @@ function summarizeUniqueOrders(orders, valueSelector) {
   };
 }
 
-function isConfirmedRepasse(order, marketplace) {
-  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
-  if (rawStatus === 'CANCELLED') return false;
-  if (!['valid', 'returned_partial'].includes(order.orderCategory)) return false;
-  if (String(marketplace ?? '').toLowerCase() === 'shopee') {
-    return order.escrowAmount !== null && order.escrowAmount !== undefined;
-  }
-  return !!order.orderPaidAt || order.status === 'paid';
-}
-
-function expectedRepasse(order, marketplace) {
-  if (isConfirmedRepasse(order, marketplace)) {
-    return String(marketplace ?? '').toLowerCase() === 'shopee'
-      ? (order.escrowAmount ?? 0)
-      : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
-  }
-  if (!REVENUE_ORDER_CATEGORIES.includes(order.orderCategory)) return 0;
-  if (order.calcNetRevenue > 0) return order.calcNetRevenue;
-
-  const gmv = r2(order.calcGmv ?? order.salePrice ?? 0);
-  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-  if (fee <= 0 && discount <= 0) return null;
-  const estimatedNet = r2(gmv - fee - discount);
-  return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
-}
-
-function calcOrderFinancials(order, taxRate = 0, marketplace = 'shopee') {
-  const gmv = r2(order.calcGmv ?? order.salePrice ?? 0);
-  const rawFee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  // Para pedidos pendentes sem escrow, platformCommission/platformServiceFee são 0.
-  // Usa calcShopeeFee (taxa estimada já salva pelo recalculate) como fallback de exibição.
-  const fee = rawFee > 0 ? rawFee : r2(order.calcShopeeFee ?? 0);
-  const confirmed = isConfirmedRepasse(order, marketplace);
-  const netRevenueRaw = expectedRepasse(order, marketplace);
-  const netRevenue = netRevenueRaw === null || netRevenueRaw === undefined ? null : r2(netRevenueRaw);
-  const tax = r2(gmv * taxRate / 100);
-  const cost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-  const profit = netRevenue === null ? null : r2(netRevenue - tax - cost);
-  const margin = gmv > 0 && profit !== null ? r2((profit / gmv) * 100) : 0;
-
-  return { gmv, fee, netRevenue, tax, profit, margin, confirmed };
-}
+// Fórmula canônica compartilhada — ver services/profitCalculator.js
+// (isConfirmedRepasse, expectedRepasse e calcOrderFinancials vivem lá).
 
 // POST /api/orders/import — dispara import em background, responde imediatamente
 async function importOrders(req, res) {
@@ -516,8 +475,9 @@ async function exportOrders(req, res) {
   if (status) where.status = status;
 
   // Mapa de alíquota por loja — imposto sempre sobre GMV bruto (Simples Nacional)
-  const taxStores  = await prisma.store.findMany({ where: { id: { in: storeIds } }, select: { id: true, taxRate: true } });
+  const taxStores  = await prisma.store.findMany({ where: { id: { in: storeIds } }, select: { id: true, taxRate: true, marketplace: true } });
   const taxRateMap = new Map(taxStores.map((s) => [s.id, s.taxRate ?? 0]));
+  const marketplaceMap = new Map(taxStores.map((s) => [s.id, s.marketplace ?? 'shopee']));
 
   const EXPORT_LIMIT = 10_000;
   const orders = await prisma.order.findMany({
@@ -539,26 +499,23 @@ async function exportOrders(req, res) {
     returned_full: 'Devolvido (total)', returned_partial: 'Devolvido (parcial)',
   };
 
-  // Recomputa taxa/lucro/margem do RAW — mantém CSV consistente com a tela (listOrders)
+  // Mesma função canônica da tela (listOrders): calcOrderFinancials — nunca uma cópia local.
   const rows = orders.map((o) => {
     const date = o.soldAt ? new Date(o.soldAt).toLocaleDateString('pt-BR') : '';
     const sku  = o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '';
     const name = o.product?.name ?? o.productName ?? '';
 
-    const hasRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
+    const hasRevenue = REVENUE_ORDER_CATEGORIES.includes(o.orderCategory);
     let orderFee = 0;
     let profit   = 0;
     let margin   = 0;
 
     if (hasRevenue) {
-      const isConfirmed = o.orderCategory === 'valid';
-      orderFee          = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
-      const orderDisc   = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
-      const orderNet    = r2((o.calcGmv ?? 0) - orderFee - orderDisc);
-      const repasse     = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
-      const orderTax    = r2((o.calcGmv ?? 0) * (taxRateMap.get(o.storeId) ?? 0) / 100);
-      profit            = r2(repasse - orderTax - (o.calcProductCost ?? 0) - (o.calcPackaging ?? 0));
-      margin            = repasse > 0 ? r2((profit / repasse) * 100) : 0;
+      const fin = calcOrderFinancials(o, taxRateMap.get(o.storeId) ?? 0, marketplaceMap.get(o.storeId));
+      orderFee = fin.fee;
+      // profit null = sem estimativa confiável (pendente sem taxa conhecida) — exporta vazio, não 0
+      profit   = fin.profit;
+      margin   = fin.margin;
     }
 
     return [
@@ -566,8 +523,8 @@ async function exportOrders(req, res) {
       o.agreedPrice.toFixed(2).replace('.', ','),
       o.calcGmv.toFixed(2).replace('.', ','),
       orderFee.toFixed(2).replace('.', ','),
-      profit.toFixed(2).replace('.', ','),
-      margin.toFixed(1).replace('.', ','),
+      profit === null || profit === undefined ? '' : profit.toFixed(2).replace('.', ','),
+      profit === null || profit === undefined ? '' : margin.toFixed(1).replace('.', ','),
       catLabel[o.orderCategory] ?? o.orderCategory,
     ].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(';');
   });
@@ -774,4 +731,5 @@ module.exports = {
   importOrders, importStatus, importSheinOrders, importTiktokOrders,
   listOrders, getOrder, deleteOrder,
   recalculateOrders, recalculateStatus, exportOrders, skuReport,
+  calcOrderFinancials,
 };

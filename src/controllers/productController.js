@@ -3,7 +3,8 @@ const { Prisma } = require('@prisma/client');
 const prisma = require('../lib/prisma');
 const { parsePage } = require('../lib/utils');
 const PDFDocument = require('pdfkit');
-const { getShopeeRates, calcOrderProfit } = require('../services/calculatorService');
+const { getShopeeRates } = require('../services/calculatorService');
+const { recalculateOrdersForStore } = require('../services/recalculateService');
 const { recalculateStoreRates } = require('../services/storeRatesService');
 
 const productSchema = z.object({
@@ -820,60 +821,19 @@ async function saveAndRecalc(req, res) {
 
     const cost = parseFloat(costPrice || 0);
     const pkg  = parseFloat(packaging  || 0);
-    // calcOrderProfit importado no topo do arquivo
 
-    // 2. Buscar todos os pedidos vinculados a este produto
-    const orders = await prisma.order.findMany({
-      where: { productId },
-      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, platformCommission: true, listingType: true, mlShippingCost: true, mlInstallmentFee: true },
+    // 2. Recalcular via cadeia canônica (recalculateService): usa escrow real,
+    // platformNetRevenue e a hierarquia de custo variant → skuMatch → product → parent.
+    // Inclui produtos filhos: pedidos deles usam o custo do pai como fallback.
+    const children = await prisma.product.findMany({
+      where: { parentId: productId },
+      select: { id: true },
+    });
+    const updated = await recalculateOrdersForStore(product.storeId, null, {
+      productIds: [productId, ...children.map((c) => c.id)],
     });
 
-    // 3. Recalcular cada pedido
-    const marketplace  = product.store?.marketplace ?? 'shopee';
-    const taxRate      = product.store?.taxRate ?? 0;
-    const updates = orders.map(o => {
-      const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
-      // Para ML: precomputedFee = comissão + frete vendedor + taxa de parcelamento
-      const mlFrete        = o.mlShippingCost   ?? 0;
-      const mlParcelamento = o.mlInstallmentFee ?? 0;
-      const precomputedFee = marketplace === 'mercadolivre'
-        ? Math.round(((o.platformCommission ?? 0) + mlFrete + mlParcelamento) * 100) / 100
-        : null;
-      const calc = calcOrderProfit({
-        agreedPrice:   o.agreedPrice,
-        quantity:      o.quantity,
-        sellerCoupon:  o.sellerCoupon,
-        lmmDiscount:   o.lmmDiscount,
-        costPrice:     cost,
-        packagingCost: pkg,
-        taxRate,
-        marketplace,
-        precomputedFee,
-        listingType:   o.listingType,
-      });
-      const finalProfit = isRevenue ? calc.grossProfit : 0;
-      const finalMargin = isRevenue ? calc.margin      : 0;
-      return prisma.order.update({
-        where: { id: o.id },
-        data: {
-          calcGmv:         calc.gmv,
-          calcShopeeFee:   calc.marketplaceFee,
-          calcNetRevenue:  calc.netRevenue,
-          calcTax:         calc.taxAmount,
-          calcProductCost: calc.productCost,
-          calcPackaging:   calc.packaging,
-          calcGrossProfit: finalProfit,
-          calcMargin:      finalMargin,
-          hasCost:         calc.hasCost,
-          profit:          finalProfit,
-          margin:          finalMargin,
-        },
-      });
-    });
-
-    await Promise.all(updates);
-
-    return res.json({ success: true, updated: updates.length, costPrice: cost, packaging: pkg });
+    return res.json({ success: true, updated, costPrice: cost, packaging: pkg });
   } catch (err) {
     console.error('saveAndRecalc error:', err);
     return res.status(500).json({ error: 'Erro ao salvar custo: ' + err.message });
@@ -903,61 +863,15 @@ async function updateVariantCost(req, res) {
     const targetIds = applyToAll ? product.productVariants.map(v => v.id) : [variantId];
     await prisma.productVariant.updateMany({ where: { id: { in: targetIds } }, data: { costPrice: cost } });
 
-    // Recalcular pedidos vinculados às variações alteradas
-    const orders = await prisma.order.findMany({
-      where: { variantId: { in: targetIds } },
-      select: { id: true, agreedPrice: true, quantity: true, sellerCoupon: true, lmmDiscount: true, orderCategory: true, platformCommission: true, listingType: true, mlShippingCost: true, mlInstallmentFee: true },
+    // Recalcular via cadeia canônica (recalculateService) — hierarquia de custo
+    // variant → skuMatch → product → parent, mesmo caminho do sync.
+    const updated = await recalculateOrdersForStore(product.storeId, null, {
+      productIds: [productId],
     });
-
-    const marketplace   = product.store?.marketplace ?? 'shopee';
-    const taxRate       = product.store?.taxRate ?? 0;
-    const effectiveCost = cost ?? product.costPrice ?? 0;
-    const pkg           = product.packaging ?? 0;
-
-    const updates = orders.map(o => {
-      const isRevenue = ['valid', 'pending', 'returned_partial'].includes(o.orderCategory);
-      const mlFrete        = o.mlShippingCost   ?? 0;
-      const mlParcelamento = o.mlInstallmentFee ?? 0;
-      const precomputedFee = marketplace === 'mercadolivre'
-        ? Math.round(((o.platformCommission ?? 0) + mlFrete + mlParcelamento) * 100) / 100
-        : null;
-      const calc = calcOrderProfit({
-        agreedPrice:   o.agreedPrice,
-        quantity:      o.quantity,
-        sellerCoupon:  o.sellerCoupon,
-        lmmDiscount:   o.lmmDiscount,
-        costPrice:     effectiveCost,
-        packagingCost: pkg,
-        taxRate,
-        marketplace,
-        precomputedFee,
-        listingType:   o.listingType,
-      });
-      const finalProfit = isRevenue ? calc.grossProfit : 0;
-      const finalMargin = isRevenue ? calc.margin      : 0;
-      return prisma.order.update({
-        where: { id: o.id },
-        data: {
-          calcGmv:         calc.gmv,
-          calcShopeeFee:   calc.marketplaceFee,
-          calcNetRevenue:  calc.netRevenue,
-          calcTax:         calc.taxAmount,
-          calcProductCost: calc.productCost,
-          calcPackaging:   calc.packaging,
-          calcGrossProfit: finalProfit,
-          calcMargin:      finalMargin,
-          hasCost:         calc.hasCost,
-          profit:          finalProfit,
-          margin:          finalMargin,
-        },
-      });
-    });
-
-    await Promise.all(updates);
 
     return res.json({
       success: true,
-      updated: updates.length,
+      updated,
       variantsUpdated: targetIds.length,
       appliedToAll: !!applyToAll,
       costPrice: cost,

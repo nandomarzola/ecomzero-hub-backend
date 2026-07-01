@@ -1,10 +1,8 @@
 const prisma = require('../lib/prisma');
 const { parseYearMonth, r2 } = require('../lib/utils');
+const { REVENUE_ORDER_CATEGORIES: REVENUE_CATEGORIES, calcOrderFinancials } = require('../services/profitCalculator');
 
 const APP_TIMEZONE = 'America/Sao_Paulo';
-
-// Categorias de receita — alinha com closingController.FINANCIAL_REVENUE_CATEGORIES
-const REVENUE_CATEGORIES = ['valid', 'pending', 'returned_partial'];
 
 function spToUtc(y, m, d, h = 0, min = 0, sec = 0, ms = 0) {
   return new Date(Date.UTC(y, m - 1, d, h + 3, min, sec, ms));
@@ -37,53 +35,10 @@ function paidPeriodWhere(start, end) {
   };
 }
 
-// Fórmula canônica — espelha dashboardController para a tela de metas não criar
-// um segundo "realizado" financeiro. Não usa calcGrossProfit nem calcTax.
-function isConfirmedPaidOrder(order, marketplace) {
-  const rawStatus = String(order.orderStatus ?? '').toUpperCase();
-  if (rawStatus === 'CANCELLED') return false;
-  if (!['valid', 'returned_partial'].includes(order.orderCategory)) return false;
-  if (String(marketplace ?? '').toLowerCase() === 'shopee') {
-    return order.escrowAmount !== null && order.escrowAmount !== undefined;
-  }
-  return !!order.orderPaidAt || order.status === 'paid';
-}
-
-function expectedRepasse(order, marketplace) {
-  if (isConfirmedPaidOrder(order, marketplace)) {
-    return String(marketplace ?? '').toLowerCase() === 'shopee'
-      ? (order.escrowAmount ?? 0)
-      : (order.calcNetRevenue ?? order.escrowAmount ?? 0);
-  }
-  if (!REVENUE_CATEGORIES.includes(order.orderCategory)) return 0;
-  if (order.calcNetRevenue > 0) return order.calcNetRevenue;
-
-  const gmv = r2(order.calcGmv ?? 0);
-  const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-  const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-  if (fee <= 0 && discount <= 0) return null;
-  const estimatedNet = r2(gmv - fee - discount);
-  return gmv > 0 && estimatedNet > 0 ? estimatedNet : null;
-}
-
+// Fórmula canônica compartilhada — services/profitCalculator.js.
+// Metas usa o mesmo lucro por pedido que dashboard/fechamento/pedidos.
 function calcLineProfit(order, taxRate, marketplace) {
-  if (isConfirmedPaidOrder(order, marketplace)) {
-    const fee = r2((order.platformCommission ?? 0) + (order.platformServiceFee ?? 0));
-    const discount = r2((order.sellerCoupon ?? 0) + (order.lmmDiscount ?? 0));
-    const net = r2((order.calcGmv ?? 0) - fee - discount);
-    const hasEscrow = order.escrowAmount !== null && order.escrowAmount !== undefined;
-    const repasse = hasEscrow ? r2(order.escrowAmount) : net;
-    const tax = r2((order.calcGmv ?? 0) * taxRate / 100);
-    const cost = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-    return r2(repasse - tax - cost);
-  }
-
-  const repasse = expectedRepasse(order, marketplace);
-  if (repasse === null || repasse === undefined) return null;
-  if (!REVENUE_CATEGORIES.includes(order.orderCategory)) return 0;
-  const tax     = r2((order.calcGmv ?? 0) * taxRate / 100);
-  const cost    = r2((order.calcProductCost ?? 0) + (order.calcPackaging ?? 0));
-  return r2(repasse - tax - cost);
+  return calcOrderFinancials(order, taxRate, marketplace).profit;
 }
 
 // Agrega pedidos por orderId — revenue e profit calculados do raw, sem snapshots

@@ -267,6 +267,10 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
         platformNetRevenue,
       });
 
+      // Gate por categoria — mesmo contrato do shopeeService: cancelados/devolução
+      // total têm calcGmv e derivados = 0 (não geram receita).
+      const isRevenue = ['valid', 'pending', 'returned_partial'].includes(orderCategory);
+
       ordersData.push({
         storeId,
         importId:        imp.id,
@@ -295,20 +299,20 @@ async function importShopeeOrderAll(filePath, storeId, userId, originalFilename,
         orderCreatedAt,
         orderPaidAt,
         orderDeliveredAt,
-        calcGmv:         calc.gmv,
-        calcShopeeFee:   calc.shopeeFee,
-        calcNetRevenue:  calc.netRevenue,
-        calcTax:         calc.taxAmount,
+        calcGmv:         isRevenue ? calc.gmv : 0,
+        calcShopeeFee:   isRevenue ? calc.shopeeFee : 0,
+        calcNetRevenue:  isRevenue ? calc.netRevenue : 0,
+        calcTax:         isRevenue ? calc.taxAmount : 0,
         calcProductCost: calc.productCost,
         calcPackaging:   calc.packaging,
-        calcGrossProfit: calc.grossProfit,
-        calcMargin:      calc.margin,
+        calcGrossProfit: isRevenue ? calc.grossProfit : 0,
+        calcMargin:      isRevenue ? calc.margin : 0,
         hasCost:         calc.hasCost,
         status:          categoryToStatus(orderCategory),
         soldAt,
-        salePrice:       calc.gmv,
-        profit:          calc.grossProfit,
-        margin:          calc.margin,
+        salePrice:       isRevenue ? calc.gmv : 0,
+        profit:          isRevenue ? calc.grossProfit : 0,
+        margin:          isRevenue ? calc.margin : 0,
         snapshotTaxRate: store.taxRate ?? 0,
       });
 
