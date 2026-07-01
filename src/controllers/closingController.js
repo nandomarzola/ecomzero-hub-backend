@@ -145,6 +145,7 @@ function snapshotToClosingData(closing) {
     pendingOrdersList:   [],
 
     groups: Array.isArray(snap) ? snap : [],
+    salesPerformance: salesPerformanceFromGroups(snap),
   };
 }
 
@@ -164,7 +165,7 @@ function combineClosingData(items) {
     impostoTotal: 0, custoTotal: 0, resultadoLiquido: 0,
     resultadoEstimado: 0, impostoEstimadoTotal: 0, custoEstimadoTotal: 0,
     gmvEstimado: 0, orphanCount: 0,
-    groups: [],
+    groups: [], salesPerformance: [],
     returnedOrdersList: [], cancelledOrdersList: [], pendingOrdersList: [],
     operational: { createdOrders: 0, createdLines: 0, createdUnits: 0, createdSalesTotal: 0 },
     competence: {
@@ -193,6 +194,7 @@ function combineClosingData(items) {
   for (const data of items) {
     for (const key of sumKeys) combined[key] += data[key] ?? 0;
     combined.groups.push(...(data.groups ?? []));
+    combined.salesPerformance.push(...(data.salesPerformance ?? salesPerformanceFromGroups(data.groups ?? [])));
     combined.returnedOrdersList.push(...(data.returnedOrdersList ?? []));
     combined.cancelledOrdersList.push(...(data.cancelledOrdersList ?? []));
     combined.pendingOrdersList.push(...(data.pendingOrdersList ?? []));
@@ -235,6 +237,8 @@ function combineClosingData(items) {
     if (typeof combined[key] === 'number') combined[key] = r2(combined[key]);
   }
   combined.operational.createdSalesTotal = r2(combined.operational.createdSalesTotal);
+  combined.salesPerformance = combined.salesPerformance
+    .sort((a, b) => (b.qty - a.qty) || ((b.gmv ?? 0) - (a.gmv ?? 0)));
   return combined;
 }
 
@@ -262,6 +266,7 @@ function trunc(str, max = 46) {
 }
 
 const FINANCIAL_REVENUE_CATEGORIES = ['valid', 'returned_partial'];
+const SALES_REVENUE_CATEGORIES = ['valid', 'pending', 'returned_partial'];
 
 function orderKey(order) {
   return order?.orderId || order?.id;
@@ -271,6 +276,20 @@ function hasRealRepasse(order) {
   return FINANCIAL_REVENUE_CATEGORIES.includes(order.orderCategory)
     && order.escrowAmount !== null
     && order.escrowAmount !== undefined;
+}
+
+function marketplaceOf(order, storeMarketplaceMap) {
+  return String(storeMarketplaceMap.get(order.storeId) ?? '').toLowerCase();
+}
+
+function isShopeeOrder(order, storeMarketplaceMap) {
+  return marketplaceOf(order, storeMarketplaceMap) === 'shopee';
+}
+
+function hasSettledRevenue(order, storeMarketplaceMap) {
+  if (!FINANCIAL_REVENUE_CATEGORIES.includes(order.orderCategory)) return false;
+  if (isShopeeOrder(order, storeMarketplaceMap)) return hasRealRepasse(order);
+  return Boolean(order.orderPaidAt) || (order.calcNetRevenue ?? 0) > 0;
 }
 
 function inRange(date, start, end) {
@@ -317,7 +336,6 @@ function catalogProductId(order) {
 
 function summarizeLines(rows, storeTaxRateMap) {
   const orderIds = new Set();
-  const globalByOrder = new Map();
   const totals = {
     orders: 0, lines: rows.length, units: 0, salesTotal: 0, gmv: 0,
     repasse: 0, marketplaceFee: 0, tax: 0, cost: 0, profit: 0,
@@ -325,8 +343,6 @@ function summarizeLines(rows, storeTaxRateMap) {
 
   for (const row of rows) {
     addUniqueOrder(orderIds, row);
-    const key = orderKey(row);
-    if (key && !globalByOrder.has(key)) globalByOrder.set(key, row.globalTotal ?? row.calcGmv ?? 0);
     const line = calcLine(row, storeTaxRateMap);
     totals.units += row.quantity ?? 0;
     totals.gmv += row.calcGmv ?? 0;
@@ -338,11 +354,164 @@ function summarizeLines(rows, storeTaxRateMap) {
   }
 
   totals.orders = orderIds.size;
-  totals.salesTotal = [...globalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0);
+  totals.salesTotal = totals.gmv;
   for (const key of ['salesTotal', 'gmv', 'repasse', 'marketplaceFee', 'tax', 'cost', 'profit']) {
     totals[key] = r2(totals[key]);
   }
   return totals;
+}
+
+function productGroupKey(order) {
+  return order.productId
+    ? `pid:${order.productId}`
+    : `sku:${order.skuVariacao || order.skuPrincipal || order.productName || order.orderId}`;
+}
+
+function variationKey(order) {
+  if (order.variantId) return `variant:${order.variantId}`;
+  if (order.skuVariacao) return `sku:${order.skuVariacao}`;
+  if (order.variationName) return `name:${order.variationName.trim()}`;
+  if (order.lineItemKey && order.lineItemKey !== '0') return `line:${order.lineItemKey}`;
+  return null;
+}
+
+function makeSalesEntry(order, storeMarketplaceMap, { variant = false } = {}) {
+  const settled = hasSettledRevenue(order, storeMarketplaceMap);
+  const parent = order.product?.parent;
+  return {
+    key: variant ? `${productGroupKey(order)}|${variationKey(order) ?? 'base'}` : productGroupKey(order),
+    productId: order.productId,
+    catalogProductId: catalogProductId(order),
+    productName: parent?.name ?? order.product?.name ?? order.productName ?? '(sem nome)',
+    variationName: variant
+      ? (order.variant?.name ?? order.variationName ?? (parent ? order.product?.name : null))
+      : null,
+    sku: variant
+      ? (order.variant?.sku ?? order.skuVariacao ?? order.product?.sku ?? order.skuPrincipal ?? '')
+      : (parent?.sku ?? order.product?.sku ?? order.skuPrincipal ?? ''),
+    orderIds: new Set(),
+    qty: 0,
+    confirmedQty: 0,
+    pendingQty: 0,
+    gmv: 0,
+    confirmedGmv: 0,
+    pendingGmv: 0,
+    returnedPartialQty: 0,
+    hasPending: false,
+    settled,
+  };
+}
+
+function addSalesPerformanceRow(map, order, storeMarketplaceMap, options = {}) {
+  const key = options.variant ? `${productGroupKey(order)}|${variationKey(order) ?? 'base'}` : productGroupKey(order);
+  if (!map.has(key)) map.set(key, makeSalesEntry(order, storeMarketplaceMap, options));
+  const entry = map.get(key);
+  const settled = hasSettledRevenue(order, storeMarketplaceMap);
+  addUniqueOrder(entry.orderIds, order);
+  entry.qty += order.quantity ?? 0;
+  entry.gmv += order.calcGmv ?? 0;
+  if (settled) {
+    entry.confirmedQty += order.quantity ?? 0;
+    entry.confirmedGmv += order.calcGmv ?? 0;
+  } else {
+    entry.pendingQty += order.quantity ?? 0;
+    entry.pendingGmv += order.calcGmv ?? 0;
+    entry.hasPending = true;
+  }
+  if (order.orderCategory === 'returned_partial') entry.returnedPartialQty += order.quantity ?? 0;
+}
+
+function finalizeSalesEntry(entry) {
+  return {
+    key: entry.key,
+    productId: entry.productId,
+    catalogProductId: entry.catalogProductId,
+    productName: entry.productName,
+    variationName: entry.variationName,
+    sku: entry.sku,
+    orderCount: entry.orderIds?.size ?? entry.orderCount ?? 0,
+    qty: entry.qty ?? 0,
+    confirmedQty: entry.confirmedQty ?? 0,
+    pendingQty: entry.pendingQty ?? 0,
+    gmv: r2(entry.gmv ?? 0),
+    confirmedGmv: r2(entry.confirmedGmv ?? 0),
+    pendingGmv: r2(entry.pendingGmv ?? 0),
+    returnedPartialQty: entry.returnedPartialQty ?? 0,
+    hasPending: Boolean(entry.hasPending),
+  };
+}
+
+function buildSalesPerformance(soldAtOrders, storeMarketplaceMap) {
+  const byGroup = new Map();
+  const byVariation = new Map();
+
+  for (const order of soldAtOrders) {
+    if (!SALES_REVENUE_CATEGORIES.includes(order.orderCategory)) continue;
+    addSalesPerformanceRow(byGroup, order, storeMarketplaceMap);
+    if (variationKey(order)) addSalesPerformanceRow(byVariation, order, storeMarketplaceMap, { variant: true });
+  }
+
+  const list = [...byVariation.values(), ...[...byGroup.values()].filter((entry) => {
+    return ![...byVariation.keys()].some((key) => key.startsWith(`${entry.key}|`));
+  })]
+    .map(finalizeSalesEntry)
+    .sort((a, b) => (b.qty - a.qty) || (b.gmv - a.gmv));
+
+  return { byGroup, byVariation, list };
+}
+
+function salesPerformanceFromGroups(groups) {
+  if (!Array.isArray(groups)) return [];
+  const rows = [];
+  for (const group of groups) {
+    if (Array.isArray(group.variants) && group.variants.length > 0) {
+      for (const variant of group.variants) {
+        rows.push({
+          key: variant.salesKey ?? `${group.productId ?? group.productName}|${variant.variantId ?? variant.sku ?? variant.name ?? 'variant'}`,
+          productId: group.productId,
+          catalogProductId: group.catalogProductId ?? group.productId,
+          productName: group.productName,
+          variationName: variant.name,
+          sku: variant.sku,
+          orderCount: variant.salesOrderCount ?? variant.orderCount ?? 0,
+          qty: variant.salesQty ?? ((variant.qty ?? 0) + (variant.pendingQty ?? 0)),
+          confirmedQty: variant.salesConfirmedQty ?? variant.qty ?? 0,
+          pendingQty: variant.salesPendingQty ?? variant.pendingQty ?? 0,
+          gmv: variant.salesGmv ?? ((variant.gmv ?? 0) + (variant.gmvEstimado ?? 0)),
+          confirmedGmv: variant.salesConfirmedGmv ?? variant.gmv ?? 0,
+          pendingGmv: variant.salesPendingGmv ?? variant.gmvEstimado ?? 0,
+          returnedPartialQty: variant.salesReturnedPartialQty ?? 0,
+          hasPending: Boolean(variant.hasPending),
+        });
+      }
+    } else {
+      rows.push({
+        key: group.salesKey ?? group.productId ?? group.productName,
+        productId: group.productId,
+        catalogProductId: group.catalogProductId ?? group.productId,
+        productName: group.productName,
+        variationName: group.variationName,
+        sku: group.sku,
+        orderCount: group.salesOrderCount ?? group.orderCount ?? 0,
+        qty: group.salesQty ?? ((group.qty ?? 0) + (group.pendingQty ?? 0)),
+        confirmedQty: group.salesConfirmedQty ?? group.qty ?? 0,
+        pendingQty: group.salesPendingQty ?? group.pendingQty ?? 0,
+        gmv: group.salesGmv ?? ((group.gmv ?? 0) + (group.gmvEstimado ?? 0)),
+        confirmedGmv: group.salesConfirmedGmv ?? group.gmv ?? 0,
+        pendingGmv: group.salesPendingGmv ?? group.gmvEstimado ?? 0,
+        returnedPartialQty: group.salesReturnedPartialQty ?? 0,
+        hasPending: Boolean(group.hasPending),
+      });
+    }
+  }
+  return rows
+    .map(row => ({
+      ...row,
+      gmv: r2(row.gmv ?? 0),
+      confirmedGmv: r2(row.confirmedGmv ?? 0),
+      pendingGmv: r2(row.pendingGmv ?? 0),
+    }))
+    .sort((a, b) => (b.qty - a.qty) || (b.gmv - a.gmv));
 }
 
 function auditOrder(row, storeTaxRateMap) {
@@ -782,12 +951,15 @@ async function buildClosingData(storeIds, month) {
 
   const stores = await prisma.store.findMany({
     where: { id: { in: storeIds } },
-    select: { id: true, taxType: true, taxRate: true, fixedMonthlyTax: true },
+    select: { id: true, marketplace: true, taxType: true, taxRate: true, fixedMonthlyTax: true },
   });
   const fixedTaxAmount = r2(stores
     .filter(s => s.taxType === 'mei')
     .reduce((sum, s) => sum + (s.fixedMonthlyTax ?? 0), 0));
   const storeTaxRateMap = new Map(stores.map(s => [s.id, s.taxRate ?? 0]));
+  const storeMarketplaceMap = new Map(stores.map(s => [s.id, s.marketplace ?? '']));
+  const shopeeStoreIds = stores.filter(s => String(s.marketplace ?? '').toLowerCase() === 'shopee').map(s => s.id);
+  const nonEscrowStoreIds = stores.filter(s => String(s.marketplace ?? '').toLowerCase() !== 'shopee').map(s => s.id);
 
   const includeProduct = {
     product: { select: { id: true, parentId: true, name: true, sku: true, costPrice: true, packaging: true, parent: { select: { id: true, name: true, sku: true, costPrice: true } } } },
@@ -796,10 +968,12 @@ async function buildClosingData(storeIds, month) {
 
   const financialOrders = await prisma.order.findMany({
     where: {
-      storeId: { in: storeIds },
       orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
-      escrowAmount: { not: null },
       orderPaidAt: { gte: start, lte: end },
+      OR: [
+        { storeId: { in: shopeeStoreIds }, escrowAmount: { not: null } },
+        { storeId: { in: nonEscrowStoreIds } },
+      ],
     },
     include: includeProduct,
   });
@@ -815,10 +989,11 @@ async function buildClosingData(storeIds, month) {
     ...soldAtOrders.filter(o => !financialRowIds.has(o.id)),
   ];
 
-  const soldAtFinancialRows = soldAtOrders.filter(o => hasRealRepasse(o));
+  const soldAtFinancialRows = soldAtOrders.filter(o => hasSettledRevenue(o, storeMarketplaceMap));
   const soldInPeriodPaidOutsideRows = soldAtFinancialRows.filter(o => !inRange(o.orderPaidAt, start, end));
   const paidInPeriodSoldOutsideRows = financialOrders.filter(o => !inRange(o.soldAt, start, end));
   const returnedPartialRows = financialOrders.filter(o => o.orderCategory === 'returned_partial');
+  const salesPerformance = buildSalesPerformance(soldAtOrders, storeMarketplaceMap);
 
   const competence = {
     basis: 'repasse',
@@ -863,9 +1038,6 @@ async function buildClosingData(storeIds, month) {
   const cancelledOrderIds = new Set();
   const returnedOrderIds = new Set();
   const revenueOrderIds = new Set();
-  const revenueGlobalByOrder = new Map();
-  const confirmedGlobalByOrder = new Map();
-  const pendingGlobalByOrder = new Map();
   let revenueLineCount = 0;
   let revenueUnitCount = 0;
 
@@ -874,20 +1046,13 @@ async function buildClosingData(storeIds, month) {
   const cancelledOrdersList = [];
   const pendingOrdersList = [];
 
-  const addOrderGlobal = (map, order) => {
-    const key = orderKey(order);
-    if (!key) return;
-    const value = order.globalTotal ?? order.calcGmv ?? 0;
-    map.set(key, Math.max(map.get(key) ?? 0, value));
-  };
-
   for (const o of allOrders) {
     const hasConfirmedRepasse = financialRowIds.has(o.id);
     const isPending = o.orderCategory === 'pending';
     const isEstimatedRevenue = isPending || (
       FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory)
       && !hasConfirmedRepasse
-      && !hasRealRepasse(o)
+      && !hasSettledRevenue(o, storeMarketplaceMap)
     );
     const isRevenue = hasConfirmedRepasse || isEstimatedRevenue;
     const isCancelled = !hasConfirmedRepasse && o.orderCategory.startsWith('cancelled');
@@ -925,7 +1090,7 @@ async function buildClosingData(storeIds, month) {
         orderCategory: o.orderCategory, returnStatus: o.returnStatus ?? null,
       });
     }
-    if (isPending || (FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory) && !hasConfirmedRepasse && !hasRealRepasse(o))) {
+    if (isPending || (FINANCIAL_REVENUE_CATEGORIES.includes(o.orderCategory) && !hasConfirmedRepasse && !hasSettledRevenue(o, storeMarketplaceMap))) {
       if (hasReliableEstimate) addUniqueOrder(estimatedReliableOrderIds, o);
       else addUniqueOrder(estimatedUnreliableOrderIds, o);
       pendingOrdersList.push({
@@ -969,19 +1134,15 @@ async function buildClosingData(storeIds, month) {
     revenueLineCount++;
     revenueUnitCount += o.quantity ?? 0;
     addUniqueOrder(revenueOrderIds, o);
-    addOrderGlobal(revenueGlobalByOrder, o);
-    if (hasConfirmedRepasse) addOrderGlobal(confirmedGlobalByOrder, o);
-    if (isEstimatedRevenue) addOrderGlobal(pendingGlobalByOrder, o);
 
-    const key = o.productId
-      ? `pid:${o.productId}`
-      : `sku:${o.skuVariacao || o.skuPrincipal || o.productName || o.orderId}`;
+    const key = productGroupKey(o);
 
     if (!groupMap.has(key)) {
       groupMap.set(key, {
         productId: o.productId,
         catalogProductId: catalogProductId(o),
-        productName: o.product?.name ?? o.productName ?? '(sem nome)',
+        salesKey: key,
+        productName: o.product?.parent?.name ?? o.product?.name ?? o.productName ?? '(sem nome)',
         sku: o.product?.sku ?? o.skuVariacao ?? o.skuPrincipal ?? '',
         variationName: o.variationName ?? null,
         hasCost: true, hasPending: false,
@@ -1035,9 +1196,11 @@ async function buildClosingData(storeIds, month) {
       estimated: isEstimatedRevenue,
     });
 
-    if (o.variantId) {
-      if (!g.variantMap.has(o.variantId)) {
-        g.variantMap.set(o.variantId, {
+    const vKey = variationKey(o);
+    if (vKey) {
+      if (!g.variantMap.has(vKey)) {
+        g.variantMap.set(vKey, {
+          salesKey: `${key}|${vKey}`,
           variantId: o.variantId,
           name: o.variant?.name ?? o.variationName ?? null,
           sku: o.variant?.sku ?? o.skuVariacao ?? null,
@@ -1051,7 +1214,7 @@ async function buildClosingData(storeIds, month) {
           orders: [],
         });
       }
-      const v = g.variantMap.get(o.variantId);
+      const v = g.variantMap.get(vKey);
       if (hasConfirmedRepasse) {
         addUniqueOrder(v.orderIds, o);
         v.orderCount = v.orderIds.size;
@@ -1093,9 +1256,9 @@ async function buildClosingData(storeIds, month) {
     }
   }
 
-  const revenueGmvTotal = r2([...revenueGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
-  const confirmedSalesTotal = r2([...confirmedGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
-  const pendingSalesTotal = r2([...pendingGlobalByOrder.values()].reduce((sum, value) => sum + (value ?? 0), 0));
+  const revenueGmvTotal = r2(gmvConfirmed + gmvPending);
+  const confirmedSalesTotal = r2(gmvConfirmed);
+  const pendingSalesTotal = r2(gmvPending);
 
   grossProfit -= fixedTaxAmount;
   const avgMargin = confirmedSalesTotal > 0 ? (grossProfit / confirmedSalesTotal) * 100 : 0;
@@ -1110,9 +1273,12 @@ async function buildClosingData(storeIds, month) {
 
   const sortOrders = (orders) => orders.slice().sort((a, b) => new Date(a.orderPaidAt ?? a.soldAt) - new Date(b.orderPaidAt ?? b.soldAt));
   const groups = [...groupMap.values()]
-    .map(g => ({
+    .map(g => {
+      const sales = salesPerformance.byGroup.get(g.salesKey);
+      return {
       productId: g.productId,
       catalogProductId: g.catalogProductId,
+      salesKey: g.salesKey,
       productName: g.productName,
       sku: g.sku,
       variationName: g.variationName,
@@ -1136,9 +1302,20 @@ async function buildClosingData(storeIds, month) {
       repasseConfirmado: r2(g.repasseConfirmado),
       repasseEstimado: r2(g.repasseEstimado),
       impostoTotal: r2(g.impostoTotal),
+      salesOrderCount: sales?.orderIds?.size ?? 0,
+      salesQty: sales?.qty ?? 0,
+      salesConfirmedQty: sales?.confirmedQty ?? 0,
+      salesPendingQty: sales?.pendingQty ?? 0,
+      salesGmv: r2(sales?.gmv ?? 0),
+      salesConfirmedGmv: r2(sales?.confirmedGmv ?? 0),
+      salesPendingGmv: r2(sales?.pendingGmv ?? 0),
+      salesReturnedPartialQty: sales?.returnedPartialQty ?? 0,
       orders: sortOrders(g.orders),
       variants: [...g.variantMap.values()]
-        .map(v => ({
+        .map(v => {
+          const vSales = salesPerformance.byVariation.get(v.salesKey);
+          return {
+          salesKey: v.salesKey,
           variantId: v.variantId,
           name: v.name,
           sku: v.sku,
@@ -1162,10 +1339,20 @@ async function buildClosingData(storeIds, month) {
           repasseConfirmado: r2(v.repasseConfirmado),
           repasseEstimado: r2(v.repasseEstimado),
           impostoTotal: r2(v.impostoTotal),
+          salesOrderCount: vSales?.orderIds?.size ?? 0,
+          salesQty: vSales?.qty ?? 0,
+          salesConfirmedQty: vSales?.confirmedQty ?? 0,
+          salesPendingQty: vSales?.pendingQty ?? 0,
+          salesGmv: r2(vSales?.gmv ?? 0),
+          salesConfirmedGmv: r2(vSales?.confirmedGmv ?? 0),
+          salesPendingGmv: r2(vSales?.pendingGmv ?? 0),
+          salesReturnedPartialQty: vSales?.returnedPartialQty ?? 0,
           orders: sortOrders(v.orders),
-        }))
+        };
+        })
         .sort((a, b) => b.gmv - a.gmv),
-    }))
+    };
+    })
     .sort((a, b) => b.gmv - a.gmv);
 
   const orphanGroups = groups.filter(g => !g.hasCost);
@@ -1244,6 +1431,7 @@ async function buildClosingData(storeIds, month) {
     pendingOrdersList,
 
     groups,
+    salesPerformance: salesPerformance.list,
   };
 }
 
@@ -1257,9 +1445,11 @@ async function getProductOrders(req, res) {
 
     const storeWhere = { userId: req.userId };
     if (storeId) storeWhere.id = storeId;
-    const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true } });
+    const stores   = await prisma.store.findMany({ where: storeWhere, select: { id: true, marketplace: true } });
     const storeIds = stores.map(s => s.id);
     if (!storeIds.length) return res.json({ orders: [] });
+    const shopeeStoreIds = stores.filter(s => String(s.marketplace ?? '').toLowerCase() === 'shopee').map(s => s.id);
+    const nonEscrowStoreIds = stores.filter(s => String(s.marketplace ?? '').toLowerCase() !== 'shopee').map(s => s.id);
 
     const { year: y, month: mo } = parseYearMonth(month);
     const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
@@ -1272,8 +1462,11 @@ async function getProductOrders(req, res) {
       OR: [
         {
           orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
-          escrowAmount: { not: null },
           orderPaidAt: { gte: start, lte: end },
+          OR: [
+            { storeId: { in: shopeeStoreIds }, escrowAmount: { not: null } },
+            { storeId: { in: nonEscrowStoreIds } },
+          ],
         },
         {
           orderCategory: 'pending',
@@ -1283,6 +1476,7 @@ async function getProductOrders(req, res) {
           orderCategory: { in: FINANCIAL_REVENUE_CATEGORIES },
           escrowAmount: null,
           soldAt: { gte: start, lte: end },
+          storeId: { in: shopeeStoreIds },
         },
       ],
     };
@@ -1292,18 +1486,22 @@ async function getProductOrders(req, res) {
       where,
       orderBy: [{ orderPaidAt: 'asc' }, { soldAt: 'asc' }],
       select: {
-        orderId: true, orderCategory: true, soldAt: true, orderPaidAt: true, calcGmv: true,
+        storeId: true, orderId: true, orderCategory: true, soldAt: true, orderPaidAt: true, calcGmv: true,
+        calcNetRevenue: true,
         escrowAmount: true, platformCommission: true, platformServiceFee: true,
         sellerCoupon: true, lmmDiscount: true,
       },
     });
 
+    const storeMarketplaceMap = new Map(stores.map(s => [s.id, s.marketplace ?? '']));
     const list = orders.map(o => {
-      const isConfirmed = o.orderCategory === 'valid' && o.escrowAmount !== null && o.escrowAmount !== undefined;
+      const isConfirmed = hasSettledRevenue(o, storeMarketplaceMap) && inRange(o.orderPaidAt, start, end);
       const orderFee  = r2((o.platformCommission ?? 0) + (o.platformServiceFee ?? 0));
       const orderDisc = r2((o.sellerCoupon ?? 0) + (o.lmmDiscount ?? 0));
       const orderNet  = r2(o.calcGmv - orderFee - orderDisc);
-      const repasse   = isConfirmed ? r2(o.escrowAmount ?? orderNet) : orderNet;
+      const repasse   = isConfirmed && o.escrowAmount != null
+        ? r2(o.escrowAmount)
+        : r2(o.calcNetRevenue ?? orderNet);
 
       return {
         orderSn: o.orderId,
